@@ -138,21 +138,7 @@ def evaluate_batch(
 
         try:
             # Prepare inputs
-            messages = helper.create_message(sample["image_frames"].flatten(0, 1))
-            inputs = processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=False,
-                continue_final_message=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
-            model_inputs = {
-                "tokenized_data": inputs,
-                "ego_history_xyz": sample["ego_history_xyz"],
-                "ego_history_rot": sample["ego_history_rot"],
-            }
-            model_inputs = helper.to_device(model_inputs, device)
+            model_inputs = helper.prepare_model_inputs(sample, processor, device)
 
             # Run inference
             with torch.autocast(device, dtype=torch.bfloat16):
