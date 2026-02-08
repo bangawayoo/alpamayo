@@ -1,0 +1,61 @@
+# GRPO Post-Training Configuration for Alpamayo-R1
+#
+# Run with:
+#   python -m alpamayo_r1.training.train_grpo --config-name grpo_default
+#
+# Override any value via CLI:
+#   python -m alpamayo_r1.training.train_grpo training.num_train_epochs=1 data.max_samples=10
+
+# General
+seed: 42
+device: cuda
+model_name: nvidia/Alpamayo-R1-10B
+
+# LoRA configuration for VLM text attention layers
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+
+# GRPOConfig training parameters
+training:
+  output_dir: outputs/grpo
+  num_train_epochs: 3
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 1e-5
+  num_generations: 8        # G in GRPO (group size for advantage estimation)
+  max_completion_length: 256  # max CoC tokens per generation
+  beta: 0.0                  # no KL penalty -> no reference model needed
+  loss_type: grpo
+  logging_steps: 10
+  save_steps: 200
+  save_total_limit: 3
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  report_to: tensorboard
+
+# Dataset
+data:
+  split: train
+  t0_us: 5100000  # 5.1 seconds into each clip
+  max_samples: null  # null = use all samples; set to int for debugging
+  clip_ids_file: null  # optional path to parquet with clip_id column
+
+# Rollout function parameters
+rollout:
+  num_traj_samples: 8  # should match training.num_generations
+  temperature: 0.6
+  top_p: 0.98
+  max_generation_length: 256
+
+# Reward function weights (must sum to 1.0)
+rewards:
+  trajectory_weight: 0.50
+  reasoning_weight: 0.25
+  consistency_weight: 0.25

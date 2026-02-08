@@ -97,3 +97,40 @@ def to_device(
         return [to_device(elem, device=device, dtype=dtype) for elem in data]
     else:
         return data
+
+
+def prepare_model_inputs(
+    data: dict[str, Any],
+    processor: AutoProcessor,
+    device: str | torch.device = "cuda",
+) -> dict[str, Any]:
+    """Prepare tokenized model inputs from raw driving data.
+
+    Converts raw data from ``load_physical_aiavdataset`` into the dict format
+    expected by ``AlpamayoR1.sample_trajectories_from_data_with_vlm_rollout``.
+
+    Args:
+        data: Raw driving data dict with keys ``image_frames``,
+            ``ego_history_xyz``, ``ego_history_rot``.
+        processor: VLM processor (from ``get_processor``).
+        device: Target device for tensors.
+
+    Returns:
+        Dict with ``tokenized_data``, ``ego_history_xyz``, ``ego_history_rot``
+        moved to the target device.
+    """
+    messages = create_message(data["image_frames"].flatten(0, 1))
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        continue_final_message=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    model_inputs = {
+        "tokenized_data": inputs,
+        "ego_history_xyz": data["ego_history_xyz"],
+        "ego_history_rot": data["ego_history_rot"],
+    }
+    return to_device(model_inputs, device)
