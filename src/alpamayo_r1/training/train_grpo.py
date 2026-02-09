@@ -46,7 +46,7 @@ from alpamayo_r1.training.rewards import (
     reasoning_quality_reward,
     trajectory_quality_reward,
 )
-from alpamayo_r1.training.rollout import AlpamayoGRPOTrainer
+from alpamayo_r1.training.rollout import AlpamayoGRPOTrainer, RolloutLoggingCallback
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +182,17 @@ def main(cfg: DictConfig) -> None:
         rollout_top_p=rollout_cfg.get("top_p", 0.98),
         rollout_max_generation_length=rollout_cfg.get("max_generation_length", 256),
     )
+
+    # Rollout logging callback (CoC text + BEV trajectory plots to TensorBoard)
+    rollout_log_interval = rollout_cfg.get(
+        "log_interval", train_cfg.get("logging_steps", 10)
+    )
+    rollout_callback = RolloutLoggingCallback(
+        log_interval=int(rollout_log_interval),
+        max_samples=int(rollout_cfg.get("log_max_samples", 2)),
+    )
+    trainer.add_callback(rollout_callback)
+    rollout_callback.trainer = trainer
 
     logger.info("Starting GRPO training...")
     trainer.train()
