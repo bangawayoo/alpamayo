@@ -53,6 +53,8 @@ rollout:
   temperature: 0.6
   top_p: 0.98
   max_generation_length: 256
+  log_interval: 10       # steps between rollout logging (CoC text + trajectory plots)
+  log_max_samples: 2     # max prompts to log per interval
 
 # Reward function weights (must sum to 1.0)
 rewards:

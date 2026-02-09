@@ -27,10 +27,11 @@ import logging
 import re
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from physical_ai_av import PhysicalAIAVDatasetInterface
-from transformers import AutoProcessor
+from transformers import AutoProcessor, TrainerCallback
 from trl import GRPOTrainer
 
 from alpamayo_r1 import helper
@@ -137,6 +138,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         all_logprobs: list[list[float]] = []
         all_pred_xyz: list[list[float]] = []
         all_gt_xyz: list[list[float]] = []
+        all_coc_texts: list[str] = []
+        all_clip_ids: list[str] = []
 
         for prompt in unique_prompts:
             # Resolve prompt to string if conversational
@@ -199,6 +202,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
                 all_prompt_ids.append(prompt_ids_list)
                 all_completion_ids.append(coc_token_ids)
+                all_coc_texts.append(coc_text)
+                all_clip_ids.append(clip_id)
 
                 # Trajectory data
                 pred_traj = pred_xyz[0, 0, sample_idx].cpu().numpy().flatten().tolist()
@@ -224,6 +229,15 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         extra_fields = {
             "pred_xyz": all_pred_xyz,
             "gt_xyz": all_gt_xyz,
+        }
+
+        # Stash rollout data for the logging callback (near-zero overhead).
+        self._rollout_log_data = {
+            "coc_texts": all_coc_texts,
+            "clip_ids": all_clip_ids,
+            "pred_xyz": all_pred_xyz,
+            "gt_xyz": all_gt_xyz,
+            "num_generations": num_generations,
         }
 
         return all_prompt_ids, all_completion_ids, all_logprobs, extra_fields
@@ -351,3 +365,128 @@ def _collate_rollout_outputs(
         "gt_xyz": all_gt_xyz,
         "completions": all_coc_texts,
     }
+
+
+# ---------------------------------------------------------------------------
+# Rollout logging callback
+# ---------------------------------------------------------------------------
+
+class RolloutLoggingCallback(TrainerCallback):
+    """Logs CoC text and BEV trajectory plots to TensorBoard periodically.
+
+    Reads stashed rollout data from ``AlpamayoGRPOTrainer._rollout_log_data``
+    and writes it as TensorBoard text + figures.
+
+    Performance: ~35 ms per logging step (matplotlib render + TB write),
+    negligible compared to the 10-60 s training step. Only fires every
+    ``log_interval`` steps.
+
+    Args:
+        log_interval: Steps between rollout logs.
+        max_samples: Max unique prompts to log per interval.
+    """
+
+    def __init__(self, log_interval: int = 10, max_samples: int = 2):
+        self.log_interval = log_interval
+        self.max_samples = max_samples
+        self.trainer = None  # set after trainer construction
+        self._tb_writer = None
+
+    def _get_tb_writer(self):
+        """Lazily retrieve the SummaryWriter from the TensorBoardCallback."""
+        if self._tb_writer is not None:
+            return self._tb_writer
+        if self.trainer is None:
+            return None
+        for cb in self.trainer.callback_handler.callbacks:
+            if hasattr(cb, "tb_writer") and cb.tb_writer is not None:
+                self._tb_writer = cb.tb_writer
+                return self._tb_writer
+        return None
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.log_interval != 0:
+            return
+        if self.trainer is None:
+            return
+        data = getattr(self.trainer, "_rollout_log_data", None)
+        if not data:
+            return
+
+        writer = self._get_tb_writer()
+        if writer is None:
+            return
+
+        step = state.global_step
+        num_gen = data["num_generations"]
+        num_prompts = len(data["coc_texts"]) // max(num_gen, 1)
+        n_log = min(num_prompts, self.max_samples)
+
+        for i in range(n_log):
+            base = i * num_gen
+            clip_id = data["clip_ids"][base]
+
+            # --- CoC text (as markdown) ---
+            text_parts = []
+            for j in range(min(num_gen, 4)):
+                text_parts.append(
+                    f"**Sample {j}:**\n\n{data['coc_texts'][base + j]}"
+                )
+            text_md = f"**Clip:** `{clip_id}`\n\n" + "\n\n---\n\n".join(text_parts)
+            writer.add_text(f"rollout/coc_text_{i}", text_md, step)
+
+            # --- BEV trajectory plot ---
+            fig = _plot_trajectories_bev(
+                pred_list=[data["pred_xyz"][base + j] for j in range(num_gen)],
+                gt_flat=data["gt_xyz"][base],
+                title=f"Step {step} | {clip_id}",
+            )
+            writer.add_figure(f"rollout/trajectory_bev_{i}", fig, step)
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+
+        writer.flush()
+        self.trainer._rollout_log_data = None
+
+
+def _plot_trajectories_bev(
+    pred_list: list[list[float]],
+    gt_flat: list[float],
+    title: str = "",
+):
+    """Render a bird's-eye-view XY trajectory plot.
+
+    Args:
+        pred_list: List of flattened predicted trajectories (one per sample).
+        gt_flat: Flattened ground-truth trajectory.
+        title: Plot title.
+
+    Returns:
+        matplotlib Figure (caller must close it).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+
+    gt = np.array(gt_flat, dtype=np.float32).reshape(-1, 3)
+    ax.plot(gt[:, 0], gt[:, 1], "k-", linewidth=2.5, label="GT", zorder=10)
+
+    cmap = plt.cm.tab10
+    for j, pred_flat in enumerate(pred_list):
+        pred = np.array(pred_flat, dtype=np.float32).reshape(-1, 3)
+        ax.plot(
+            pred[:, 0], pred[:, 1], "--",
+            color=cmap(j % 10), alpha=0.6, linewidth=1.0,
+            label=f"Pred {j}" if j < 6 else None,
+        )
+
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_title(title, fontsize=9)
+    ax.legend(loc="best", fontsize=7)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return fig
