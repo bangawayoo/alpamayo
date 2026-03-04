@@ -20,8 +20,15 @@ Optimized evaluation script with batched processing and parallel data loading.
 import argparse
 import json
 import multiprocessing as mp
+import os
 from pathlib import Path
 from typing import Optional
+
+# Must be set before any CUDA import/init.  In MIG environments the default
+# CUDA caching allocator queries NVML for per-device free memory, which fails
+# with "NVML_SUCCESS == r INTERNAL ASSERT FAILED".  expandable_segments uses
+# a different allocation strategy that skips those NVML calls entirely.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import pandas as pd
@@ -271,7 +278,12 @@ def main():
 
     # Load model
     print("\nLoading model...")
-    model = AlpamayoR1.from_pretrained(args.model_name, dtype=torch.bfloat16).to(args.device)
+    # Avoid .to(device) — in MIG environments the generic "cuda" device string
+    # causes "CUDA driver error: invalid argument".  device_map="auto" lets HF
+    # place weights directly on the available GPU without a separate .to() call.
+    model = AlpamayoR1.from_pretrained(
+        args.model_name, dtype=torch.bfloat16, device_map="auto"
+    )
     model.eval()
     processor = helper.get_processor(model.tokenizer)
 

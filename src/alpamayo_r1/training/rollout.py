@@ -13,32 +13,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom GRPOTrainer subclass for Alpamayo-R1.
+"""Custom GRPOTrainer subclass for Alpamayo-R1 (VLM-only rollouts).
 
-TRL's ``rollout_func`` is only invoked in vLLM code paths. To use our custom
-VLM + Expert + Diffusion pipeline without requiring vLLM, we override
-``_generate_single_turn`` directly. This gives us full control over generation
-while keeping TRL's training loop, loss computation, logging, and checkpointing.
+The VLM autoregressively generates both Chain-of-Thought reasoning text AND
+discrete trajectory tokens during GRPO rollouts, following the paper
+(arXiv:2511.00088). No Expert or Diffusion modules are needed during rollout
+-- trajectory tokens are decoded to continuous xyz via the trajectory tokenizer.
+
+We override ``_generate_single_turn`` to call VLM.generate() directly (instead
+of the full VLM -> Expert -> Diffusion pipeline). This simplifies the
+architecture and reduces GPU memory during training.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from physical_ai_av import PhysicalAIAVDatasetInterface
-from transformers import AutoProcessor, TrainerCallback
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from transformers import AutoProcessor, GenerationConfig, StoppingCriteriaList, TrainerCallback
 from trl import GRPOTrainer
+from trl.models import unwrap_model_for_generation
 
 from alpamayo_r1 import helper
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+from alpamayo_r1.models.token_utils import StopAfterEOS, extract_text_tokens, extract_traj_tokens
 
 logger = logging.getLogger(__name__)
+
+
+class ClipDataCache:
+    """Cache processed clip data (images + ego motion) in CPU RAM.
+
+    On first access for a (clip_id, t0_us) pair, loads raw driving data via
+    load_physical_aiavdataset and runs prepare_model_inputs on CPU. Results
+    are stored as CPU tensors. Subsequent accesses call helper.to_device which
+    always creates new tensors, so callers may modify returned dicts (e.g. pop
+    keys) without corrupting the cache.
+    """
+
+    def __init__(self, avdi: PhysicalAIAVDatasetInterface, processor: AutoProcessor) -> None:
+        self._avdi = avdi
+        self._processor = processor
+        self._cache: dict[tuple[str, int], dict] = {}
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, clip_id: str, t0_us: int, device: torch.device) -> tuple[dict, torch.Tensor]:
+        """Return (model_inputs_on_device, ego_future_xyz_cpu).
+
+        model_inputs are freshly moved to device each call (safe to modify).
+        ego_future_xyz stays on CPU for numpy compatibility.
+        """
+        key = (clip_id, t0_us)
+        if key not in self._cache:
+            self._misses += 1
+            data = load_physical_aiavdataset(clip_id=clip_id, t0_us=t0_us, avdi=self._avdi, maybe_stream=True)
+            model_inputs_cpu = helper.prepare_model_inputs(data, self._processor, device="cpu")
+            self._cache[key] = {
+                "model_inputs": model_inputs_cpu,
+                "ego_future_xyz": data["ego_future_xyz"],
+            }
+            logger.debug("Cache miss for (%s, %d). Total: %d hits, %d misses.",
+                         clip_id, t0_us, self._hits, self._misses)
+        else:
+            self._hits += 1
+        cached = self._cache[key]
+        return helper.to_device(cached["model_inputs"], device=device), cached["ego_future_xyz"]
 
 
 def _parse_clip_metadata(prompt_text: str) -> tuple[str, int]:
@@ -64,26 +112,27 @@ def _parse_clip_metadata(prompt_text: str) -> tuple[str, int]:
 
 
 class AlpamayoGRPOTrainer(GRPOTrainer):
-    """GRPOTrainer subclass that uses the full Alpamayo-R1 pipeline for generation.
+    """GRPOTrainer subclass with VLM-only rollouts for Alpamayo-R1.
 
-    Overrides ``_generate_single_turn`` to run the VLM → CoC → Expert → Diffusion
-    pipeline instead of standard HF ``model.generate()``. This is necessary because:
+    The VLM autoregressively generates both Chain-of-Thought (CoC) reasoning
+    text AND discrete trajectory tokens. Trajectory tokens are decoded to
+    continuous xyz via ``traj_tokenizer.decode()`` for reward computation.
+    The Expert and Diffusion modules are NOT used during rollouts.
 
-    1. Standard generation only produces text — we also need trajectory predictions
-       for the trajectory quality and consistency reward functions.
-    2. The full pipeline involves non-VLM components (expert transformer, diffusion)
-       that are not part of the model passed to GRPOTrainer.
-    3. TRL's ``rollout_func`` is only called in vLLM code paths, not in the regular
-       generation path.
+    ``completion_ids`` contains the full generated sequence (CoC text +
+    trajectory tokens), so GRPO jointly optimizes reasoning and trajectory
+    prediction.
 
     Args:
-        full_model: The complete AlpamayoR1 model (VLM + expert + diffusion).
-            The VLM (``full_model.vlm``) should be passed as the ``model`` arg
-            to the parent GRPOTrainer.
+        full_model: The complete AlpamayoR1 model. Only ``full_model.vlm``
+            and ``full_model.traj_tokenizer`` are used during rollouts.
+            The VLM (``full_model.vlm``) should be passed as the ``model``
+            arg to the parent GRPOTrainer.
         avdi: PhysicalAI-AV dataset interface for loading driving data.
         rollout_temperature: Sampling temperature for VLM generation.
         rollout_top_p: Nucleus sampling threshold.
-        rollout_max_generation_length: Maximum CoC tokens.
+        rollout_max_generation_length: Maximum CoC text tokens (trajectory
+            tokens budget is added automatically).
         **kwargs: All other arguments forwarded to GRPOTrainer.
     """
 
@@ -95,6 +144,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         rollout_temperature: float = 0.6,
         rollout_top_p: float = 0.98,
         rollout_max_generation_length: int = 256,
+        logprob_mini_batch_size: int = 4,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -103,14 +153,16 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self.rollout_temperature = rollout_temperature
         self.rollout_top_p = rollout_top_p
         self.rollout_max_generation_length = rollout_max_generation_length
+        self.logprob_mini_batch_size = logprob_mini_batch_size
+        self._data_cache = ClipDataCache(avdi, self.processing_class)
 
     def _generate_single_turn(self, prompts: list):
-        """Override generation to use the full Alpamayo pipeline.
+        """Generate CoC text + discrete trajectory tokens via VLM only.
 
-        Runs the VLM + Expert + Diffusion pipeline for each unique prompt,
-        extracts CoC text and trajectory predictions, computes per-token
-        log-probs via teacher-forced VLM forward, and returns everything
-        in TRL's expected format.
+        For each unique prompt, calls ``VLM.generate()`` directly (no Expert
+        or Diffusion). The VLM generates CoC reasoning followed by discrete
+        trajectory tokens, stopping at ``<|traj_future_end|>``. Trajectory
+        tokens are decoded to continuous xyz for reward computation.
 
         Args:
             prompts: List of prompt strings or message lists (B*G items,
@@ -123,12 +175,13 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         device = self.accelerator.device
         num_generations = self.num_generations if self.model.training else self.num_generations_eval
 
-        # Temporarily disable gradient checkpointing during rollout.
-        # The Alpamayo pipeline needs use_cache=True for KV cache in the
-        # expert model, which is incompatible with gradient checkpointing.
-        gc_enabled = getattr(self.full_model.vlm, "is_gradient_checkpointing", False)
-        if gc_enabled:
-            self.full_model.vlm.gradient_checkpointing_disable()
+        # Model config for trajectory token handling
+        traj_token_start_idx = self.full_model.future_token_start_idx
+        tokens_per_future_traj = self.full_model.config.tokens_per_future_traj
+        traj_vocab_size = self.full_model.config.traj_vocab_size
+        special_token_ids = self.full_model.special_token_ids
+        traj_tokenizer = self.full_model.traj_tokenizer
+        pad_token_id = self.processing_class.tokenizer.pad_token_id
 
         # De-duplicate prompts (TRL repeats each prompt num_generations times)
         unique_prompts = prompts[::num_generations]
@@ -141,90 +194,132 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         all_coc_texts: list[str] = []
         all_clip_ids: list[str] = []
 
-        for prompt in unique_prompts:
-            # Resolve prompt to string if conversational
-            if isinstance(prompt, list):
-                prompt_text = " ".join(
-                    m.get("content", "") if isinstance(m.get("content"), str)
-                    else " ".join(c.get("text", "") for c in m.get("content", []) if isinstance(c, dict))
-                    for m in prompt
-                )
-            else:
-                prompt_text = prompt
+        # Stop generation at <|traj_future_end|>
+        traj_future_end_id = special_token_ids["traj_future_end"]
 
-            clip_id, t0_us = _parse_clip_metadata(prompt_text)
+        # FSDP-aware generation: unwrap_model_for_generation handles
+        # gradient checkpointing disable/enable automatically.
+        # summon_full_params gathers sharded VLM weights so the full
+        # pipeline (accessed via self.full_model) sees complete params.
+        fsdp_ctx = (
+            FSDP.summon_full_params(self.model_wrapped, recurse=False)
+            if self.is_fsdp_enabled else nullcontext()
+        )
+        with unwrap_model_for_generation(self.model_wrapped, self.accelerator):
+            with torch.no_grad(), fsdp_ctx:
+                for prompt in unique_prompts:
+                    # Resolve prompt to string if conversational
+                    if isinstance(prompt, list):
+                        prompt_text = " ".join(
+                            m.get("content", "") if isinstance(m.get("content"), str)
+                            else " ".join(c.get("text", "") for c in m.get("content", []) if isinstance(c, dict))
+                            for m in prompt
+                        )
+                    else:
+                        prompt_text = prompt
 
-            # 1. Load driving data
-            data = load_physical_aiavdataset(
-                clip_id=clip_id, t0_us=t0_us, avdi=self.avdi, maybe_stream=True
-            )
+                    clip_id, t0_us = _parse_clip_metadata(prompt_text)
 
-            # 2. Prepare model inputs
-            model_inputs = helper.prepare_model_inputs(
-                data, self.processing_class, device
-            )
-            prompt_len = model_inputs["tokenized_data"]["input_ids"].shape[1]
-            prompt_input_ids = model_inputs["tokenized_data"]["input_ids"].clone()
+                    # 1. Load driving data and prepare model inputs (cached in CPU RAM)
+                    model_inputs, ego_future_xyz = self._data_cache.get(clip_id, t0_us, device)
 
-            # 3. Run full pipeline
-            with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
-                pred_xyz, pred_rot, extra = (
-                    self.full_model.sample_trajectories_from_data_with_vlm_rollout(
-                        data=model_inputs,
-                        top_p=self.rollout_top_p,
+                    # 2. Fuse history trajectory tokens into input_ids
+                    tokenized = model_inputs["tokenized_data"]
+                    input_ids = tokenized.pop("input_ids")
+                    traj_data = {
+                        "ego_history_xyz": model_inputs["ego_history_xyz"],
+                        "ego_history_rot": model_inputs["ego_history_rot"],
+                    }
+                    input_ids = self.full_model.fuse_traj_tokens(input_ids, traj_data)
+                    prompt_len = input_ids.shape[1]
+                    prompt_input_ids = input_ids.clone()
+
+                    # 3. VLM-only generation (no ExpertLogitsProcessor)
+                    gen_config = GenerationConfig(
+                        do_sample=True,
                         temperature=self.rollout_temperature,
-                        num_traj_samples=num_generations,
-                        max_generation_length=self.rollout_max_generation_length,
-                        return_extra=True,
+                        top_p=self.rollout_top_p,
+                        num_return_sequences=num_generations,
+                        max_new_tokens=self.rollout_max_generation_length + tokens_per_future_traj + 10,
+                        pad_token_id=pad_token_id,
                     )
-                )
+                    stopping = StoppingCriteriaList([
+                        StopAfterEOS(eos_token_id=traj_future_end_id),
+                    ])
 
-            # 4. Extract CoC text
-            coc_texts_raw = extra.get("cot", None)
-            if coc_texts_raw is not None:
-                coc_texts = coc_texts_raw.flatten().tolist()
-            else:
-                coc_texts = [""] * num_generations
+                    with torch.autocast(str(device), dtype=torch.bfloat16):
+                        vlm_output = self.full_model.vlm.generate(
+                            input_ids=input_ids,
+                            generation_config=gen_config,
+                            stopping_criteria=stopping,
+                            **tokenized,  # pixel_values, attention_mask, image_grid_thw
+                        )
 
-            # 5. Build per-sample outputs (num_generations per unique prompt)
-            prompt_ids_list = prompt_input_ids[0].cpu().tolist()
+                    # vlm_output: (num_generations, prompt_len + generated_len)
+                    generated_seqs = vlm_output[:, prompt_len:]  # (num_gen, gen_len)
 
-            for sample_idx in range(num_generations):
-                coc_text = coc_texts[sample_idx] if sample_idx < len(coc_texts) else ""
+                    # 4. Extract CoC text
+                    coc_dict = extract_text_tokens(self.full_model.tokenizer, vlm_output)
+                    coc_texts = coc_dict.get("cot", [""] * num_generations)
 
-                # Tokenize CoC completion. Guarantee at least one token —
-                # TRL's _generate() accesses ids[-1] and crashes on empty lists.
-                coc_token_ids = self.processing_class.tokenizer.encode(
-                    coc_text, add_special_tokens=False
-                )
-                if not coc_token_ids:
-                    coc_token_ids = [self.processing_class.tokenizer.eos_token_id]
+                    # 5. Extract trajectory tokens and decode to continuous xyz
+                    traj_tokens = extract_traj_tokens(
+                        vlm_output, special_token_ids,
+                        tokens_per_future_traj, traj_token_start_idx, traj_vocab_size,
+                    )
+                    hist_xyz = model_inputs["ego_history_xyz"][:, -1]  # (1, T, 3)
+                    hist_rot = model_inputs["ego_history_rot"][:, -1]  # (1, T, 3, 3)
+                    hist_xyz_rep = hist_xyz.expand(num_generations, -1, -1)
+                    hist_rot_rep = hist_rot.expand(num_generations, -1, -1, -1)
+                    with torch.no_grad():
+                        pred_xyz_tensor, pred_rot_tensor, _ = traj_tokenizer.decode(
+                            hist_xyz_rep, hist_rot_rep, traj_tokens,
+                        )
 
-                all_prompt_ids.append(prompt_ids_list)
-                all_completion_ids.append(coc_token_ids)
-                all_coc_texts.append(coc_text)
-                all_clip_ids.append(clip_id)
+                    # 6. Build per-sample outputs (num_generations per unique prompt)
+                    prompt_ids_list = prompt_input_ids[0].cpu().tolist()
 
-                # Trajectory data
-                pred_traj = pred_xyz[0, 0, sample_idx].cpu().numpy().flatten().tolist()
-                gt_traj = data["ego_future_xyz"][0, 0].numpy().flatten().tolist()
-                all_pred_xyz.append(pred_traj)
-                all_gt_xyz.append(gt_traj)
+                    for sample_idx in range(num_generations):
+                        coc_text = coc_texts[sample_idx] if sample_idx < len(coc_texts) else ""
 
-            # 6. Compute log-probs via teacher-forced VLM forward
-            batch_logprobs = _compute_batch_logprobs(
-                self.full_model,
-                model_inputs,
-                prompt_input_ids,
-                all_completion_ids[-num_generations:],
-                prompt_len,
-                device,
-            )
-            all_logprobs.extend(batch_logprobs)
+                        # Completion = all generated tokens up to <|traj_future_end|>
+                        # (trim trailing pad and extra token from StopAfterEOS)
+                        raw_completion = generated_seqs[sample_idx].cpu().tolist()
+                        completion_ids: list[int] = []
+                        for tid in raw_completion:
+                            completion_ids.append(tid)
+                            if tid == traj_future_end_id:
+                                break
+                        # Fallback: strip trailing pad tokens if no end marker found
+                        if traj_future_end_id not in completion_ids:
+                            while completion_ids and completion_ids[-1] == pad_token_id:
+                                completion_ids.pop()
+                        # TRL requires at least one token
+                        if not completion_ids:
+                            completion_ids = [self.processing_class.tokenizer.eos_token_id]
 
-        # Re-enable gradient checkpointing if it was active
-        if gc_enabled:
-            self.full_model.vlm.gradient_checkpointing_enable()
+                        all_prompt_ids.append(prompt_ids_list)
+                        all_completion_ids.append(completion_ids)
+                        all_coc_texts.append(coc_text)
+                        all_clip_ids.append(clip_id)
+
+                        # Trajectory data for reward computation
+                        pred_traj = pred_xyz_tensor[sample_idx].cpu().numpy().flatten().tolist()
+                        gt_traj = ego_future_xyz[0, 0].numpy().flatten().tolist()
+                        all_pred_xyz.append(pred_traj)
+                        all_gt_xyz.append(gt_traj)
+
+                    # 7. Compute log-probs via teacher-forced VLM forward (batched)
+                    batch_logprobs = _compute_batch_logprobs(
+                        self.full_model,
+                        model_inputs,
+                        prompt_input_ids,
+                        all_completion_ids[-num_generations:],
+                        prompt_len,
+                        device,
+                        mini_batch_size=self.logprob_mini_batch_size,
+                    )
+                    all_logprobs.extend(batch_logprobs)
 
         extra_fields = {
             "pred_xyz": all_pred_xyz,
@@ -250,8 +345,13 @@ def _compute_batch_logprobs(
     completion_ids_list: list[list[int]],
     prompt_len: int,
     device: torch.device,
+    mini_batch_size: int = 4,
 ) -> list[list[float]]:
     """Compute per-token log-probs for a batch of completions.
+
+    Processes completions in groups of ``mini_batch_size`` to reduce the number
+    of VLM forward passes (e.g. 2 passes for 8 completions with batch size 4,
+    vs 8 serial passes in the original implementation).
 
     Args:
         full_model: The full AlpamayoR1 model.
@@ -260,49 +360,71 @@ def _compute_batch_logprobs(
         completion_ids_list: List of completion token ID lists.
         prompt_len: Number of prompt tokens.
         device: CUDA device.
+        mini_batch_size: Number of completions to process per forward pass.
 
     Returns:
         List of per-token log-prob lists, one per completion.
     """
     results: list[list[float]] = []
+    tokenized = model_inputs["tokenized_data"]
 
-    for comp_ids in completion_ids_list:
-        if not comp_ids:
-            results.append([])
-            continue
+    for batch_start in range(0, len(completion_ids_list), mini_batch_size):
+        batch_comp_ids = completion_ids_list[batch_start : batch_start + mini_batch_size]
+        B = len(batch_comp_ids)
 
-        comp_tensor = torch.tensor(comp_ids, dtype=torch.long, device=device)
+        # Build per-completion tensors (use a placeholder token for empties)
+        comp_tensors = [
+            torch.tensor(ids, dtype=torch.long, device=device) if ids
+            else torch.tensor([0], dtype=torch.long, device=device)
+            for ids in batch_comp_ids
+        ]
+        comp_lens = [len(ids) for ids in batch_comp_ids]
+        max_comp_len = max(t.shape[0] for t in comp_tensors)
 
-        # Concatenate prompt + completion for teacher-forced forward
-        full_ids = torch.cat(
-            [prompt_input_ids[0], comp_tensor], dim=0
-        ).unsqueeze(0)
+        # Pad completions to max_comp_len within the mini-batch
+        comp_padded = torch.zeros(B, max_comp_len, dtype=torch.long, device=device)
+        for i, t in enumerate(comp_tensors):
+            comp_padded[i, : t.shape[0]] = t
 
-        # Prepare forward kwargs (attention_mask, pixel_values, etc.)
+        # Build full input_ids: (B, L_prompt + max_comp_len)
+        prompt_expanded = prompt_input_ids.expand(B, -1)  # (B, L_prompt)
+        full_ids = torch.cat([prompt_expanded, comp_padded], dim=1)
+
+        # Build forward kwargs
         forward_kwargs = {}
-        tokenized = model_inputs["tokenized_data"]
         if "attention_mask" in tokenized:
-            orig_mask = tokenized["attention_mask"]
-            ext_mask = torch.ones(
-                1, comp_tensor.shape[0], device=device, dtype=orig_mask.dtype
+            orig_mask = tokenized["attention_mask"]  # (1, L_prompt)
+            comp_mask = torch.zeros(B, max_comp_len, device=device, dtype=orig_mask.dtype)
+            for i, comp_len in enumerate(comp_lens):
+                if comp_len > 0:
+                    comp_mask[i, :comp_len] = 1
+            forward_kwargs["attention_mask"] = torch.cat(
+                [orig_mask.expand(B, -1), comp_mask], dim=1
             )
-            forward_kwargs["attention_mask"] = torch.cat([orig_mask, ext_mask], dim=1)
         if "pixel_values" in tokenized:
-            forward_kwargs["pixel_values"] = tokenized["pixel_values"]
+            pv = tokenized["pixel_values"]
+            # Repeat along first dim: (N_patches, ...) -> (B*N_patches, ...)
+            forward_kwargs["pixel_values"] = pv.repeat(B, *([1] * (pv.dim() - 1)))
         if "image_grid_thw" in tokenized:
-            forward_kwargs["image_grid_thw"] = tokenized["image_grid_thw"]
+            igt = tokenized["image_grid_thw"]  # (N_images, 3)
+            forward_kwargs["image_grid_thw"] = igt.repeat(B, 1)
 
         with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
             outputs = full_model.vlm(input_ids=full_ids, **forward_kwargs)
 
-        # Logits at position t predict token t+1
-        comp_len = comp_tensor.shape[0]
-        logits = outputs.logits[0, prompt_len - 1 : prompt_len - 1 + comp_len]
-        log_probs = F.log_softmax(logits.float(), dim=-1)
-        token_log_probs = log_probs.gather(
-            1, comp_tensor.unsqueeze(-1)
-        ).squeeze(-1)
-        results.append(token_log_probs.cpu().tolist())
+        # Extract per-token log-probs for each completion in the mini-batch.
+        # Logits at position t predict token t+1, so completion tokens at
+        # positions [prompt_len .. prompt_len+comp_len) are predicted by
+        # logits at [prompt_len-1 .. prompt_len-1+comp_len).
+        for i, (comp_ids, comp_len) in enumerate(zip(batch_comp_ids, comp_lens)):
+            if not comp_ids:
+                results.append([])
+                continue
+            logits = outputs.logits[i, prompt_len - 1 : prompt_len - 1 + comp_len]
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            comp_target = comp_tensors[i][:comp_len]
+            token_log_probs = log_probs.gather(1, comp_target.unsqueeze(-1)).squeeze(-1)
+            results.append(token_log_probs.cpu().tolist())
 
     return results
 
@@ -365,6 +487,36 @@ def _collate_rollout_outputs(
         "gt_xyz": all_gt_xyz,
         "completions": all_coc_texts,
     }
+
+
+# ---------------------------------------------------------------------------
+# GPU utilization callback
+# ---------------------------------------------------------------------------
+
+class GpuUtilizationCallback(TrainerCallback):
+    """Prints GPU SM utilization and memory usage to the log on each logging step.
+
+    Uses pynvml when available (nvidia-ml-py3 package); silently skips if not
+    installed or if no NVIDIA devices are found.
+    """
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            n = pynvml.nvmlDeviceGetCount()
+            parts = []
+            for i in range(n):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                parts.append(
+                    f"GPU{i} {util.gpu:3d}% SM  "
+                    f"{mem.used / 2**30:.1f}/{mem.total / 2**30:.1f} GB"
+                )
+            logger.info("GPU util | step %d | %s", state.global_step, " | ".join(parts))
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

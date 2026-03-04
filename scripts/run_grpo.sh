@@ -5,18 +5,25 @@
 # GRPO Post-Training for Alpamayo-R1
 #
 # Usage:
-#   ./scripts/run_grpo.sh                    # full training run
-#   ./scripts/run_grpo.sh --smoke            # quick smoke test (3 samples, 1 epoch)
-#   ./scripts/run_grpo.sh --dry-run          # print config and exit
-#   ./scripts/run_grpo.sh --max-samples 50   # limit dataset size
+#   ./scripts/run_grpo.sh                              # full training run (single GPU)
+#   ./scripts/run_grpo.sh --smoke                      # quick smoke test (3 samples, 1 epoch)
+#   ./scripts/run_grpo.sh --dry-run                    # print config and exit
+#   ./scripts/run_grpo.sh --max-samples 50             # limit dataset size
+#   ./scripts/run_grpo.sh --fsdp                       # multi-GPU FSDP training (auto-detect GPUs)
+#   ./scripts/run_grpo.sh --fsdp --num-gpus 2          # FSDP with explicit GPU count
+#   ./scripts/run_grpo.sh --fsdp --num-gpus 2 --smoke  # FSDP smoke test
+#   ./scripts/run_grpo.sh --fsdp --accelerate-config path/to/config.yaml  # custom accelerate config
 
 set -euo pipefail
-
+export HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN env var}
 # ---------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------
 SMOKE=0
 DRY_RUN=0
+FSDP=0
+NUM_GPUS=""
+ACCELERATE_CONFIG=""
 MAX_SAMPLES=""
 EXTRA_OVERRIDES=()
 
@@ -32,6 +39,18 @@ while [[ $# -gt 0 ]]; do
         --dry-run)
             DRY_RUN=1
             shift
+            ;;
+        --fsdp)
+            FSDP=1
+            shift
+            ;;
+        --num-gpus)
+            NUM_GPUS="$2"
+            shift 2
+            ;;
+        --accelerate-config)
+            ACCELERATE_CONFIG="$2"
+            shift 2
             ;;
         --max-samples)
             MAX_SAMPLES="$2"
@@ -51,6 +70,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PYTHON="$PROJECT_ROOT/.venv/bin/python"
+
 
 if [[ ! -x "$VENV_PYTHON" ]]; then
     echo "Error: venv python not found at $VENV_PYTHON"
@@ -139,9 +159,37 @@ fi
 echo "Starting training..."
 echo "================================================================"
 
-"$VENV_PYTHON" -m alpamayo_r1.training.train_grpo \
-    --config-name grpo_default \
-    "${OVERRIDES[@]+"${OVERRIDES[@]}"}"
+if [[ "$FSDP" -eq 1 ]]; then
+    # Multi-GPU FSDP launch via accelerate
+    if [[ -z "$ACCELERATE_CONFIG" ]]; then
+        ACCELERATE_CONFIG="$PROJECT_ROOT/src/alpamayo_r1/training/configs/accelerate_fsdp.yaml"
+    fi
+    if [[ ! -f "$ACCELERATE_CONFIG" ]]; then
+        echo "Error: accelerate config not found at $ACCELERATE_CONFIG"
+        exit 1
+    fi
+
+    # Auto-detect GPU count if not specified
+    if [[ -z "$NUM_GPUS" ]]; then
+        NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+        if [[ "$NUM_GPUS" -lt 1 ]]; then
+            NUM_GPUS=1
+        fi
+    fi
+
+    echo "FSDP enabled: $NUM_GPUS GPU(s), config=$ACCELERATE_CONFIG"
+    "$VENV_PYTHON" -m accelerate.commands.launch \
+        --config_file "$ACCELERATE_CONFIG" \
+        --num_processes "$NUM_GPUS" \
+        -m alpamayo_r1.training.train_grpo \
+        --config-name grpo_default \
+        "${OVERRIDES[@]+"${OVERRIDES[@]}"}"
+else
+    # Single-GPU launch (default)
+    "$VENV_PYTHON" -m alpamayo_r1.training.train_grpo \
+        --config-name grpo_default \
+        "${OVERRIDES[@]+"${OVERRIDES[@]}"}"
+fi
 
 echo ""
 echo "================================================================"

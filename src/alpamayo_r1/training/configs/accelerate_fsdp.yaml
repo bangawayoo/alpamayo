@@ -1,0 +1,40 @@
+# Accelerate config for FSDP multi-GPU GRPO training.
+#
+# Based on TRL's fsdp1.yaml template. Shards the VLM across GPUs to
+# reduce per-GPU memory for the 10B+ parameter AlpamayoR1 model.
+#
+# Usage:
+#   ./scripts/run_grpo.sh --fsdp --num-gpus 2
+#   # or directly:
+#   accelerate launch --config_file this_file.yaml -m alpamayo_r1.training.train_grpo ...
+
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: bf16
+num_machines: 1
+num_processes: 2  # default; overridden by --num-gpus / --num_processes
+
+fsdp_config:
+  # Auto-wrap transformer layers for per-layer sharding.
+  # Detects Qwen2VL transformer blocks automatically.
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+
+  # Required for LoRA/PEFT — keeps original param names so PEFT can
+  # match adapter targets to base model parameters.
+  fsdp_use_orig_params: true
+
+  # Sync module states across ranks at init (broadcast from rank 0).
+  fsdp_sync_module_states: true
+
+  # Memory-efficient loading: only rank 0 loads the full model from
+  # disk, then broadcasts to other ranks.
+  fsdp_cpu_ram_efficient_loading: true
+
+  # Full shard (ZeRO-3 equivalent) — maximum memory savings.
+  fsdp_sharding_strategy: FULL_SHARD
+
+  # Backward prefetch for overlapping communication with computation.
+  fsdp_backward_prefetch: BACKWARD_PRE
+
+  # Forward prefetch for better pipeline utilization.
+  fsdp_forward_prefetch: true

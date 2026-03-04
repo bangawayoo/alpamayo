@@ -6,6 +6,12 @@
 # Override any value via CLI:
 #   python -m alpamayo_r1.training.train_grpo training.num_train_epochs=1 data.max_samples=10
 
+# Hydra logging — disable Hydra's extra handlers to prevent duplicate log lines
+defaults:
+  - _self_
+  - override hydra/hydra_logging: none
+  - override hydra/job_logging: none
+
 # General
 seed: 42
 device: cuda
@@ -26,11 +32,12 @@ lora:
 training:
   output_dir: outputs/grpo
   num_train_epochs: 3
-  per_device_train_batch_size: 1
-  gradient_accumulation_steps: 16
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 1
   learning_rate: 1e-5
-  num_generations: 8        # G in GRPO (group size for advantage estimation)
+  num_generations: 4        # G in GRPO (group size for advantage estimation)
   max_completion_length: 256  # max CoC tokens per generation
+  gradient_checkpointing: true  # trade compute for memory
   beta: 0.0                  # no KL penalty -> no reference model needed
   loss_type: grpo
   logging_steps: 10
@@ -49,10 +56,11 @@ data:
 
 # Rollout function parameters
 rollout:
-  num_traj_samples: 8  # should match training.num_generations
+  num_traj_samples: 2  # should match training.num_generations
   temperature: 0.6
   top_p: 0.98
   max_generation_length: 256
+  logprob_mini_batch_size: 1  # completions per VLM forward pass — reduced for 40GB GPU
   log_interval: 10       # steps between rollout logging (CoC text + trajectory plots)
   log_max_samples: 2     # max prompts to log per interval
 

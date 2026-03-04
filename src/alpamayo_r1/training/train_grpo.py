@@ -19,10 +19,11 @@ Usage:
     python -m alpamayo_r1.training.train_grpo --config-name grpo_default
 
 This script:
-1. Loads the full AlpamayoR1 model (VLM + expert + diffusion)
-2. Freezes all non-VLM parameters (expert, diffusion, action space, projections)
+1. Loads the full AlpamayoR1 model (only VLM + trajectory tokenizers are
+   moved to GPU; expert/diffusion/projections stay on CPU)
+2. Freezes all non-VLM parameters
 3. Applies LoRA to the VLM's attention layers
-4. Runs GRPO training with custom generation via AlpamayoGRPOTrainer
+4. Runs GRPO training with VLM-only rollouts via AlpamayoGRPOTrainer
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ from alpamayo_r1.training.rewards import (
     reasoning_quality_reward,
     trajectory_quality_reward,
 )
-from alpamayo_r1.training.rollout import AlpamayoGRPOTrainer, RolloutLoggingCallback
+from alpamayo_r1.training.rollout import AlpamayoGRPOTrainer, GpuUtilizationCallback, RolloutLoggingCallback
 
 logger = logging.getLogger(__name__)
 
@@ -76,22 +77,21 @@ def main(cfg: DictConfig) -> None:
         cfg: Hydra config with model, training, data, and reward settings.
     """
     logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
-
+    
     # Set seeds
     seed = cfg.get("seed", 42)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    device = cfg.get("device", "cuda")
     model_name = cfg.get("model_name", "nvidia/Alpamayo-R1-10B")
 
     # ---------------------------------------------------------------
-    # 1. Load the full AlpamayoR1 model
+    # 1. Load the full AlpamayoR1 model (on CPU; FSDP/accelerator
+    #    will handle VLM device placement)
     # ---------------------------------------------------------------
     logger.info("Loading model: %s", model_name)
     full_model = AlpamayoR1.from_pretrained(model_name, dtype=torch.bfloat16)
-    full_model.to(device)
 
     # ---------------------------------------------------------------
     # 2. Freeze non-VLM parameters
@@ -126,13 +126,21 @@ def main(cfg: DictConfig) -> None:
         float(reward_cfg.get("reasoning_weight", 0.25)),
         float(reward_cfg.get("consistency_weight", 0.25)),
     ]
+    num_generations = train_cfg.get("num_generations", 8)
+    per_device_bs = train_cfg.get("per_device_train_batch_size", 4)
+    grad_acc = train_cfg.get("gradient_accumulation_steps", 16)
+    # generation_batch_size must be divisible by num_generations.
+    # Default: per_device_bs * grad_acc, but at least num_generations.
+    gen_batch = max(per_device_bs * grad_acc, num_generations)
+    gen_batch = gen_batch - (gen_batch % num_generations)  # round down to multiple
+
     training_args = GRPOConfig(
         output_dir=train_cfg.get("output_dir", "outputs/grpo"),
         num_train_epochs=train_cfg.get("num_train_epochs", 3),
-        per_device_train_batch_size=train_cfg.get("per_device_train_batch_size", 1),
-        gradient_accumulation_steps=train_cfg.get("gradient_accumulation_steps", 16),
+        per_device_train_batch_size=per_device_bs,
+        gradient_accumulation_steps=grad_acc,
         learning_rate=float(train_cfg.get("learning_rate", 1e-5)),
-        num_generations=train_cfg.get("num_generations", 8),
+        num_generations=num_generations,
         max_completion_length=train_cfg.get("max_completion_length", 256),
         beta=float(train_cfg.get("beta", 0.0)),
         loss_type=train_cfg.get("loss_type", "grpo"),
@@ -143,6 +151,7 @@ def main(cfg: DictConfig) -> None:
         warmup_ratio=float(train_cfg.get("warmup_ratio", 0.05)),
         max_grad_norm=float(train_cfg.get("max_grad_norm", 1.0)),
         seed=seed,
+        gradient_checkpointing=train_cfg.get("gradient_checkpointing", False),
         report_to=train_cfg.get("report_to", "tensorboard"),
         reward_weights=reward_weights,
     )
@@ -181,6 +190,7 @@ def main(cfg: DictConfig) -> None:
         rollout_temperature=rollout_cfg.get("temperature", 0.6),
         rollout_top_p=rollout_cfg.get("top_p", 0.98),
         rollout_max_generation_length=rollout_cfg.get("max_generation_length", 256),
+        logprob_mini_batch_size=int(rollout_cfg.get("logprob_mini_batch_size", 4)),
     )
 
     # Rollout logging callback (CoC text + BEV trajectory plots to TensorBoard)
@@ -193,6 +203,17 @@ def main(cfg: DictConfig) -> None:
     )
     trainer.add_callback(rollout_callback)
     rollout_callback.trainer = trainer
+
+    trainer.add_callback(GpuUtilizationCallback())
+
+    # Move trajectory tokenizers to the local device. The VLM is handled
+    # by FSDP/accelerator (sharded across GPUs when using FSDP, or placed
+    # on the single GPU otherwise). Expert/diffusion stay on CPU.
+    device = trainer.accelerator.device
+    if full_model.traj_tokenizer is not None:
+        full_model.traj_tokenizer.to(device)
+    if full_model.hist_traj_tokenizer is not None:
+        full_model.hist_traj_tokenizer.to(device)
 
     logger.info("Starting GRPO training...")
     trainer.train()
