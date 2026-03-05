@@ -20,6 +20,15 @@ discrete trajectory tokens during GRPO rollouts, following the paper
 (arXiv:2511.00088). No Expert or Diffusion modules are needed during rollout
 -- trajectory tokens are decoded to continuous xyz via the trajectory tokenizer.
 
+Three generation backends are supported:
+1. **HuggingFace** (default): ``model.generate()`` via ``_generate_single_turn``.
+2. **vLLM colocate**: PagedAttention-accelerated generation via a custom
+   ``rollout_func`` passed to TRL's ``GRPOTrainer``.  Enable with
+   ``vllm.enabled: true`` in the Hydra config.
+3. **vLLM server**: Same as colocate but vLLM runs as a separate process
+   (``trl vllm-serve``). Enable with ``vllm.enabled: true, vllm.mode: server``.
+   The rollout_func is called on rank 0 only with ALL prompts gathered.
+
 We override ``_generate_single_turn`` to call VLM.generate() directly (instead
 of the full VLM -> Expert -> Diffusion pipeline). This simplifies the
 architecture and reduces GPU memory during training.
@@ -30,12 +39,13 @@ from __future__ import annotations
 import logging
 import re
 from contextlib import nullcontext
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from physical_ai_av import PhysicalAIAVDatasetInterface
+from PIL import Image
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import AutoProcessor, GenerationConfig, StoppingCriteriaList, TrainerCallback
 from trl import GRPOTrainer
@@ -46,7 +56,78 @@ from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1.models.token_utils import StopAfterEOS, extract_text_tokens, extract_traj_tokens
 
+if TYPE_CHECKING:
+    from trl import GRPOConfig
+
 logger = logging.getLogger(__name__)
+
+_vllm_qwen3vl_patched = False
+
+
+def _patch_vllm_qwen3vl_embed() -> None:
+    """Patch vLLM's transformers-backend ``embed_multimodal`` for Qwen3-VL.
+
+    Qwen3-VL's ``get_image_features`` returns a tuple
+    ``(image_embeds, deepstack_image_embeds)`` instead of a single tensor.
+    The generic ``embed_multimodal`` in
+    ``vllm.model_executor.models.transformers.multimodal.MultiModalMixin``
+    only handles the ``torch.Tensor`` case: when the return is a tuple it
+    falls through the ``isinstance`` check and is returned raw, causing the
+    profiling sanity check (and downstream cache code) to crash.
+
+    We monkey-patch ``embed_multimodal`` to unpack the tuple and apply the
+    standard split-by-``num_image_patches`` logic to the first element.
+    """
+    global _vllm_qwen3vl_patched  # noqa: PLW0603
+    if _vllm_qwen3vl_patched:
+        return
+    try:
+        from vllm.model_executor.models.transformers.multimodal import MultiModalMixin
+
+        def _patched_embed_multimodal(self, **kwargs):
+            pixel_values = kwargs.pop("pixel_values", None)
+            image_embeds = kwargs.pop("image_embeds", None)
+            if pixel_values is None:
+                pixel_values = kwargs.pop("image_patches", None)
+
+            if image_embeds is not None:
+                return image_embeds
+            if pixel_values is None:
+                return None
+
+            num_image_patches = kwargs.pop("num_image_patches")
+            kwargs.pop("token_type_ids", None)
+
+            vision_embeddings = self.model.get_image_features(pixel_values, **kwargs)
+
+            # Qwen3-VL returns (image_embeds, deepstack_image_embeds).
+            # Extract just the image embeddings.
+            if isinstance(vision_embeddings, (tuple, list)) and not isinstance(
+                vision_embeddings, torch.Tensor
+            ):
+                vision_embeddings = vision_embeddings[0]
+
+            if isinstance(vision_embeddings, torch.Tensor):
+                if vision_embeddings.ndim == 2:
+                    vision_embeddings = vision_embeddings.unsqueeze(0)
+                vision_embeddings = torch.split(
+                    vision_embeddings, num_image_patches.flatten().tolist()
+                )
+                vision_embeddings = [
+                    embed.flatten(start_dim=0, end_dim=-2)
+                    for embed in vision_embeddings
+                ]
+
+            return vision_embeddings
+
+        MultiModalMixin.embed_multimodal = _patched_embed_multimodal
+        _vllm_qwen3vl_patched = True
+        logger.info(
+            "Patched vLLM MultiModalMixin.embed_multimodal for "
+            "Qwen3-VL tuple return from get_image_features."
+        )
+    except (ImportError, AttributeError) as exc:
+        logger.debug("Could not patch vLLM embed_multimodal: %s", exc)
 
 
 class ClipDataCache:
@@ -57,14 +138,44 @@ class ClipDataCache:
     are stored as CPU tensors. Subsequent accesses call helper.to_device which
     always creates new tensors, so callers may modify returned dicts (e.g. pop
     keys) without corrupting the cache.
+
+    When ``cache_pil_images=True``, raw PIL images are also cached for vLLM
+    multimodal generation (vLLM expects PIL images, not pre-processed tensors).
     """
 
-    def __init__(self, avdi: PhysicalAIAVDatasetInterface, processor: AutoProcessor) -> None:
+    def __init__(
+        self,
+        avdi: PhysicalAIAVDatasetInterface,
+        processor: AutoProcessor,
+        cache_pil_images: bool = False,
+    ) -> None:
         self._avdi = avdi
         self._processor = processor
         self._cache: dict[tuple[str, int], dict] = {}
+        self._cache_pil_images = cache_pil_images
         self._hits = 0
         self._misses = 0
+
+    def _load_and_cache(self, clip_id: str, t0_us: int) -> None:
+        """Load raw data and populate the cache entry."""
+        self._misses += 1
+        data = load_physical_aiavdataset(clip_id=clip_id, t0_us=t0_us, avdi=self._avdi, maybe_stream=True)
+        model_inputs_cpu = helper.prepare_model_inputs(data, self._processor, device="cpu")
+        entry: dict[str, Any] = {
+            "model_inputs": model_inputs_cpu,
+            "ego_future_xyz": data["ego_future_xyz"],
+        }
+        if self._cache_pil_images:
+            # Convert (N_cameras, num_frames, 3, H, W) → flat list of PIL images
+            frames = data["image_frames"].flatten(0, 1)  # (N*F, 3, H, W)
+            pil_images = [
+                Image.fromarray(frame.permute(1, 2, 0).numpy().astype(np.uint8))
+                for frame in frames
+            ]
+            entry["pil_images"] = pil_images
+        self._cache[(clip_id, t0_us)] = entry
+        logger.debug("Cache miss for (%s, %d). Total: %d hits, %d misses.",
+                     clip_id, t0_us, self._hits, self._misses)
 
     def get(self, clip_id: str, t0_us: int, device: torch.device) -> tuple[dict, torch.Tensor]:
         """Return (model_inputs_on_device, ego_future_xyz_cpu).
@@ -74,19 +185,22 @@ class ClipDataCache:
         """
         key = (clip_id, t0_us)
         if key not in self._cache:
-            self._misses += 1
-            data = load_physical_aiavdataset(clip_id=clip_id, t0_us=t0_us, avdi=self._avdi, maybe_stream=True)
-            model_inputs_cpu = helper.prepare_model_inputs(data, self._processor, device="cpu")
-            self._cache[key] = {
-                "model_inputs": model_inputs_cpu,
-                "ego_future_xyz": data["ego_future_xyz"],
-            }
-            logger.debug("Cache miss for (%s, %d). Total: %d hits, %d misses.",
-                         clip_id, t0_us, self._hits, self._misses)
+            self._load_and_cache(clip_id, t0_us)
         else:
             self._hits += 1
         cached = self._cache[key]
         return helper.to_device(cached["model_inputs"], device=device), cached["ego_future_xyz"]
+
+    def get_pil_images(self, clip_id: str, t0_us: int) -> list[Image.Image]:
+        """Return cached PIL images for vLLM multimodal generation.
+
+        Requires ``cache_pil_images=True`` at construction time.
+        Must call ``get()`` first to ensure the cache is populated.
+        """
+        key = (clip_id, t0_us)
+        if key not in self._cache:
+            self._load_and_cache(clip_id, t0_us)
+        return self._cache[key]["pil_images"]
 
 
 def _parse_clip_metadata(prompt_text: str) -> tuple[str, int]:
@@ -109,6 +223,237 @@ def _parse_clip_metadata(prompt_text: str) -> tuple[str, int]:
     if clip_match is None or t0_match is None:
         raise ValueError(f"Could not parse clip metadata from prompt: {prompt_text[:200]}")
     return clip_match.group(1), int(t0_match.group(1))
+
+
+def make_vllm_rollout_func(
+    full_model: AlpamayoR1,
+    data_cache: ClipDataCache,
+    rollout_temperature: float = 0.6,
+    rollout_top_p: float = 0.98,
+    rollout_max_generation_length: int = 256,
+    vllm_mode: str = "colocate",
+) -> callable:
+    """Factory that builds a ``rollout_func`` for TRL's vLLM mode.
+
+    The returned function has signature ``(prompts, trainer) -> dict`` and
+    handles ONLY generation.  Trajectory token extraction / decoding happens
+    later in ``AlpamayoGRPOTrainer._calculate_rewards()``.
+
+    Supports two vLLM modes:
+    - **colocate**: vLLM engine runs in-process (``trainer.vllm_generation.llm``).
+      Called on every rank with local prompts.
+    - **server**: vLLM runs as a separate process via ``trl vllm-serve``
+      (``trainer.vllm_generation.vllm_client``). Called on rank 0 only with
+      ALL prompts gathered from all ranks.
+
+    Args:
+        full_model: Complete AlpamayoR1 model (used for tokenizer config,
+            ``fuse_traj_tokens``, and special token IDs).
+        data_cache: Shared ``ClipDataCache`` (with ``cache_pil_images=True``).
+        rollout_temperature: Sampling temperature for generation.
+        rollout_top_p: Nucleus sampling threshold.
+        rollout_max_generation_length: Max CoC text tokens (trajectory
+            budget is added automatically).
+        vllm_mode: Either ``"colocate"`` or ``"server"``.
+
+    Returns:
+        A callable suitable for ``GRPOTrainer(rollout_func=...)``.
+    """
+    # Pre-resolve model config fields (avoid repeated attribute lookups).
+    tokens_per_future_traj = full_model.config.tokens_per_future_traj
+    traj_future_end_id = full_model.special_token_ids["traj_future_end"]
+    max_new_tokens = rollout_max_generation_length + tokens_per_future_traj + 10
+
+    def rollout_func(prompts: list[str], trainer: GRPOTrainer) -> dict[str, Any]:
+        """Generate completions for *prompts* using vLLM engine.
+
+        In colocate mode, TRL passes ``B*G`` prompts (each unique prompt
+        repeated ``num_generations`` times) on every rank.  In server mode,
+        this is called on rank 0 only with ALL prompts gathered.
+
+        We de-duplicate, call vLLM once per unique prompt (with ``n=1``
+        per request, one request per generation), and collate the outputs.
+        """
+
+        device = trainer.accelerator.device
+        num_generations = trainer.num_generations if trainer.model.training else trainer.num_generations_eval
+
+        # De-duplicate prompts (TRL repeats each prompt num_generations times)
+        unique_prompts = prompts[::num_generations]
+
+        all_prompt_ids: list[list[int]] = []
+        all_completion_ids: list[list[int]] = []
+        all_logprobs: list[list[list[float]]] = []
+        all_gt_xyz: list[list[float]] = []
+        all_hist_xyz: list[list[float]] = []
+        all_hist_rot: list[list[float]] = []
+        all_clip_ids: list[str] = []
+
+        # Build vLLM inputs for all prompts (expanded by num_generations)
+        vllm_inputs: list[dict] = []
+        prompt_ids_per_unique: list[list[int]] = []
+        pil_images_per_unique: list[list] = []
+        gt_xyz_per_unique: list[list[float]] = []
+        hist_xyz_per_unique: list[list[float]] = []
+        hist_rot_per_unique: list[list[float]] = []
+        clip_ids_per_unique: list[str] = []
+
+        for prompt in unique_prompts:
+            # Resolve prompt to string if conversational
+            if isinstance(prompt, list):
+                prompt_text = " ".join(
+                    m.get("content", "") if isinstance(m.get("content"), str)
+                    else " ".join(c.get("text", "") for c in m.get("content", []) if isinstance(c, dict))
+                    for m in prompt
+                )
+            else:
+                prompt_text = prompt
+
+            clip_id, t0_us = _parse_clip_metadata(prompt_text)
+
+            # Load clip data (cached)
+            model_inputs, ego_future_xyz = data_cache.get(clip_id, t0_us, device)
+
+            # Fuse history trajectory tokens into input_ids
+            tokenized = model_inputs["tokenized_data"]
+            input_ids = tokenized.pop("input_ids")
+            traj_data = {
+                "ego_history_xyz": model_inputs["ego_history_xyz"],
+                "ego_history_rot": model_inputs["ego_history_rot"],
+            }
+            input_ids = full_model.fuse_traj_tokens(input_ids, traj_data)
+            prompt_token_ids = input_ids[0].cpu().tolist()
+
+            # Get PIL images for vLLM multimodal
+            pil_images = data_cache.get_pil_images(clip_id, t0_us)
+
+            # Cache prompt-level data
+            prompt_ids_per_unique.append(prompt_token_ids)
+            pil_images_per_unique.append(pil_images)
+            gt_xyz_per_unique.append(ego_future_xyz[0, 0].numpy().flatten().tolist())
+            hist_xyz_per_unique.append(
+                model_inputs["ego_history_xyz"][:, -1].cpu().numpy().flatten().tolist()
+            )
+            hist_rot_per_unique.append(
+                model_inputs["ego_history_rot"][:, -1].cpu().numpy().flatten().tolist()
+            )
+            clip_ids_per_unique.append(clip_id)
+
+            # Repeat each prompt num_generations times (colocate uses n=1)
+            for _ in range(num_generations):
+                vllm_inputs.append({
+                    "prompt_token_ids": prompt_token_ids,
+                    "multi_modal_data": {"image": pil_images},
+                })
+
+        # Call vLLM generate — branch on mode
+        if vllm_mode == "colocate":
+            from vllm import SamplingParams  # lazy import — only needed in colocate mode
+
+            sampling_params = SamplingParams(
+                temperature=rollout_temperature,
+                top_p=rollout_top_p,
+                max_tokens=max_new_tokens,
+                stop_token_ids=[traj_future_end_id],
+                include_stop_str_in_output=True,
+                logprobs=1,
+            )
+            request_outputs = trainer.vllm_generation.llm.generate(
+                vllm_inputs,
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
+
+            # Parse colocate outputs (list of RequestOutput objects)
+            for req_idx, req_output in enumerate(request_outputs):
+                unique_idx = req_idx // num_generations
+                output = req_output.outputs[0]  # n=1, so single output per request
+
+                all_prompt_ids.append(prompt_ids_per_unique[unique_idx])
+
+                completion_ids = list(output.token_ids)
+
+                token_logprobs: list[list[float]] = []
+                if output.logprobs:
+                    for pos_logprobs in output.logprobs:
+                        lp_values = [lp.logprob for lp in pos_logprobs.values()]
+                        token_logprobs.append(lp_values[:1] if lp_values else [0.0])
+                else:
+                    token_logprobs = [[0.0]] * len(completion_ids)
+
+                if completion_ids and completion_ids[-1] != traj_future_end_id:
+                    completion_ids.append(traj_future_end_id)
+                    token_logprobs.append([0.0])
+                if not completion_ids:
+                    completion_ids = [traj_future_end_id]
+                    token_logprobs = [[0.0]]
+                all_completion_ids.append(completion_ids)
+                all_logprobs.append(token_logprobs)
+
+                all_gt_xyz.append(gt_xyz_per_unique[unique_idx])
+                all_hist_xyz.append(hist_xyz_per_unique[unique_idx])
+                all_hist_rot.append(hist_rot_per_unique[unique_idx])
+                all_clip_ids.append(clip_ids_per_unique[unique_idx])
+
+        else:  # server mode
+            vllm_client = trainer.vllm_generation.vllm_client
+
+            # Build per-generation prompt_token_ids and images.
+            # Reuse the already-computed prompt_token_ids (with fused
+            # history trajectory tokens) and PIL images from the loop above.
+            server_token_ids: list[list[int]] = []
+            images_per_prompt: list[list] = []
+            for unique_idx in range(len(unique_prompts)):
+                for _ in range(num_generations):
+                    server_token_ids.append(prompt_ids_per_unique[unique_idx])
+                    images_per_prompt.append(pil_images_per_unique[unique_idx])
+
+            result = vllm_client.generate(
+                prompt_token_ids=server_token_ids,
+                images=images_per_prompt,
+                temperature=rollout_temperature,
+                top_p=rollout_top_p,
+                max_tokens=max_new_tokens,
+                logprobs=1,
+                mm_processor_kwargs={"min_pixels": helper.MIN_PIXELS, "max_pixels": helper.MAX_PIXELS},
+                generation_kwargs={"stop_token_ids": [traj_future_end_id]},
+            )
+
+            # Parse server response (dict with lists)
+            for req_idx in range(len(server_token_ids)):
+                unique_idx = req_idx // num_generations
+
+                all_prompt_ids.append(result["prompt_ids"][req_idx])
+
+                completion_ids = list(result["completion_ids"][req_idx])
+                token_logprobs = list(result["logprobs"][req_idx])
+
+                if completion_ids and completion_ids[-1] != traj_future_end_id:
+                    completion_ids.append(traj_future_end_id)
+                    token_logprobs.append([0.0])
+                if not completion_ids:
+                    completion_ids = [traj_future_end_id]
+                    token_logprobs = [[0.0]]
+                all_completion_ids.append(completion_ids)
+                all_logprobs.append(token_logprobs)
+
+                all_gt_xyz.append(gt_xyz_per_unique[unique_idx])
+                all_hist_xyz.append(hist_xyz_per_unique[unique_idx])
+                all_hist_rot.append(hist_rot_per_unique[unique_idx])
+                all_clip_ids.append(clip_ids_per_unique[unique_idx])
+
+        return {
+            "prompt_ids": all_prompt_ids,
+            "completion_ids": all_completion_ids,
+            "logprobs": all_logprobs,
+            # Extra fields — forwarded to reward functions via _calculate_rewards
+            "gt_xyz": all_gt_xyz,
+            "hist_xyz": all_hist_xyz,
+            "hist_rot": all_hist_rot,
+            "clip_ids": all_clip_ids,
+        }
+
+    return rollout_func
 
 
 class AlpamayoGRPOTrainer(GRPOTrainer):
@@ -147,6 +492,33 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         logprob_mini_batch_size: int = 4,
         **kwargs,
     ):
+        # Detect vLLM mode from GRPOConfig *before* calling super().__init__,
+        # because the parent passes rollout_func to VLLMGeneration.__init__.
+        grpo_config: GRPOConfig | None = kwargs.get("args") or (args[1] if len(args) > 1 else None)
+        use_vllm = getattr(grpo_config, "use_vllm", False) if grpo_config is not None else False
+
+        if use_vllm:
+            vllm_mode = getattr(grpo_config, "vllm_mode", "colocate")
+            # Create ClipDataCache early — shared between rollout_func and trainer.
+            # processing_class may be passed as kwarg or positional arg.
+            processor = kwargs.get("processing_class")
+            self._data_cache = ClipDataCache(avdi, processor, cache_pil_images=True)
+            rollout_fn = make_vllm_rollout_func(
+                full_model=full_model,
+                data_cache=self._data_cache,
+                rollout_temperature=rollout_temperature,
+                rollout_top_p=rollout_top_p,
+                rollout_max_generation_length=rollout_max_generation_length,
+                vllm_mode=vllm_mode,
+            )
+            kwargs["rollout_func"] = rollout_fn
+
+            # Workaround: Qwen3-VL's get_image_features returns a tuple
+            # (image_embeds, deepstack_embeds) which the generic vLLM
+            # transformers backend doesn't handle, crashing during
+            # profiling.  Patch embed_multimodal to unpack the tuple.
+            _patch_vllm_qwen3vl_embed()
+
         super().__init__(*args, **kwargs)
         self.full_model = full_model
         self.avdi = avdi
@@ -154,15 +526,43 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self.rollout_top_p = rollout_top_p
         self.rollout_max_generation_length = rollout_max_generation_length
         self.logprob_mini_batch_size = logprob_mini_batch_size
-        self._data_cache = ClipDataCache(avdi, self.processing_class)
+        self.use_vllm = use_vllm
+        if not use_vllm:
+            self._data_cache = ClipDataCache(avdi, self.processing_class)
+
+        # Patch FSDP1 weight sync on the VLLMGeneration instance.
+        # TRL's default _sync_fsdp1_params_to_vllm does a post-order
+        # traversal calling FSDP.summon_full_params on each sub-module.
+        # This triggers _lazy_init on children before the root, corrupting
+        # PyTorch FSDP's _is_root hierarchy and raising:
+        #   AssertionError: Non-root FSDP instance's '_is_root' should not
+        #   have been set yet or should have been set to 'False'
+        # Fix: use a single root-level summon_full_params(recurse=True)
+        # which initialises the root first, then gathers all params at once.
+        if use_vllm and self.is_fsdp_enabled and hasattr(self, "vllm_generation"):
+            vllm_gen = self.vllm_generation
+
+            def _patched_sync_fsdp1(module, prefix="", visited=None):
+                with FSDP.summon_full_params(module, recurse=True, writeback=False):
+                    for name, param in module.named_parameters():
+                        name = vllm_gen._fix_param_name_to_vllm(
+                            name, extra_prefixes=["_fsdp_wrapped_module."]
+                        )
+                        if vllm_gen.mode == "server" and vllm_gen.accelerator.is_main_process:
+                            vllm_gen.vllm_client.update_named_param(name, param.data)
+                        elif vllm_gen.mode == "colocate":
+                            llm_model = vllm_gen.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                            llm_model.load_weights([(name, param.data)])
+
+            vllm_gen._sync_fsdp1_params_to_vllm = _patched_sync_fsdp1
+            logger.info("Patched VLLMGeneration._sync_fsdp1_params_to_vllm for FSDP root-level sync.")
 
     def _generate_single_turn(self, prompts: list):
         """Generate CoC text + discrete trajectory tokens via VLM only.
 
-        For each unique prompt, calls ``VLM.generate()`` directly (no Expert
-        or Diffusion). The VLM generates CoC reasoning followed by discrete
-        trajectory tokens, stopping at ``<|traj_future_end|>``. Trajectory
-        tokens are decoded to continuous xyz for reward computation.
+        When ``use_vllm=True``, delegates to the parent's vLLM path which
+        calls our ``rollout_func``.  Otherwise uses HuggingFace
+        ``model.generate()`` directly.
 
         Args:
             prompts: List of prompt strings or message lists (B*G items,
@@ -172,6 +572,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             Tuple of (prompt_ids, completion_ids, logprobs, extra_fields)
             matching TRL's internal interface.
         """
+        if self.use_vllm:
+            return super()._generate_single_turn(prompts)
+
         device = self.accelerator.device
         num_generations = self.num_generations if self.model.training else self.num_generations_eval
 
@@ -332,10 +735,99 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             "clip_ids": all_clip_ids,
             "pred_xyz": all_pred_xyz,
             "gt_xyz": all_gt_xyz,
+            "completion_ids": all_completion_ids,
             "num_generations": num_generations,
         }
 
         return all_prompt_ids, all_completion_ids, all_logprobs, extra_fields
+
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+        """Override to decode trajectory tokens from vLLM completions.
+
+        In the vLLM path, ``rollout_func`` returns ``hist_xyz``, ``hist_rot``,
+        and ``clip_ids`` as extra fields (injected into ``inputs`` by TRL).
+        We extract trajectory tokens from ``completion_ids``, decode them to
+        continuous xyz via ``traj_tokenizer``, and set ``pred_xyz`` before
+        delegating to the parent's reward computation.
+
+        For the HF path, ``pred_xyz`` is already in ``inputs`` (set by
+        ``_generate_single_turn``), so we just pass through.
+        """
+        if not self.use_vllm or not inputs or "hist_xyz" not in inputs[0]:
+            return super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+
+        # vLLM path: decode trajectory tokens from completion_ids
+        traj_token_start_idx = self.full_model.future_token_start_idx
+        tokens_per_future_traj = self.full_model.config.tokens_per_future_traj
+        traj_vocab_size = self.full_model.config.traj_vocab_size
+        special_token_ids = self.full_model.special_token_ids
+        traj_tokenizer = self.full_model.traj_tokenizer
+        num_generations = self.num_generations if self.model.training else self.num_generations_eval
+
+        all_pred_xyz: list[list[float]] = []
+        all_coc_texts: list[str] = []
+        all_clip_ids: list[str] = []
+
+        device = self.accelerator.device
+
+        for i, inp in enumerate(inputs):
+            comp_ids = completion_ids_list[i]
+            comp_tensor = torch.tensor(comp_ids, dtype=torch.long, device=device).unsqueeze(0)
+
+            # Extract trajectory tokens
+            traj_tokens = extract_traj_tokens(
+                comp_tensor, special_token_ids,
+                tokens_per_future_traj, traj_token_start_idx, traj_vocab_size,
+            )
+
+            # Reconstruct hist_xyz/hist_rot from flattened lists
+            hist_xyz_flat = inp["hist_xyz"]
+            hist_rot_flat = inp["hist_rot"]
+            hist_xyz = torch.tensor(hist_xyz_flat, dtype=torch.float32, device=device)
+            hist_rot = torch.tensor(hist_rot_flat, dtype=torch.float32, device=device)
+
+            # Reshape — hist_xyz is (T*3,) flattened, hist_rot is (T*3*3,) flattened
+            n_hist = hist_xyz.numel() // 3
+            hist_xyz = hist_xyz.reshape(1, n_hist, 3)
+            hist_rot = hist_rot.reshape(1, n_hist, 3, 3)
+
+            # Decode trajectory tokens → continuous xyz
+            with torch.no_grad():
+                pred_xyz_tensor, _, _ = traj_tokenizer.decode(
+                    hist_xyz, hist_rot, traj_tokens,
+                )
+
+            pred_traj = pred_xyz_tensor[0].cpu().numpy().flatten().tolist()
+            all_pred_xyz.append(pred_traj)
+
+            # Set pred_xyz on the input dict for reward functions
+            inp["pred_xyz"] = pred_traj
+
+            # Collect for logging
+            all_clip_ids.append(inp.get("clip_ids", ""))
+
+        # Extract CoC text from completions (text strings from TRL)
+        for comp in completions:
+            text = comp if isinstance(comp, str) else ""
+            all_coc_texts.append(text)
+
+        # Clean up vLLM-only fields that reward functions don't expect
+        for inp in inputs:
+            inp.pop("hist_xyz", None)
+            inp.pop("hist_rot", None)
+            inp.pop("clip_ids", None)
+
+        # Stash rollout data for the logging callback
+        self._rollout_log_data = {
+            "coc_texts": all_coc_texts,
+            "clip_ids": all_clip_ids,
+            "pred_xyz": all_pred_xyz,
+            "gt_xyz": [inp.get("gt_xyz", []) for inp in inputs],
+            "completion_ids": completion_ids_list,
+            "num_generations": num_generations,
+        }
+
+        return super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
 
 
 def _compute_batch_logprobs(
@@ -538,7 +1030,7 @@ class RolloutLoggingCallback(TrainerCallback):
         max_samples: Max unique prompts to log per interval.
     """
 
-    def __init__(self, log_interval: int = 10, max_samples: int = 2):
+    def __init__(self, log_interval: int = 1, max_samples: int = 2):
         self.log_interval = log_interval
         self.max_samples = max_samples
         self.trainer = None  # set after trainer construction
@@ -587,15 +1079,39 @@ class RolloutLoggingCallback(TrainerCallback):
             text_md = f"**Clip:** `{clip_id}`\n\n" + "\n\n---\n\n".join(text_parts)
             writer.add_text(f"rollout/coc_text_{i}", text_md, step)
 
+            # --- Generated tokens (decoded) ---
+            completion_ids = data.get("completion_ids")
+            if completion_ids and self.trainer is not None:
+                tokenizer = self.trainer.processing_class.tokenizer
+                token_parts = []
+                for j in range(min(num_gen, 4)):
+                    ids = completion_ids[base + j]
+                    decoded = tokenizer.decode(ids, skip_special_tokens=False)
+                    token_parts.append(
+                        f"**Sample {j}** ({len(ids)} tokens):\n\n"
+                        f"`{ids[:20]}{'...' if len(ids) > 20 else ''}`\n\n"
+                        f"```\n{decoded}\n```"
+                    )
+                tokens_md = f"**Clip:** `{clip_id}`\n\n" + "\n\n---\n\n".join(token_parts)
+                writer.add_text(f"rollout/generated_tokens_{i}", tokens_md, step)
+                logger.info(
+                    "Step %d | Clip %s | Sample 0 (%d tokens): %s",
+                    step, clip_id, len(completion_ids[base]),
+                    tokenizer.decode(completion_ids[base], skip_special_tokens=False)[:200],
+                )
+
             # --- BEV trajectory plot ---
-            fig = _plot_trajectories_bev(
-                pred_list=[data["pred_xyz"][base + j] for j in range(num_gen)],
-                gt_flat=data["gt_xyz"][base],
-                title=f"Step {step} | {clip_id}",
-            )
-            writer.add_figure(f"rollout/trajectory_bev_{i}", fig, step)
-            import matplotlib.pyplot as plt
-            plt.close(fig)
+            try:
+                fig = _plot_trajectories_bev(
+                    pred_list=[data["pred_xyz"][base + j] for j in range(num_gen)],
+                    gt_flat=data["gt_xyz"][base],
+                    title=f"Step {step} | {clip_id}",
+                )
+                writer.add_figure(f"rollout/trajectory_bev_{i}", fig, step)
+                import matplotlib.pyplot as plt
+                plt.close(fig)
+            except OSError as e:
+                logger.warning("Skipping BEV plot at step %d (matplotlib error: %s)", step, e)
 
         writer.flush()
         self.trainer._rollout_log_data = None

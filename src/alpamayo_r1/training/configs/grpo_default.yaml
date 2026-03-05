@@ -18,8 +18,10 @@ device: cuda
 model_name: nvidia/Alpamayo-R1-10B
 
 # LoRA configuration for VLM text attention layers
+# Set lora.enabled=false for full-parameter training (requires FSDP for multi-GPU)
 lora:
-  r: 16
+  enabled: true
+  r: 4
   alpha: 32
   dropout: 0.05
   target_modules:
@@ -40,7 +42,7 @@ training:
   gradient_checkpointing: true  # trade compute for memory
   beta: 0.0                  # no KL penalty -> no reference model needed
   loss_type: grpo
-  logging_steps: 10
+  logging_steps: 1
   save_steps: 200
   save_total_limit: 3
   warmup_ratio: 0.05
@@ -61,11 +63,32 @@ rollout:
   top_p: 0.98
   max_generation_length: 256
   logprob_mini_batch_size: 1  # completions per VLM forward pass — reduced for 40GB GPU
-  log_interval: 10       # steps between rollout logging (CoC text + trajectory plots)
+  log_interval: 1       # steps between rollout logging (CoC text + trajectory plots)
   log_max_samples: 2     # max prompts to log per interval
+
+# vLLM configuration for faster rollout generation
+# Requires: pip install vllm
+# Two modes:
+#   colocate — vLLM engine runs in-process (default)
+#   server   — vLLM runs as a separate process via `trl vllm-serve`
+vllm:
+  enabled: false
+  mode: colocate              # "colocate" or "server"
+  model_impl: transformers    # needed for Qwen3-VL support
+  # --- Colocate-specific ---
+  gpu_memory_utilization: 0.4 # fraction of GPU memory for vLLM KV cache + weights
+  tensor_parallel_size: 1
+  max_model_length: 8192      # must fit 16 images after vision token expansion (~5870 tokens)
+  enable_sleep_mode: false    # offload weights between train/generate phases
+  # --- Server-specific ---
+  server_host: "0.0.0.0"
+  server_port: 8000
+  server_base_url: null       # overrides host+port if set
+  server_timeout: 240.0
+  group_port: 51216
 
 # Reward function weights (must sum to 1.0)
 rewards:
   trajectory_weight: 0.50
-  reasoning_weight: 0.25
-  consistency_weight: 0.25
+  reasoning_weight: 0.5
+  consistency_weight: 0.0

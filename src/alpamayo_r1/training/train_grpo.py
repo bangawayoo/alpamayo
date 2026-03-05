@@ -22,7 +22,9 @@ This script:
 1. Loads the full AlpamayoR1 model (only VLM + trajectory tokenizers are
    moved to GPU; expert/diffusion/projections stay on CPU)
 2. Freezes all non-VLM parameters
-3. Applies LoRA to the VLM's attention layers
+3. Optionally applies LoRA to the VLM's attention layers (lora.enabled=true,
+   the default) or trains all VLM parameters (lora.enabled=false).
+   Full-parameter training should use FSDP for multi-GPU sharding.
 4. Runs GRPO training with VLM-only rollouts via AlpamayoGRPOTrainer
 """
 
@@ -35,7 +37,6 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
-from peft import LoraConfig
 from physical_ai_av import PhysicalAIAVDatasetInterface
 from trl import GRPOConfig
 
@@ -105,16 +106,25 @@ def main(cfg: DictConfig) -> None:
     avdi = PhysicalAIAVDatasetInterface()
 
     # ---------------------------------------------------------------
-    # 4. LoRA configuration for VLM text layers
+    # 4. LoRA configuration (optional — disabled for full-parameter training)
     # ---------------------------------------------------------------
     lora_cfg = cfg.get("lora", {})
-    lora_config = LoraConfig(
-        r=lora_cfg.get("r", 16),
-        lora_alpha=lora_cfg.get("alpha", 32),
-        lora_dropout=lora_cfg.get("dropout", 0.05),
-        target_modules=list(lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])),
-        task_type="CAUSAL_LM",
-    )
+    use_lora = bool(lora_cfg.get("enabled", True))
+
+    if use_lora:
+        from peft import LoraConfig
+
+        lora_config = LoraConfig(
+            r=lora_cfg.get("r", 16),
+            lora_alpha=lora_cfg.get("alpha", 32),
+            lora_dropout=lora_cfg.get("dropout", 0.05),
+            target_modules=list(lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])),
+            task_type="CAUSAL_LM",
+        )
+        logger.info("LoRA enabled: r=%d, alpha=%d", lora_config.r, lora_config.lora_alpha)
+    else:
+        lora_config = None
+        logger.info("LoRA disabled — full-parameter VLM training")
 
     # ---------------------------------------------------------------
     # 5. GRPO training config
@@ -133,6 +143,37 @@ def main(cfg: DictConfig) -> None:
     # Default: per_device_bs * grad_acc, but at least num_generations.
     gen_batch = max(per_device_bs * grad_acc, num_generations)
     gen_batch = gen_batch - (gen_batch % num_generations)  # round down to multiple
+
+    # vLLM configuration (colocate or server mode)
+    vllm_cfg = cfg.get("vllm", {})
+    vllm_enabled = bool(vllm_cfg.get("enabled", False))
+
+    vllm_kwargs = {}
+    if vllm_enabled:
+        vllm_mode = str(vllm_cfg.get("mode", "colocate"))
+        vllm_kwargs = dict(
+            use_vllm=True,
+            vllm_mode=vllm_mode,
+            vllm_model_impl=str(vllm_cfg.get("model_impl", "transformers")),
+        )
+        if vllm_mode == "colocate":
+            vllm_kwargs.update(
+                vllm_gpu_memory_utilization=float(vllm_cfg.get("gpu_memory_utilization", 0.3)),
+                vllm_tensor_parallel_size=int(vllm_cfg.get("tensor_parallel_size", 1)),
+                vllm_max_model_length=vllm_cfg.get("max_model_length", None),
+                vllm_enable_sleep_mode=bool(vllm_cfg.get("enable_sleep_mode", False)),
+            )
+        else:  # server mode
+            vllm_kwargs.update(
+                vllm_server_host=str(vllm_cfg.get("server_host", "0.0.0.0")),
+                vllm_server_port=int(vllm_cfg.get("server_port", 8000)),
+                vllm_server_timeout=float(vllm_cfg.get("server_timeout", 240.0)),
+                vllm_group_port=int(vllm_cfg.get("group_port", 51216)),
+            )
+            server_base_url = vllm_cfg.get("server_base_url", None)
+            if server_base_url is not None:
+                vllm_kwargs["vllm_server_base_url"] = str(server_base_url)
+        logger.info("vLLM %s mode enabled: %s", vllm_mode, vllm_kwargs)
 
     training_args = GRPOConfig(
         output_dir=train_cfg.get("output_dir", "outputs/grpo"),
@@ -154,6 +195,7 @@ def main(cfg: DictConfig) -> None:
         gradient_checkpointing=train_cfg.get("gradient_checkpointing", False),
         report_to=train_cfg.get("report_to", "tensorboard"),
         reward_weights=reward_weights,
+        **vllm_kwargs,
     )
 
     # ---------------------------------------------------------------
@@ -172,6 +214,13 @@ def main(cfg: DictConfig) -> None:
     # 7. Create trainer and train
     # ---------------------------------------------------------------
     rollout_cfg = cfg.get("rollout", {})
+    # Ensure the VLM has name_or_path set so TRL's VLLMGeneration can
+    # locate the model checkpoint when initialising the vLLM engine.
+    if not getattr(full_model.vlm, "name_or_path", ""):
+        full_model.vlm.name_or_path = full_model.config.vlm_name_or_path
+    if not getattr(full_model.vlm.config, "_name_or_path", ""):
+        full_model.vlm.config._name_or_path = full_model.config.vlm_name_or_path
+
     logger.info("Initializing AlpamayoGRPOTrainer...")
     trainer = AlpamayoGRPOTrainer(
         model=full_model.vlm,
@@ -210,9 +259,9 @@ def main(cfg: DictConfig) -> None:
     # by FSDP/accelerator (sharded across GPUs when using FSDP, or placed
     # on the single GPU otherwise). Expert/diffusion stay on CPU.
     device = trainer.accelerator.device
-    if full_model.traj_tokenizer is not None:
+    if full_model.traj_tokenizer is not None and hasattr(full_model.traj_tokenizer, "to"):
         full_model.traj_tokenizer.to(device)
-    if full_model.hist_traj_tokenizer is not None:
+    if full_model.hist_traj_tokenizer is not None and hasattr(full_model.hist_traj_tokenizer, "to"):
         full_model.hist_traj_tokenizer.to(device)
 
     logger.info("Starting GRPO training...")
