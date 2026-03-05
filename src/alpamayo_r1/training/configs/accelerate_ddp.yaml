@@ -1,0 +1,15 @@
+# Accelerate config for DDP (DistributedDataParallel) multi-GPU GRPO training.
+#
+# Use this when each GPU has enough memory to hold the full model (e.g. with
+# LoRA). Simpler than FSDP and often faster for models that fit in memory.
+#
+# Usage:
+#   ./scripts/run_grpo.sh --no-fsdp --num-gpus 2
+#   # or directly:
+#   accelerate launch --config_file this_file.yaml -m alpamayo_r1.training.train_grpo ...
+
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+mixed_precision: bf16
+num_machines: 1
+num_processes: 2  # default; overridden by --num-gpus / --num_processes
