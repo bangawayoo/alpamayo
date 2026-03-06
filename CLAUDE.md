@@ -10,7 +10,7 @@ Alpamayo-R1 is a Vision-Language-Action (VLA) model for autonomous driving that 
 
 - Development environment uses MIG notebook (10GB VRAM)
 - Run enviornment uses multi-gpu
-- Python enviornment is in ./.venv
+- Python enviornment is in conda's .venv environment
 
 ## Running
 

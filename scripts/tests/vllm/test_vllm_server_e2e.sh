@@ -3,9 +3,10 @@
 # the diagnostic test script against it.
 #
 # Usage:
-#   ./scripts/test_vllm_server_e2e.sh                      # text-only tests
-#   ./scripts/test_vllm_server_e2e.sh --with-images         # include multi-image tests
-#   ./scripts/test_vllm_server_e2e.sh --server-gpu 0,1 --tp 2 --with-images
+#   ./scripts/tests/vllm/test_vllm_server_e2e.sh                      # text-only tests
+#   ./scripts/tests/vllm/test_vllm_server_e2e.sh --with-images         # 16-image tests on 5 clips
+#   ./scripts/tests/vllm/test_vllm_server_e2e.sh --with-images --num-clips 3
+#   ./scripts/tests/vllm/test_vllm_server_e2e.sh --server-gpu 0,1 --tp 2 --with-images
 
 set -euo pipefail
 export HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN env var}
@@ -20,6 +21,7 @@ PORT=8000
 HEALTH_TIMEOUT=300
 HEALTH_INTERVAL=5
 WITH_IMAGES=""
+NUM_CLIPS=5
 
 # ---------------------------------------------------------------
 # Parse arguments
@@ -32,6 +34,7 @@ while [[ $# -gt 0 ]]; do
         --port)             PORT="$2";                  shift 2 ;;
         --health-timeout)   HEALTH_TIMEOUT="$2";        shift 2 ;;
         --with-images)      WITH_IMAGES="--with-images"; shift ;;
+        --num-clips)        NUM_CLIPS="$2";             shift 2 ;;
         *)
             echo "Unknown argument: $1"; exit 1 ;;
     esac
@@ -41,8 +44,9 @@ done
 # Paths
 # ---------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-VENV_PYTHON="$PROJECT_ROOT/.venv/bin/python"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+SCRIPTS_ROOT="$PROJECT_ROOT/scripts"
+VENV_PYTHON="/home/jovyan/conda/.venv/bin/python"
 
 if [[ ! -x "$VENV_PYTHON" ]]; then
     echo "Error: venv python not found at $VENV_PYTHON"
@@ -56,6 +60,7 @@ echo "  Server GPU:  $SERVER_GPU"
 echo "  TP size:     $TENSOR_PARALLEL_SIZE"
 echo "  Port:        $PORT"
 echo "  With images: ${WITH_IMAGES:-no}"
+echo "  Num clips:   $NUM_CLIPS"
 echo "================================================================"
 echo ""
 
@@ -85,7 +90,7 @@ if [[ -f "$VLM_CACHE_DIR/config.json" ]]; then
 else
     echo "Extracting VLM backbone from $MODEL..."
     PYTHONPATH="$PROJECT_ROOT/src:${PYTHONPATH:-}" "$VENV_PYTHON" \
-        "$SCRIPT_DIR/extract_vlm.py" \
+        "$SCRIPTS_ROOT/extract_vlm.py" \
         --model "$MODEL" \
         --output "$VLM_CACHE_DIR"
     echo "VLM extracted to $VLM_CACHE_DIR"
@@ -99,8 +104,7 @@ SERVER_LOG="$PROJECT_ROOT/.cache/vllm_server.log"
 echo "Starting vLLM server on GPU $SERVER_GPU (port $PORT)..."
 echo "  Server log: $SERVER_LOG"
 
-VENV_TRL="$PROJECT_ROOT/.venv/bin/trl"
-CUDA_VISIBLE_DEVICES="$SERVER_GPU" "$VENV_TRL" vllm-serve \
+CUDA_VISIBLE_DEVICES="$SERVER_GPU" "$VENV_PYTHON" "$SCRIPTS_ROOT/vllm_serve_patched.py" \
     --model "$VLM_CACHE_DIR" \
     --vllm_model_impl "$MODEL_IMPL" \
     --tensor_parallel_size "$TENSOR_PARALLEL_SIZE" \
@@ -155,6 +159,7 @@ PYTHONUNBUFFERED=1 PYTHONPATH="$PROJECT_ROOT/src:${PYTHONPATH:-}" \
     --port "$PORT" \
     --model "$VLM_CACHE_DIR" \
     --full-model "$MODEL" \
+    --num-clips "$NUM_CLIPS" \
     ${WITH_IMAGES} || TEST_RC=$?
 
 if [[ $TEST_RC -ne 0 ]]; then

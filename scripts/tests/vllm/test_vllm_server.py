@@ -89,10 +89,48 @@ def _send_generate(base_url: str, payload: dict, timeout: int = 180) -> dict | N
 # ---------------------------------------------------------------------------
 
 
-def _load_clip_for_server(
-    full_model_name: str = "nvidia/Alpamayo-R1-10B",
+def _collapse_image_pad_tokens(
+    token_ids: list[int],
+    image_pad_id: int = 151655,
+    vision_start_id: int = 151652,
+    vision_end_id: int = 151653,
+) -> list[int]:
+    """Collapse runs of ``<|image_pad|>`` to a single token per image.
+
+    vLLM's multimodal preprocessor needs at least one ``<|image_pad|>`` between
+    ``<|vision_start|>`` and ``<|vision_end|>`` as a marker to know where to
+    expand.  But if ALL pre-expanded pads are kept, vLLM adds a second set
+    (double-insertion).  Keeping exactly one pad per image lets vLLM replace
+    it with the correct count.
+    """
+    result = []
+    in_vision = False
+    pad_emitted = False
+    for t in token_ids:
+        if t == vision_start_id:
+            in_vision = True
+            pad_emitted = False
+            result.append(t)
+        elif t == vision_end_id:
+            in_vision = False
+            result.append(t)
+        elif t == image_pad_id and in_vision:
+            if not pad_emitted:
+                result.append(t)
+                pad_emitted = True
+        else:
+            result.append(t)
+    return result
+
+
+def _prepare_clip_data(
+    data: dict,
+    clip_id: str,
+    t0_us: int,
+    full_model,
+    processor,
 ) -> dict[str, Any]:
-    """Load a real driving clip and prepare it exactly like the GRPO rollout.
+    """Prepare a single clip's data for the server (tokenize, fuse, strip pads).
 
     Returns dict with:
         prompt_token_ids: list[int]  — full prompt with all 16 images
@@ -104,6 +142,70 @@ def _load_clip_for_server(
         data: dict                   — raw driving data
     """
     import numpy as np
+
+    from alpamayo_r1 import helper
+
+    # 1. Tokenize via chat template (same as helper.prepare_model_inputs)
+    model_inputs = helper.prepare_model_inputs(data, processor, device="cpu")
+
+    # 2. Fuse history trajectory tokens (same as rollout_func)
+    tokenized = model_inputs["tokenized_data"]
+    input_ids = tokenized.pop("input_ids")
+    traj_data = {
+        "ego_history_xyz": model_inputs["ego_history_xyz"],
+        "ego_history_rot": model_inputs["ego_history_rot"],
+    }
+    input_ids = full_model.fuse_traj_tokens(input_ids, traj_data)
+    prompt_token_ids = input_ids[0].cpu().tolist()
+
+    # 3. Extract PIL images (same as ClipDataCache._load_and_cache)
+    frames = data["image_frames"].flatten(0, 1)  # (N*F, 3, H, W)
+    pil_images = [
+        Image.fromarray(frame.permute(1, 2, 0).numpy().astype(np.uint8))
+        for frame in frames
+    ]
+
+    # 4. Diagnostic: count image placeholder groups in token IDs
+    VISION_START = 151652
+    VISION_END = 151653
+    IMAGE_PAD = 151655
+    n_vision_start = prompt_token_ids.count(VISION_START)
+    n_vision_end = prompt_token_ids.count(VISION_END)
+    n_image_pad = prompt_token_ids.count(IMAGE_PAD)
+    print(f"  prompt_token_ids length (before strip): {len(prompt_token_ids)}")
+    print(f"  num images: {len(pil_images)}")
+    print(f"  vision placeholders: {n_vision_start} starts, {n_vision_end} ends, "
+          f"{n_image_pad} pad tokens")
+    if pil_images:
+        print(f"  image size: {pil_images[0].size}, mode={pil_images[0].mode}")
+    if n_vision_start != len(pil_images):
+        print(f"  WARNING: placeholder count ({n_vision_start}) != image count "
+              f"({len(pil_images)})")
+
+    # Strip <|image_pad|> tokens — vLLM will re-insert them from the images.
+    prompt_token_ids = _collapse_image_pad_tokens(prompt_token_ids, IMAGE_PAD)
+    print(f"  prompt_token_ids length (after strip): {len(prompt_token_ids)}")
+
+    return {
+        "prompt_token_ids": prompt_token_ids,
+        "pil_images": pil_images,
+        "clip_id": clip_id,
+        "t0_us": t0_us,
+        "full_model": full_model,
+        "processor": processor,
+        "data": data,
+    }
+
+
+def _load_clips_for_server(
+    full_model_name: str = "nvidia/Alpamayo-R1-10B",
+    num_clips: int = 5,
+) -> list[dict[str, Any]]:
+    """Load multiple real driving clips and prepare them for the server.
+
+    Samples ``num_clips`` clips spread across the valid training set so they
+    are diverse.  Returns a list of clip data dicts (same format as before).
+    """
     import torch
 
     from alpamayo_r1 import helper
@@ -115,7 +217,7 @@ def _load_clip_for_server(
     full_model = AlpamayoR1.from_pretrained(full_model_name, dtype=torch.bfloat16)
     processor = helper.get_processor(full_model.tokenizer)
 
-    # 2. Pick a clip from the dataset
+    # 2. Pick clips spread across the dataset
     from physical_ai_av import PhysicalAIAVDatasetInterface
 
     avdi = PhysicalAIAVDatasetInterface()
@@ -123,61 +225,29 @@ def _load_clip_for_server(
     valid_clips = clip_index[
         (clip_index["split"] == "train") & clip_index["clip_is_valid"]
     ]
-    clip_id = valid_clips.index[0]
+    total = len(valid_clips)
+    num_clips = min(num_clips, total)
+    # Spread evenly across valid clips for diversity
+    indices = [int(i * total / num_clips) for i in range(num_clips)]
     t0_us = 5_100_000
-    print(f"  clip_id={clip_id}, t0_us={t0_us}")
 
-    # 3. Load raw driving data (same as ClipDataCache._load_and_cache)
-    data = load_physical_aiavdataset(
-        clip_id=clip_id, t0_us=t0_us, avdi=avdi, maybe_stream=True
-    )
+    clips = []
+    for idx in indices:
+        clip_id = valid_clips.index[idx]
+        print(f"\n  [{len(clips)+1}/{num_clips}] clip_id={clip_id}, t0_us={t0_us}")
 
-    # 4. Tokenize via chat template (same as helper.prepare_model_inputs)
-    model_inputs = helper.prepare_model_inputs(data, processor, device="cpu")
+        try:
+            data = load_physical_aiavdataset(
+                clip_id=clip_id, t0_us=t0_us, avdi=avdi, maybe_stream=True
+            )
+            clip_data = _prepare_clip_data(data, clip_id, t0_us, full_model, processor)
+            clips.append(clip_data)
+        except Exception as e:
+            print(f"  SKIP: failed to load clip {clip_id}: {e}")
+            continue
 
-    # 5. Fuse history trajectory tokens (same as rollout_func)
-    tokenized = model_inputs["tokenized_data"]
-    input_ids = tokenized.pop("input_ids")
-    traj_data = {
-        "ego_history_xyz": model_inputs["ego_history_xyz"],
-        "ego_history_rot": model_inputs["ego_history_rot"],
-    }
-    input_ids = full_model.fuse_traj_tokens(input_ids, traj_data)
-    prompt_token_ids = input_ids[0].cpu().tolist()
-
-    # 6. Extract PIL images (same as ClipDataCache._load_and_cache)
-    frames = data["image_frames"].flatten(0, 1)  # (N*F, 3, H, W)
-    pil_images = [
-        Image.fromarray(frame.permute(1, 2, 0).numpy().astype(np.uint8))
-        for frame in frames
-    ]
-
-    # 7. Diagnostic: count image placeholder groups in token IDs
-    VISION_START = 151652
-    VISION_END = 151653
-    IMAGE_PAD = 151655
-    n_vision_start = prompt_token_ids.count(VISION_START)
-    n_vision_end = prompt_token_ids.count(VISION_END)
-    n_image_pad = prompt_token_ids.count(IMAGE_PAD)
-    print(f"  prompt_token_ids length: {len(prompt_token_ids)}")
-    print(f"  num images: {len(pil_images)}")
-    print(f"  vision placeholders: {n_vision_start} starts, {n_vision_end} ends, "
-          f"{n_image_pad} pad tokens")
-    if pil_images:
-        print(f"  image size: {pil_images[0].size}, mode={pil_images[0].mode}")
-    if n_vision_start != len(pil_images):
-        print(f"  WARNING: placeholder count ({n_vision_start}) != image count "
-              f"({len(pil_images)})")
-
-    return {
-        "prompt_token_ids": prompt_token_ids,
-        "pil_images": pil_images,
-        "clip_id": clip_id,
-        "t0_us": t0_us,
-        "full_model": full_model,
-        "processor": processor,
-        "data": data,
-    }
+    print(f"\n  Loaded {len(clips)}/{num_clips} clips successfully.")
+    return clips
 
 
 # ---------------------------------------------------------------------------
@@ -210,10 +280,17 @@ def test_text_only(base_url: str, tokenizer=None) -> bool:
 
 
 def test_token_ids_only(base_url: str, tokenizer=None) -> bool:
-    """Send prompt_token_ids instead of text."""
-    print("\n[Test 2] prompt_token_ids (no images)...")
+    """Send a pre-tokenized prompt as text (TRL /generate/ only accepts prompts: list[str])."""
+    print("\n[Test 2] Pre-encoded prompt as text (no images)...")
+    # TRL's GenerateRequest requires `prompts: list[str]`; there is no prompt_token_ids field.
+    # Decode the token IDs [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13] to text.
+    token_ids = [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13]
+    if tokenizer:
+        text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    else:
+        text = "You are a helpful assistant."
     payload = {
-        "prompt_token_ids": [[151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13]],
+        "prompts": [text],
         "max_tokens": 10,
         "temperature": 0.1,
     }
@@ -230,7 +307,9 @@ def _build_prompt_for_n_images(
     """Build prompt_token_ids and PIL images for a subset of the clip's frames.
 
     Re-runs the chat template with only the first ``n_images`` frames so the
-    placeholder count matches exactly.
+    placeholder count matches exactly.  Image-pad tokens are stripped from the
+    returned token IDs so that vLLM can re-insert them during its own
+    multimodal preprocessing (avoiding double-insertion).
     """
     import torch
 
@@ -263,6 +342,9 @@ def _build_prompt_for_n_images(
     }
     input_ids = full_model.fuse_traj_tokens(input_ids, traj_data)
     prompt_token_ids = input_ids[0].cpu().tolist()
+
+    # Strip <|image_pad|> tokens — vLLM will re-insert them from the images.
+    prompt_token_ids = _collapse_image_pad_tokens(prompt_token_ids)
 
     import numpy as np
 
@@ -412,6 +494,13 @@ def main():
         help="Full AlpamayoR1 model name/path (for loading clip data). "
         "Only used with --with-images.",
     )
+    parser.add_argument(
+        "--num-clips",
+        type=int,
+        default=5,
+        help="Number of clips to sample for image tests (default: 5). "
+        "Only used with --with-images.",
+    )
     args = parser.parse_args()
 
     base_url = f"http://{args.host}:{args.port}"
@@ -437,20 +526,18 @@ def main():
 
     if args.with_images:
         print("\n" + "=" * 60)
-        print("Loading real driving clip (same pipeline as GRPO rollout)...")
+        print(f"Loading {args.num_clips} driving clips (same pipeline as GRPO rollout)...")
         print("=" * 60)
-        clip_data = _load_clip_for_server(full_model_name=args.full_model)
+        all_clips = _load_clips_for_server(
+            full_model_name=args.full_model,
+            num_clips=args.num_clips,
+        )
 
-        # Progressive tests: 1 → 4 → 8 → 16 images
-        # Each image adds ~179 tokens after vLLM vision expansion.
-        # With max_model_len=4096, the expanded prompt may exceed the limit.
-        results["real_1img"] = test_real_clip_single_image(base_url, clip_data, tokenizer)
-        if results["real_1img"]:
-            results["real_4img"] = test_real_clip_four_images(base_url, clip_data, tokenizer)
-        if results.get("real_4img"):
-            results["real_8img"] = test_real_clip_eight_images(base_url, clip_data, tokenizer)
-        if results.get("real_8img"):
-            results["real_all"] = test_real_clip_all_images(base_url, clip_data, tokenizer)
+        # Test each clip with all 16 images
+        for i, clip_data in enumerate(all_clips):
+            results[f"clip{i+1}_16img"] = test_real_clip_all_images(
+                base_url, clip_data, tokenizer
+            )
 
     print("\n" + "=" * 60)
     print("Results:")

@@ -113,13 +113,35 @@ def _patch_vllm_mm_sanity_check() -> None:
         logger.debug("vLLM v1 worker utils not available; skipping MM sanity check patch.")
 
 
+def _patch_trl_llm_worker() -> None:
+    """Wrap TRL's ``llm_worker`` so patches run inside the worker subprocess.
+
+    Worker subprocesses are spawned (not forked) so they don't inherit
+    monkey-patches applied in the main process.  By wrapping ``llm_worker``
+    we ensure our vLLM patches execute before ``LLM(...)`` is constructed.
+    """
+    import trl.scripts.vllm_serve as _vllm_serve
+
+    _orig_llm_worker = _vllm_serve.llm_worker
+
+    def _patched_llm_worker(*args, **kwargs):
+        _patch_vllm_qwen3vl_embed()
+        _patch_vllm_mm_sanity_check()
+        return _orig_llm_worker(*args, **kwargs)
+
+    _vllm_serve.llm_worker = _patched_llm_worker
+    logger.info("Wrapped TRL llm_worker to apply vLLM patches in worker subprocess.")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    # Apply patches BEFORE trl imports trigger vLLM worker spawns.
-    # Workers inherit the patched module state via fork().
+    # Apply patches in main process (for any direct usage).
     _patch_vllm_qwen3vl_embed()
     _patch_vllm_mm_sanity_check()
+
+    # Wrap TRL's worker function so patches also run in spawned subprocesses.
+    _patch_trl_llm_worker()
 
     # Launch trl vllm-serve with the remaining CLI args
     sys.argv = ["trl", "vllm-serve"] + sys.argv[1:]
