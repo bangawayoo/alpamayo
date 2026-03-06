@@ -54,7 +54,7 @@ from trl.models import unwrap_model_for_generation
 from alpamayo_r1 import helper
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
-from alpamayo_r1.models.token_utils import StopAfterEOS, extract_text_tokens, extract_traj_tokens
+from alpamayo_r1.models.token_utils import StopAfterEOS, extract_traj_tokens
 
 if TYPE_CHECKING:
     from trl import GRPOConfig
@@ -225,6 +225,40 @@ def _parse_clip_metadata(prompt_text: str) -> tuple[str, int]:
     return clip_match.group(1), int(t0_match.group(1))
 
 
+def _collapse_image_pad_tokens(
+    token_ids: list[int],
+    image_pad_id: int = 151655,
+    vision_start_id: int = 151652,
+    vision_end_id: int = 151653,
+) -> list[int]:
+    """Collapse runs of ``<|image_pad|>`` to a single token per image.
+
+    vLLM's multimodal preprocessor needs at least one ``<|image_pad|>`` between
+    ``<|vision_start|>`` and ``<|vision_end|>`` as a marker to know where to
+    expand.  But if ALL pre-expanded pads are kept, vLLM adds a second set
+    (double-insertion).  Keeping exactly one pad per image lets vLLM replace
+    it with the correct count.
+    """
+    result = []
+    in_vision = False
+    pad_emitted = False
+    for t in token_ids:
+        if t == vision_start_id:
+            in_vision = True
+            pad_emitted = False
+            result.append(t)
+        elif t == vision_end_id:
+            in_vision = False
+            result.append(t)
+        elif t == image_pad_id and in_vision:
+            if not pad_emitted:
+                result.append(t)
+                pad_emitted = True
+        else:
+            result.append(t)
+    return result
+
+
 def make_vllm_rollout_func(
     full_model: AlpamayoR1,
     data_cache: ClipDataCache,
@@ -323,6 +357,11 @@ def make_vllm_rollout_func(
             }
             input_ids = full_model.fuse_traj_tokens(input_ids, traj_data)
             prompt_token_ids = input_ids[0].cpu().tolist()
+
+            # Collapse <|image_pad|> runs to a single token per image.
+            # vLLM re-inserts the correct count from the PIL images; keeping
+            # all pre-expanded pads causes double-insertion and CUDA errors.
+            prompt_token_ids = _collapse_image_pad_tokens(prompt_token_ids)
 
             # Get PIL images for vLLM multimodal
             pil_images = data_cache.get_pil_images(clip_id, t0_us)
@@ -557,6 +596,30 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             vllm_gen._sync_fsdp1_params_to_vllm = _patched_sync_fsdp1
             logger.info("Patched VLLMGeneration._sync_fsdp1_params_to_vllm for FSDP root-level sync.")
 
+    def _save(self, output_dir, state_dict=None):
+        """Override to pass save_embedding_layers=True for PEFT models.
+
+        Qwen3VLConfig doesn't expose ``vocab_size`` at the top level, which
+        causes PEFT's auto-detection to crash with AttributeError. Since we
+        know the vocabulary is resized (trajectory + special tokens), we
+        explicitly tell PEFT to save embedding layers.
+        """
+        if state_dict is not None and not (hasattr(self.model, "peft_config")):
+            super()._save(output_dir, state_dict=state_dict)
+            return
+
+        import os
+
+        os.makedirs(output_dir, exist_ok=True)
+        self.model.save_pretrained(
+            output_dir,
+            state_dict=state_dict,
+            safe_serialization=self.args.save_safetensors,
+            save_embedding_layers=True,
+        )
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
+
     def _generate_single_turn(self, prompts: list):
         """Generate CoC text + discrete trajectory tokens via VLM only.
 
@@ -661,11 +724,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     # vlm_output: (num_generations, prompt_len + generated_len)
                     generated_seqs = vlm_output[:, prompt_len:]  # (num_gen, gen_len)
 
-                    # 4. Extract CoC text
-                    coc_dict = extract_text_tokens(self.full_model.tokenizer, vlm_output)
-                    coc_texts = coc_dict.get("cot", [""] * num_generations)
-
-                    # 5. Extract trajectory tokens and decode to continuous xyz
+                    # 4. Extract trajectory tokens and decode to continuous xyz
                     traj_tokens = extract_traj_tokens(
                         vlm_output, special_token_ids,
                         tokens_per_future_traj, traj_token_start_idx, traj_vocab_size,
@@ -679,12 +738,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                             hist_xyz_rep, hist_rot_rep, traj_tokens,
                         )
 
-                    # 6. Build per-sample outputs (num_generations per unique prompt)
+                    # 5. Build per-sample outputs (num_generations per unique prompt)
                     prompt_ids_list = prompt_input_ids[0].cpu().tolist()
+                    traj_future_start_id = special_token_ids["traj_future_start"]
 
                     for sample_idx in range(num_generations):
-                        coc_text = coc_texts[sample_idx] if sample_idx < len(coc_texts) else ""
-
                         # Completion = all generated tokens up to <|traj_future_end|>
                         # (trim trailing pad and extra token from StopAfterEOS)
                         raw_completion = generated_seqs[sample_idx].cpu().tolist()
@@ -700,6 +758,16 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         # TRL requires at least one token
                         if not completion_ids:
                             completion_ids = [self.processing_class.tokenizer.eos_token_id]
+
+                        # Extract CoC text: decode tokens before <|traj_future_start|>.
+                        # This is robust regardless of whether <|cot_end|> is generated.
+                        try:
+                            traj_start_pos = raw_completion.index(traj_future_start_id)
+                        except ValueError:
+                            traj_start_pos = len(raw_completion)
+                        coc_text = self.full_model.tokenizer.decode(
+                            raw_completion[:traj_start_pos], skip_special_tokens=True
+                        ).strip()
 
                         all_prompt_ids.append(prompt_ids_list)
                         all_completion_ids.append(completion_ids)
@@ -1026,12 +1094,14 @@ class RolloutLoggingCallback(TrainerCallback):
     ``log_interval`` steps.
 
     Args:
-        log_interval: Steps between rollout logs.
+        log_interval: Steps between text rollout logs (CoC text, generated tokens).
+        plot_interval: Steps between BEV trajectory plots. Defaults to log_interval.
         max_samples: Max unique prompts to log per interval.
     """
 
-    def __init__(self, log_interval: int = 1, max_samples: int = 2):
+    def __init__(self, log_interval: int = 1, plot_interval: int | None = None, max_samples: int = 2):
         self.log_interval = log_interval
+        self.plot_interval = plot_interval if plot_interval is not None else log_interval
         self.max_samples = max_samples
         self.trainer = None  # set after trainer construction
         self._tb_writer = None
@@ -1049,7 +1119,9 @@ class RolloutLoggingCallback(TrainerCallback):
         return None
 
     def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % self.log_interval != 0:
+        should_log_text = state.global_step % self.log_interval == 0
+        should_plot = state.global_step % self.plot_interval == 0
+        if not should_log_text and not should_plot:
             return
         if self.trainer is None:
             return
@@ -1070,48 +1142,50 @@ class RolloutLoggingCallback(TrainerCallback):
             base = i * num_gen
             clip_id = data["clip_ids"][base]
 
-            # --- CoC text (as markdown) ---
-            text_parts = []
-            for j in range(min(num_gen, 4)):
-                text_parts.append(
-                    f"**Sample {j}:**\n\n{data['coc_texts'][base + j]}"
-                )
-            text_md = f"**Clip:** `{clip_id}`\n\n" + "\n\n---\n\n".join(text_parts)
-            writer.add_text(f"rollout/coc_text_{i}", text_md, step)
-
-            # --- Generated tokens (decoded) ---
-            completion_ids = data.get("completion_ids")
-            if completion_ids and self.trainer is not None:
-                tokenizer = self.trainer.processing_class.tokenizer
-                token_parts = []
+            if should_log_text:
+                # --- CoC text (as markdown) ---
+                text_parts = []
                 for j in range(min(num_gen, 4)):
-                    ids = completion_ids[base + j]
-                    decoded = tokenizer.decode(ids, skip_special_tokens=False)
-                    token_parts.append(
-                        f"**Sample {j}** ({len(ids)} tokens):\n\n"
-                        f"`{ids[:20]}{'...' if len(ids) > 20 else ''}`\n\n"
-                        f"```\n{decoded}\n```"
+                    text_parts.append(
+                        f"**Sample {j}:**\n\n{data['coc_texts'][base + j]}"
                     )
-                tokens_md = f"**Clip:** `{clip_id}`\n\n" + "\n\n---\n\n".join(token_parts)
-                writer.add_text(f"rollout/generated_tokens_{i}", tokens_md, step)
-                logger.info(
-                    "Step %d | Clip %s | Sample 0 (%d tokens): %s",
-                    step, clip_id, len(completion_ids[base]),
-                    tokenizer.decode(completion_ids[base], skip_special_tokens=False)[:200],
-                )
+                text_md = f"**Clip:** `{clip_id}`\n\n" + "\n\n---\n\n".join(text_parts)
+                writer.add_text(f"rollout/coc_text_{i}", text_md, step)
 
-            # --- BEV trajectory plot ---
-            try:
-                fig = _plot_trajectories_bev(
-                    pred_list=[data["pred_xyz"][base + j] for j in range(num_gen)],
-                    gt_flat=data["gt_xyz"][base],
-                    title=f"Step {step} | {clip_id}",
-                )
-                writer.add_figure(f"rollout/trajectory_bev_{i}", fig, step)
-                import matplotlib.pyplot as plt
-                plt.close(fig)
-            except OSError as e:
-                logger.warning("Skipping BEV plot at step %d (matplotlib error: %s)", step, e)
+                # --- Generated tokens (decoded) ---
+                completion_ids = data.get("completion_ids")
+                if completion_ids and self.trainer is not None:
+                    tokenizer = self.trainer.processing_class.tokenizer
+                    token_parts = []
+                    for j in range(min(num_gen, 4)):
+                        ids = completion_ids[base + j]
+                        decoded = tokenizer.decode(ids, skip_special_tokens=False)
+                        token_parts.append(
+                            f"**Sample {j}** ({len(ids)} tokens):\n\n"
+                            f"`{ids[:20]}{'...' if len(ids) > 20 else ''}`\n\n"
+                            f"```\n{decoded}\n```"
+                        )
+                    tokens_md = f"**Clip:** `{clip_id}`\n\n" + "\n\n---\n\n".join(token_parts)
+                    writer.add_text(f"rollout/generated_tokens_{i}", tokens_md, step)
+                    logger.info(
+                        "Step %d | Clip %s | Sample 0 (%d tokens): %s",
+                        step, clip_id, len(completion_ids[base]),
+                        tokenizer.decode(completion_ids[base], skip_special_tokens=False)[:200],
+                    )
+
+            if should_plot:
+                # --- BEV trajectory plot ---
+                try:
+                    fig = _plot_trajectories_bev(
+                        pred_list=[data["pred_xyz"][base + j] for j in range(num_gen)],
+                        gt_flat=data["gt_xyz"][base],
+                        title=f"Step {step} | {clip_id}",
+                    )
+                    writer.add_figure(f"rollout/trajectory_bev_{i}", fig, step)
+                    import matplotlib.pyplot as plt
+                    plt.close(fig)
+                except OSError as e:
+                    logger.warning("Skipping BEV plot at step %d (matplotlib error: %s)", step, e)
 
         writer.flush()
         self.trainer._rollout_log_data = None

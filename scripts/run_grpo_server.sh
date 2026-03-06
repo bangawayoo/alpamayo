@@ -44,11 +44,7 @@ fi
 # ---------------------------------------------------------------
 # Defaults (adapt to available GPUs)
 # ---------------------------------------------------------------
-if [[ "$NUM_GPUS" -ge 4 ]]; then
-    SERVER_GPU=0,1
-    TRAIN_GPU=2,3
-    TENSOR_PARALLEL_SIZE=2
-elif [[ "$NUM_GPUS" -ge 2 ]]; then
+if [[ "$NUM_GPUS" -ge 2 ]]; then
     SERVER_GPU=0
     TRAIN_GPU=1
     TENSOR_PARALLEL_SIZE=1
@@ -64,7 +60,7 @@ MODEL="nvidia/Alpamayo-R1-10B"
 MODEL_IMPL="auto"
 PORT=8000
 NO_LORA=0
-GPU_MEM_UTIL=0.85    # fraction of GPU memory vLLM may use
+GPU_MEM_UTIL=0.9    # fraction of GPU memory vLLM may use
 HEALTH_TIMEOUT=300   # seconds to wait for server readiness
 HEALTH_INTERVAL=5    # seconds between health checks
 EXTRA_ARGS=()        # forwarded to run_grpo.sh

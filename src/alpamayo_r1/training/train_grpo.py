@@ -246,8 +246,12 @@ def main(cfg: DictConfig) -> None:
     rollout_log_interval = rollout_cfg.get(
         "log_interval", train_cfg.get("logging_steps", 10)
     )
+    rollout_plot_interval = rollout_cfg.get("plot_interval", None)
+    if rollout_plot_interval is not None:
+        rollout_plot_interval = int(rollout_plot_interval)
     rollout_callback = RolloutLoggingCallback(
         log_interval=int(rollout_log_interval),
+        plot_interval=rollout_plot_interval,
         max_samples=int(rollout_cfg.get("log_max_samples", 2)),
     )
     trainer.add_callback(rollout_callback)
