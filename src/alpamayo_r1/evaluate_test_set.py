@@ -32,9 +32,10 @@ from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 class AlpamayoDataset(Dataset):
     """Dataset for batched loading of Alpamayo samples."""
 
-    def __init__(self, clip_ids, t0_us=5_100_000):
+    def __init__(self, clip_ids, t0_us=5_100_000, revision=None):
         self.clip_ids = clip_ids
         self.t0_us = t0_us
+        self.revision = revision
         # Each worker process needs its own AVDI instance
         self.avdi = None
 
@@ -42,9 +43,13 @@ class AlpamayoDataset(Dataset):
         return len(self.clip_ids)
 
     def _get_avdi(self):
-        """Lazy initialization of AVDI per worker."""
+        """Lazy initialization of AVDI per worker.
+
+        Passes the pre-resolved revision so workers don't each call
+        ``list_repo_refs()`` (avoids redundant HF API requests).
+        """
         if self.avdi is None:
-            self.avdi = PhysicalAIAVDatasetInterface()
+            self.avdi = PhysicalAIAVDatasetInterface(revision=self.revision)
         return self.avdi
 
     def __getitem__(self, idx):
@@ -111,6 +116,7 @@ def evaluate_batch(
     temperature: float,
     top_p: float,
     device: str,
+    t0_us: int = 5_100_000,
 ) -> list:
     """Evaluate a batch of samples."""
     results = []
@@ -120,7 +126,7 @@ def evaluate_batch(
             results.append(
                 {
                     "clip_id": sample["clip_id"],
-                    "t0_us": 5_100_000,
+                    "t0_us": t0_us,
                     "minADE": None,
                     "minFDE": None,
                     "success": False,
@@ -158,7 +164,7 @@ def evaluate_batch(
             results.append(
                 {
                     "clip_id": sample["clip_id"],
-                    "t0_us": 5_100_000,
+                    "t0_us": t0_us,
                     "minADE": min_ade,
                     "minFDE": min_fde,
                     "success": True,
@@ -173,7 +179,7 @@ def evaluate_batch(
             results.append(
                 {
                     "clip_id": sample["clip_id"],
-                    "t0_us": 5_100_000,
+                    "t0_us": t0_us,
                     "minADE": None,
                     "minFDE": None,
                     "success": False,
@@ -193,7 +199,13 @@ def main():
         "--model-name",
         type=str,
         default="nvidia/Alpamayo-R1-10B",
-        help="Model name or path",
+        help="Model name or path (full model or LoRA adapter checkpoint)",
+    )
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        default="nvidia/Alpamayo-R1-10B",
+        help="Base model for LoRA checkpoints (ignored for full model paths)",
     )
     parser.add_argument(
         "--num-samples", type=int, default=None, help="Number of test samples to evaluate"
@@ -236,8 +248,25 @@ def main():
         action="store_true",
         help="Use torch.compile for faster inference (PyTorch 2.0+)",
     )
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=None,
+        help="Shard index for multi-GPU data parallelism (0-based)",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help="Total number of shards for multi-GPU data parallelism",
+    )
 
     args = parser.parse_args()
+
+    if (args.shard_id is None) != (args.num_shards is None):
+        parser.error("--shard-id and --num-shards must be used together")
+    if args.shard_id is not None and args.shard_id >= args.num_shards:
+        parser.error("--shard-id must be less than --num-shards")
 
     # Set random seed
     torch.manual_seed(args.seed)
@@ -259,18 +288,28 @@ def main():
     print(f"Data loading workers: {args.num_workers}")
     print(f"Prefetch factor: {args.prefetch_factor}")
     print(f"Model compilation: {'enabled' if args.compile_model else 'disabled'}")
+    if args.shard_id is not None:
+        print(f"Shard: {args.shard_id}/{args.num_shards}")
     print(f"Random seed: {args.seed}")
     print(f"Output directory: {output_dir}")
     print("=" * 80)
 
     # Load model
     print("\nLoading model...")
-    # Avoid .to(device) — in MIG environments the generic "cuda" device string
-    # causes "CUDA driver error: invalid argument".  device_map="auto" lets HF
-    # place weights directly on the available GPU without a separate .to() call.
-    model = AlpamayoR1.from_pretrained(
-        args.model_name, dtype=torch.bfloat16, device_map="auto"
-    )
+    model_path = Path(args.model_name)
+    is_lora = (model_path / "adapter_config.json").exists()
+    if is_lora:
+        print(f"Detected LoRA adapter at {model_path}")
+        model = AlpamayoR1.from_pretrained_with_lora(
+            adapter_path=args.model_name,
+            base_model_name=args.base_model,
+            dtype=torch.bfloat16,
+            device_map="auto",
+        )
+    else:
+        model = AlpamayoR1.from_pretrained(
+            args.model_name, dtype=torch.bfloat16, device_map="auto"
+        )
     model.eval()
     processor = helper.get_processor(model.tokenizer)
 
@@ -282,14 +321,17 @@ def main():
     print("Model loaded successfully!")
 
     # Get clip IDs
+    avdi = PhysicalAIAVDatasetInterface()
     if args.use_clip_ids_file:
-        print("\nUsing clip_ids.parquet file...")
+        print("\nUsing clip_ids.parquet file (test split only)...")
         clip_ids_df = pd.read_parquet("notebooks/clip_ids.parquet")
-        test_clips = clip_ids_df["clip_id"].tolist()
-        print(f"Found {len(test_clips)} clips in clip_ids.parquet")
+        all_eval_ids = set(clip_ids_df["clip_id"].tolist())
+        clip_index = avdi.clip_index
+        test_ids = set(clip_index[clip_index["split"] == "test"].index)
+        test_clips = sorted(all_eval_ids & test_ids)
+        print(f"clip_ids.parquet: {len(all_eval_ids)} total, {len(test_clips)} in test split")
     else:
         print("\nLoading test split from dataset...")
-        avdi = PhysicalAIAVDatasetInterface()
         clip_index = avdi.clip_index
         test_df = clip_index[(clip_index["split"] == "test") & clip_index["clip_is_valid"]]
         test_clips = test_df.index.tolist()
@@ -300,11 +342,22 @@ def main():
         test_clips = test_clips[: args.num_samples]
         print(f"Limiting evaluation to {len(test_clips)} samples")
 
+    # Shard the clip list for multi-GPU data parallelism
+    if args.shard_id is not None:
+        total = len(test_clips)
+        shard_size = (total + args.num_shards - 1) // args.num_shards
+        start = args.shard_id * shard_size
+        end = min(start + shard_size, total)
+        test_clips = test_clips[start:end]
+        print(f"Shard {args.shard_id}/{args.num_shards}: clips [{start}:{end}] ({len(test_clips)} samples)")
+
     print(f"\nEvaluating {len(test_clips)} test samples...")
     print("=" * 80)
 
-    # Create dataset and dataloader
-    dataset = AlpamayoDataset(test_clips, t0_us=args.t0_us)
+    # Create dataset and dataloader.
+    # Pass the resolved revision so DataLoader workers reuse the same cache
+    # (avoids per-worker list_repo_refs API calls and revision mismatch).
+    dataset = AlpamayoDataset(test_clips, t0_us=args.t0_us, revision=avdi.revision)
     dataloader = DataLoader(
         dataset,
         batch_size=1,  # Process one at a time for inference, but prefetch in background
@@ -327,6 +380,7 @@ def main():
                 temperature=args.temperature,
                 top_p=args.top_p,
                 device=args.device,
+                t0_us=args.t0_us,
             )
             all_results.extend(results)
 
@@ -401,15 +455,16 @@ def main():
         }
         print("\n⚠️  All evaluations failed!")
 
-    # Save results
-    results_csv = output_dir / "results.csv"
+    # Save results (use shard-specific filenames when sharding)
+    shard_suffix = f"_shard{args.shard_id}" if args.shard_id is not None else ""
+    results_csv = output_dir / f"results{shard_suffix}.csv"
     results_df.to_csv(results_csv, index=False)
-    print(f"\n✅ Detailed results saved to: {results_csv}")
+    print(f"\nDetailed results saved to: {results_csv}")
 
-    stats_json = output_dir / "statistics.json"
+    stats_json = output_dir / f"statistics{shard_suffix}.json"
     with open(stats_json, "w") as f:
         json.dump(stats, f, indent=2)
-    print(f"✅ Summary statistics saved to: {stats_json}")
+    print(f"Summary statistics saved to: {stats_json}")
 
     # Print failure summary if any
     if len(failed_results) > 0:
