@@ -89,3 +89,7 @@ CoC: `<|cot_start|>`, `<|cot_end|>`
 
 - Imperative mood for commit messages
 - Follow existing conventions in each file/module
+
+## Response Conventions
+
+- You can freely make revisions to code to improve them. When you do, always tell me which files have changed at the end of you response.

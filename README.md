@@ -2,6 +2,12 @@
 
 # 🏔️ Alpamayo 1
 
+## TODO (Last Update: 26.03.06)
+ [ ] SFT
+ [ ] Evaluation
+      [ ] Stopping criterion for RL post-train
+      [ ] Train / Val. Split 
+
 ### Bridging Reasoning and Action Prediction for Generalizable Autonomous Driving
 
 [![HuggingFace](https://img.shields.io/badge/🤗%20Model-Alpamayo--R1--10B-blue)](https://huggingface.co/nvidia/Alpamayo-R1-10B)
