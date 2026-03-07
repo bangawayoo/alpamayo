@@ -76,6 +76,49 @@ class AlpamayoR1(ReasoningVLA):
     config_class: type[AlpamayoR1Config] = AlpamayoR1Config
     base_model_prefix = "vlm"
 
+    @classmethod
+    def from_pretrained_with_lora(
+        cls,
+        adapter_path: str,
+        base_model_name: str = "nvidia/Alpamayo-R1-10B",
+        dtype: torch.dtype = torch.bfloat16,
+        device_map: str | None = "auto",
+        merge: bool = True,
+    ) -> "AlpamayoR1":
+        """Load base AlpamayoR1 model and apply a LoRA adapter to the VLM.
+
+        GRPO training saves only a PEFT LoRA adapter for the VLM component.
+        This method loads the full AlpamayoR1 model, applies the adapter to
+        ``self.vlm``, optionally merges the weights, and returns the model
+        ready for inference.
+
+        Args:
+            adapter_path: Path to the LoRA adapter checkpoint directory
+                (contains ``adapter_config.json`` and ``adapter_model.safetensors``).
+            base_model_name: HuggingFace model ID or local path for the base
+                AlpamayoR1 model.
+            dtype: Torch dtype for model weights.
+            device_map: Device placement strategy (passed to ``from_pretrained``).
+            merge: If True, merge LoRA weights into the base model and unload
+                the adapter for faster inference.
+
+        Returns:
+            AlpamayoR1 model with LoRA weights applied.
+        """
+        from peft import PeftModel
+
+        logger.info("Loading base model from %s", base_model_name)
+        model = cls.from_pretrained(base_model_name, dtype=dtype, device_map=device_map)
+
+        logger.info("Applying LoRA adapter from %s", adapter_path)
+        model.vlm = PeftModel.from_pretrained(model.vlm, adapter_path)
+
+        if merge:
+            logger.info("Merging LoRA weights into base model")
+            model.vlm = model.vlm.merge_and_unload()
+
+        return model
+
     def __init__(
         self,
         config: AlpamayoR1Config,
