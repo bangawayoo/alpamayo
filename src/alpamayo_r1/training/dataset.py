@@ -68,6 +68,7 @@ def build_alpamayo_dataset(
     t0_us: int = 5_100_000,
     max_samples: int | None = None,
     clip_ids_file: str | None = None,
+    exclude_clip_ids_file: str | None = None,
     avdi: PhysicalAIAVDatasetInterface | None = None,
 ) -> Dataset:
     """Build an HF Dataset from PhysicalAI-AV for GRPO training.
@@ -83,6 +84,9 @@ def build_alpamayo_dataset(
         max_samples: Optional cap on dataset size for debugging.
         clip_ids_file: Optional path to a parquet file with a ``clip_id`` column.
             If provided, overrides the split-based selection.
+        exclude_clip_ids_file: Optional path to a parquet file with a ``clip_id``
+            column. Clips listed here are removed from the training set (e.g.
+            to exclude evaluation clips).
         avdi: Pre-initialized dataset interface. Created if None.
 
     Returns:
@@ -102,6 +106,13 @@ def build_alpamayo_dataset(
         ]
         clip_ids = split_df.index.tolist()
         logger.info("Found %d valid clips for split '%s'", len(clip_ids), split)
+
+    if exclude_clip_ids_file is not None:
+        exclude_df = pd.read_parquet(exclude_clip_ids_file)
+        exclude_set = set(exclude_df["clip_id"].tolist())
+        before = len(clip_ids)
+        clip_ids = [c for c in clip_ids if c not in exclude_set]
+        logger.info("Excluded %d clips (%s), %d remaining", before - len(clip_ids), exclude_clip_ids_file, len(clip_ids))
 
     if max_samples is not None:
         clip_ids = clip_ids[:max_samples]
