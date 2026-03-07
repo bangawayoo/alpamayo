@@ -33,11 +33,11 @@ lora:
 # GRPOConfig training parameters
 training:
   output_dir: outputs/grpo
-  num_train_epochs: 3
+  num_train_epochs: 1
   per_device_train_batch_size: 4
   gradient_accumulation_steps: 1
   learning_rate: 1e-5
-  num_generations: 4        # G in GRPO (group size for advantage estimation)
+  num_generations: 8        # G in GRPO (group size for advantage estimation)
   max_completion_length: 384  # CoC tokens (≤256) + 64 trajectory tokens + special tokens overhead
   gradient_checkpointing: true  # trade compute for memory
   beta: 0.0                  # no KL penalty -> no reference model needed
@@ -53,8 +53,9 @@ training:
 data:
   split: train
   t0_us: 5100000  # 5.1 seconds into each clip
-  max_samples: 5000  # null = use all samples; set to int for debugging
+  max_samples: 3000  # null = use all samples; set to int for debugging
   clip_ids_file: null  # optional path to parquet with clip_id column
+  exclude_clip_ids_file: notebooks/clip_ids.parquet  # exclude evaluation clips from training
 
 # Rollout function parameters
 rollout:

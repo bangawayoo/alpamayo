@@ -139,10 +139,6 @@ def main(cfg: DictConfig) -> None:
     num_generations = train_cfg.get("num_generations", 8)
     per_device_bs = train_cfg.get("per_device_train_batch_size", 4)
     grad_acc = train_cfg.get("gradient_accumulation_steps", 16)
-    # generation_batch_size must be divisible by num_generations.
-    # Default: per_device_bs * grad_acc, but at least num_generations.
-    gen_batch = max(per_device_bs * grad_acc, num_generations)
-    gen_batch = gen_batch - (gen_batch % num_generations)  # round down to multiple
 
     # vLLM configuration (colocate or server mode)
     vllm_cfg = cfg.get("vllm", {})
@@ -207,6 +203,7 @@ def main(cfg: DictConfig) -> None:
         t0_us=data_cfg.get("t0_us", 5_100_000),
         max_samples=data_cfg.get("max_samples", None),
         clip_ids_file=data_cfg.get("clip_ids_file", None),
+        exclude_clip_ids_file=data_cfg.get("exclude_clip_ids_file", None),
         avdi=avdi,
     )
 
