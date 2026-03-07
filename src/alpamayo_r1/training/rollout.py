@@ -203,6 +203,35 @@ class ClipDataCache:
         return self._cache[key]["pil_images"]
 
 
+def _group_consecutive_prompts(prompts: list) -> list[tuple[Any, int]]:
+    """Group consecutive identical prompts and return (prompt, count) pairs.
+
+    TRL repeats each prompt ``num_generations`` times, but distributed training
+    may split those repetitions across GPUs.  This helper detects the *actual*
+    local repeat count instead of assuming ``num_generations`` copies are present.
+    """
+    groups: list[tuple[Any, int]] = []
+    for p in prompts:
+        if groups and _prompt_eq(groups[-1][0], p):
+            groups[-1] = (groups[-1][0], groups[-1][1] + 1)
+        else:
+            groups.append((p, 1))
+    return groups
+
+
+def _prompt_eq(a: Any, b: Any) -> bool:
+    """Check if two prompts are equal (handles str and list-of-dict formats)."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, str):
+        return a == b
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return False
+        return all(x == y for x, y in zip(a, b))
+    return a == b
+
+
 def _parse_clip_metadata(prompt_text: str) -> tuple[str, int]:
     """Extract clip_id and t0_us from the prompt system message.
 
@@ -312,8 +341,11 @@ def make_vllm_rollout_func(
         device = trainer.accelerator.device
         num_generations = trainer.num_generations if trainer.model.training else trainer.num_generations_eval
 
-        # De-duplicate prompts (TRL repeats each prompt num_generations times)
-        unique_prompts = prompts[::num_generations]
+        # De-duplicate prompts: TRL repeats each prompt, but distributed
+        # training may split repetitions across GPUs.  Detect actual local
+        # repeat counts instead of assuming num_generations copies are here.
+        prompt_groups = _group_consecutive_prompts(prompts)
+        gen_counts = [count for _, count in prompt_groups]
 
         all_prompt_ids: list[list[int]] = []
         all_completion_ids: list[list[int]] = []
@@ -323,7 +355,7 @@ def make_vllm_rollout_func(
         all_hist_rot: list[list[float]] = []
         all_clip_ids: list[str] = []
 
-        # Build vLLM inputs for all prompts (expanded by num_generations)
+        # Build vLLM inputs for all prompts (expanded by local gen count)
         vllm_inputs: list[dict] = []
         prompt_ids_per_unique: list[list[int]] = []
         pil_images_per_unique: list[list] = []
@@ -332,7 +364,7 @@ def make_vllm_rollout_func(
         hist_rot_per_unique: list[list[float]] = []
         clip_ids_per_unique: list[str] = []
 
-        for prompt in unique_prompts:
+        for (prompt, local_gen_count) in prompt_groups:
             # Resolve prompt to string if conversational
             if isinstance(prompt, list):
                 prompt_text = " ".join(
@@ -378,8 +410,8 @@ def make_vllm_rollout_func(
             )
             clip_ids_per_unique.append(clip_id)
 
-            # Repeat each prompt num_generations times (colocate uses n=1)
-            for _ in range(num_generations):
+            # Repeat each prompt local_gen_count times (colocate uses n=1)
+            for _ in range(local_gen_count):
                 vllm_inputs.append({
                     "prompt_token_ids": prompt_token_ids,
                     "multi_modal_data": {"image": pil_images},
@@ -404,8 +436,12 @@ def make_vllm_rollout_func(
             )
 
             # Parse colocate outputs (list of RequestOutput objects)
+            # Build a mapping from request index to unique prompt index
+            _req_to_unique = []
+            for uid, gc in enumerate(gen_counts):
+                _req_to_unique.extend([uid] * gc)
             for req_idx, req_output in enumerate(request_outputs):
-                unique_idx = req_idx // num_generations
+                unique_idx = _req_to_unique[req_idx]
                 output = req_output.outputs[0]  # n=1, so single output per request
 
                 all_prompt_ids.append(prompt_ids_per_unique[unique_idx])
@@ -442,8 +478,8 @@ def make_vllm_rollout_func(
             # history trajectory tokens) and PIL images from the loop above.
             server_token_ids: list[list[int]] = []
             images_per_prompt: list[list] = []
-            for unique_idx in range(len(unique_prompts)):
-                for _ in range(num_generations):
+            for unique_idx, gc in enumerate(gen_counts):
+                for _ in range(gc):
                     server_token_ids.append(prompt_ids_per_unique[unique_idx])
                     images_per_prompt.append(pil_images_per_unique[unique_idx])
 
@@ -459,8 +495,11 @@ def make_vllm_rollout_func(
             )
 
             # Parse server response (dict with lists)
+            _srv_to_unique = []
+            for uid, gc in enumerate(gen_counts):
+                _srv_to_unique.extend([uid] * gc)
             for req_idx in range(len(server_token_ids)):
-                unique_idx = req_idx // num_generations
+                unique_idx = _srv_to_unique[req_idx]
 
                 all_prompt_ids.append(result["prompt_ids"][req_idx])
 
@@ -649,8 +688,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         traj_tokenizer = self.full_model.traj_tokenizer
         pad_token_id = self.processing_class.tokenizer.pad_token_id
 
-        # De-duplicate prompts (TRL repeats each prompt num_generations times)
-        unique_prompts = prompts[::num_generations]
+        # De-duplicate prompts: TRL repeats each prompt, but distributed
+        # training may split repetitions across GPUs.  Detect actual local
+        # repeat counts instead of assuming num_generations copies are here.
+        prompt_groups = _group_consecutive_prompts(prompts)
 
         all_prompt_ids: list[list[int]] = []
         all_completion_ids: list[list[int]] = []
@@ -673,7 +714,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         )
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator):
             with torch.no_grad(), fsdp_ctx:
-                for prompt in unique_prompts:
+                for prompt, local_gen_count in prompt_groups:
                     # Resolve prompt to string if conversational
                     if isinstance(prompt, list):
                         prompt_text = " ".join(
@@ -701,11 +742,14 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     prompt_input_ids = input_ids.clone()
 
                     # 3. VLM-only generation (no ExpertLogitsProcessor)
+                    # Generate only as many sequences as this GPU needs for this
+                    # prompt group (may be less than num_generations when
+                    # generations are distributed across GPUs).
                     gen_config = GenerationConfig(
                         do_sample=True,
                         temperature=self.rollout_temperature,
                         top_p=self.rollout_top_p,
-                        num_return_sequences=num_generations,
+                        num_return_sequences=local_gen_count,
                         max_new_tokens=self.rollout_max_generation_length + tokens_per_future_traj + 10,
                         pad_token_id=pad_token_id,
                     )
@@ -721,8 +765,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                             **tokenized,  # pixel_values, attention_mask, image_grid_thw
                         )
 
-                    # vlm_output: (num_generations, prompt_len + generated_len)
-                    generated_seqs = vlm_output[:, prompt_len:]  # (num_gen, gen_len)
+                    # vlm_output: (local_gen_count, prompt_len + generated_len)
+                    generated_seqs = vlm_output[:, prompt_len:]
 
                     # 4. Extract trajectory tokens and decode to continuous xyz
                     traj_tokens = extract_traj_tokens(
@@ -731,18 +775,18 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     )
                     hist_xyz = model_inputs["ego_history_xyz"][:, -1]  # (1, T, 3)
                     hist_rot = model_inputs["ego_history_rot"][:, -1]  # (1, T, 3, 3)
-                    hist_xyz_rep = hist_xyz.expand(num_generations, -1, -1)
-                    hist_rot_rep = hist_rot.expand(num_generations, -1, -1, -1)
+                    hist_xyz_rep = hist_xyz.expand(local_gen_count, -1, -1)
+                    hist_rot_rep = hist_rot.expand(local_gen_count, -1, -1, -1)
                     with torch.no_grad():
                         pred_xyz_tensor, pred_rot_tensor, _ = traj_tokenizer.decode(
                             hist_xyz_rep, hist_rot_rep, traj_tokens,
                         )
 
-                    # 5. Build per-sample outputs (num_generations per unique prompt)
+                    # 5. Build per-sample outputs (local_gen_count per unique prompt)
                     prompt_ids_list = prompt_input_ids[0].cpu().tolist()
                     traj_future_start_id = special_token_ids["traj_future_start"]
 
-                    for sample_idx in range(num_generations):
+                    for sample_idx in range(local_gen_count):
                         # Completion = all generated tokens up to <|traj_future_end|>
                         # (trim trailing pad and extra token from StopAfterEOS)
                         raw_completion = generated_seqs[sample_idx].cpu().tolist()
@@ -785,7 +829,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         self.full_model,
                         model_inputs,
                         prompt_input_ids,
-                        all_completion_ids[-num_generations:],
+                        all_completion_ids[-local_gen_count:],
                         prompt_len,
                         device,
                         mini_batch_size=self.logprob_mini_batch_size,
@@ -1089,6 +1133,9 @@ class RolloutLoggingCallback(TrainerCallback):
     Reads stashed rollout data from ``AlpamayoGRPOTrainer._rollout_log_data``
     and writes it as TensorBoard text + figures.
 
+    Uses ``on_log`` so the TensorBoardCallback's writer is guaranteed to be
+    initialised (it calls ``_init_summary_writer`` inside its own ``on_log``).
+
     Performance: ~35 ms per logging step (matplotlib render + TB write),
     negligible compared to the 10-60 s training step. Only fires every
     ``log_interval`` steps.
@@ -1107,7 +1154,12 @@ class RolloutLoggingCallback(TrainerCallback):
         self._tb_writer = None
 
     def _get_tb_writer(self):
-        """Lazily retrieve the SummaryWriter from the TensorBoardCallback."""
+        """Retrieve the SummaryWriter from the TensorBoardCallback.
+
+        Called from ``on_log``, so the TensorBoardCallback has already run
+        its own ``on_log`` (which calls ``_init_summary_writer`` if needed),
+        guaranteeing ``tb_writer`` is set.
+        """
         if self._tb_writer is not None:
             return self._tb_writer
         if self.trainer is None:
@@ -1116,9 +1168,21 @@ class RolloutLoggingCallback(TrainerCallback):
             if hasattr(cb, "tb_writer") and cb.tb_writer is not None:
                 self._tb_writer = cb.tb_writer
                 return self._tb_writer
+        # Fallback: create our own writer using the trainer's logging dir
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            log_dir = getattr(self.trainer.args, "logging_dir", None)
+            if log_dir:
+                logger.info("RolloutLoggingCallback: creating own SummaryWriter at %s", log_dir)
+                self._tb_writer = SummaryWriter(log_dir=log_dir)
+                return self._tb_writer
+        except ImportError:
+            pass
         return None
 
-    def on_step_end(self, args, state, control, **kwargs):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_world_process_zero:
+            return
         should_log_text = state.global_step % self.log_interval == 0
         should_plot = state.global_step % self.plot_interval == 0
         if not should_log_text and not should_plot:
@@ -1134,7 +1198,18 @@ class RolloutLoggingCallback(TrainerCallback):
             return
 
         step = state.global_step
-        num_gen = data["num_generations"]
+        # Infer local generation count from clip_ids to handle DDP/FSDP where
+        # each rank holds fewer than num_generations samples per prompt.
+        clip_ids = data["clip_ids"]
+        if clip_ids:
+            num_gen = 1
+            for i in range(1, len(clip_ids)):
+                if clip_ids[i] == clip_ids[0]:
+                    num_gen += 1
+                else:
+                    break
+        else:
+            num_gen = max(data.get("num_generations", 1), 1)
         num_prompts = len(data["coc_texts"]) // max(num_gen, 1)
         n_log = min(num_prompts, self.max_samples)
 
@@ -1188,7 +1263,6 @@ class RolloutLoggingCallback(TrainerCallback):
                     logger.warning("Skipping BEV plot at step %d (matplotlib error: %s)", step, e)
 
         writer.flush()
-        self.trainer._rollout_log_data = None
 
 
 def _plot_trajectories_bev(
