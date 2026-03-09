@@ -635,6 +635,29 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             vllm_gen._sync_fsdp1_params_to_vllm = _patched_sync_fsdp1
             logger.info("Patched VLLMGeneration._sync_fsdp1_params_to_vllm for FSDP root-level sync.")
 
+    def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        """Override to mutate the ``logs`` dict in-place during eval.
+
+        TRL's GRPOTrainer.log() merges reward metrics into a **new** dict via
+        ``logs = {**logs, **metrics}``, so the original ``output.metrics``
+        dict (passed by ``evaluate()``) never receives reward metrics.
+        Downstream consumers — ``_determine_best_metric`` and the
+        ``EarlyStoppingCallback.on_evaluate`` — then fail to find reward
+        metrics like ``eval_rewards/trajectory_quality_reward/mean``.
+
+        We fix this by updating the original ``logs`` dict in-place with the
+        pending eval metrics *before* delegating to TRL's ``log()``.
+        """
+        mode = "train" if self.model.training else "eval"
+        if mode == "eval" and self._metrics[mode]:
+            extra = {
+                f"eval_{k}": sum(v) / len(v)
+                for k, v in self._metrics[mode].items()
+                if v
+            }
+            logs.update(extra)
+        super().log(logs, start_time)
+
     def _save(self, output_dir, state_dict=None):
         """Override to pass save_embedding_layers=True for PEFT models.
 
