@@ -96,9 +96,17 @@ def build_alpamayo_dataset(
         avdi = PhysicalAIAVDatasetInterface()
 
     if clip_ids_file is not None:
-        logger.info("Loading clip IDs from %s", clip_ids_file)
+        logger.info("Loading clip IDs from %s (split=%s)", clip_ids_file, split)
         clip_ids_df = pd.read_parquet(clip_ids_file)
         clip_ids = clip_ids_df["clip_id"].tolist()
+        # Filter by split: look up each clip's split in clip_index
+        clip_index = avdi.clip_index
+        valid_for_split = clip_index[
+            (clip_index["split"] == split) & clip_index["clip_is_valid"]
+        ].index
+        before = len(clip_ids)
+        clip_ids = [c for c in clip_ids if c in valid_for_split]
+        logger.info("Filtered to %d/%d clips matching split '%s'", len(clip_ids), before, split)
     else:
         clip_index = avdi.clip_index
         split_df = clip_index[

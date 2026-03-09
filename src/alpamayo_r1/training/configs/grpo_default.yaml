@@ -88,6 +88,17 @@ vllm:
   server_timeout: 240.0
   group_port: 51216
 
+# Early stopping on held-out validation set (uses eval clips from exclude_clip_ids_file)
+early_stopping:
+  enabled: true
+  patience: 5              # stop after N evals with no improvement
+  threshold: 0.01          # minimum improvement to count
+  eval_steps: 100          # evaluate every N training steps
+  eval_split: val          # dataset split filter (train 153k, val 91k, test 62k)
+  eval_clip_ids_file: null # parquet with clip_id column; defaults to data.exclude_clip_ids_file
+  eval_max_samples: 30     # clips in the validation set
+  metric: rewards/trajectory_quality_reward/mean  # minADE-based reward (first in reward_funcs)
+
 # Reward function weights (must sum to 1.0)
 rewards:
   trajectory_weight: 0.50

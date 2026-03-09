@@ -129,6 +129,8 @@ def main(cfg: DictConfig) -> None:
     # ---------------------------------------------------------------
     # 5. GRPO training config
     # ---------------------------------------------------------------
+    early_stopping_cfg = cfg.get("early_stopping", {})
+    early_stopping_enabled = bool(early_stopping_cfg.get("enabled", False))
     train_cfg = cfg.get("training", {})
     reward_cfg = cfg.get("rewards", {})
     reward_weights = [
@@ -171,6 +173,19 @@ def main(cfg: DictConfig) -> None:
                 vllm_kwargs["vllm_server_base_url"] = str(server_base_url)
         logger.info("vLLM %s mode enabled: %s", vllm_mode, vllm_kwargs)
 
+    # Early stopping eval args (conditionally added to GRPOConfig)
+    eval_kwargs = {}
+    if early_stopping_enabled:
+        es_metric = early_stopping_cfg.get("metric", "rewards/trajectory_quality_reward/mean")
+        eval_kwargs = dict(
+            eval_strategy="steps",
+            eval_steps=int(early_stopping_cfg.get("eval_steps", 100)),
+            per_device_eval_batch_size=per_device_bs,
+            metric_for_best_model=es_metric,
+            greater_is_better=True,
+            load_best_model_at_end=True,
+        )
+
     training_args = GRPOConfig(
         output_dir=train_cfg.get("output_dir", "outputs/grpo"),
         num_train_epochs=train_cfg.get("num_train_epochs", 3),
@@ -191,6 +206,7 @@ def main(cfg: DictConfig) -> None:
         gradient_checkpointing=train_cfg.get("gradient_checkpointing", False),
         report_to=train_cfg.get("report_to", "tensorboard"),
         reward_weights=reward_weights,
+        **eval_kwargs,
         **vllm_kwargs,
     )
 
@@ -208,6 +224,24 @@ def main(cfg: DictConfig) -> None:
     )
 
     # ---------------------------------------------------------------
+    # 6b. Early stopping — build eval dataset from val split of curated clips
+    # ---------------------------------------------------------------
+    eval_dataset = None
+
+    if early_stopping_enabled:
+        eval_clip_ids_file = early_stopping_cfg.get(
+            "eval_clip_ids_file", data_cfg.get("exclude_clip_ids_file")
+        )
+        eval_dataset = build_alpamayo_dataset(
+            split=early_stopping_cfg.get("eval_split", "val"),
+            t0_us=data_cfg.get("t0_us", 5_100_000),
+            max_samples=early_stopping_cfg.get("eval_max_samples", 50),
+            clip_ids_file=eval_clip_ids_file,
+            avdi=avdi,
+        )
+        logger.info("Built eval dataset: %d samples", len(eval_dataset))
+
+    # ---------------------------------------------------------------
     # 7. Create trainer and train
     # ---------------------------------------------------------------
     rollout_cfg = cfg.get("rollout", {})
@@ -223,6 +257,7 @@ def main(cfg: DictConfig) -> None:
         model=full_model.vlm,
         args=training_args,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         reward_funcs=[
             trajectory_quality_reward,
             reasoning_quality_reward,
@@ -256,14 +291,22 @@ def main(cfg: DictConfig) -> None:
 
     trainer.add_callback(GpuUtilizationCallback())
 
-    # Move trajectory tokenizers to the local device. The VLM is handled
-    # by FSDP/accelerator (sharded across GPUs when using FSDP, or placed
-    # on the single GPU otherwise). Expert/diffusion stay on CPU.
-    device = trainer.accelerator.device
-    if full_model.traj_tokenizer is not None and hasattr(full_model.traj_tokenizer, "to"):
-        full_model.traj_tokenizer.to(device)
-    if full_model.hist_traj_tokenizer is not None and hasattr(full_model.hist_traj_tokenizer, "to"):
-        full_model.hist_traj_tokenizer.to(device)
+    # Early stopping callback
+    if early_stopping_enabled:
+        from transformers import EarlyStoppingCallback
+
+        es_patience = int(early_stopping_cfg.get("patience", 5))
+        es_threshold = float(early_stopping_cfg.get("threshold", 0.01))
+        trainer.add_callback(
+            EarlyStoppingCallback(
+                early_stopping_patience=es_patience,
+                early_stopping_threshold=es_threshold,
+            )
+        )
+        logger.info(
+            "Early stopping enabled: patience=%d, threshold=%.3f, metric=%s",
+            es_patience, es_threshold, training_args.metric_for_best_model,
+        )
 
     logger.info("Starting GRPO training...")
     trainer.train()
