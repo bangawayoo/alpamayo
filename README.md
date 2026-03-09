@@ -1,13 +1,6 @@
 <div align="center">
 
 # 🏔️ Alpamayo 1
-
-## TODO (Last Update: 26.03.06)
- [ ] SFT
- [ ] Evaluation
-      [ ] Stopping criterion for RL post-train
-      [ ] Train / Val. Split 
-
 ### Bridging Reasoning and Action Prediction for Generalizable Autonomous Driving
 
 [![HuggingFace](https://img.shields.io/badge/🤗%20Model-Alpamayo--R1--10B-blue)](https://huggingface.co/nvidia/Alpamayo-R1-10B)
@@ -16,10 +9,10 @@
 
 </div>
 
-_Note: Following the release of [NVIDIA Alpamayo](https://nvidianews.nvidia.com/news/alpamayo-autonomous-vehicle-development) at CES 2026, Alpamayo-R1 has been renamed to Alpamayo 1._
+> **This is a fork** of [NVlabs/alpamayo](https://github.com/NVlabs/alpamayo) that adds **GRPO (Group Relative Policy Optimization) post-training pipeline** — the RL stage described in the [paper](https://arxiv.org/abs/2511.00088) but not included in the official release. See [GRPO Training](#grpo-post-training-unofficial) below for details and [Limitations](#limitations-vs-the-paper) for known differences from the paper.
 
-> **📖 Please read the [HuggingFace Model Card](https://huggingface.co/nvidia/Alpamayo-R1-10B) first!**
-> The model card contains comprehensive details on model architecture, inputs/outputs, licensing, and tested hardware configurations. This GitHub README focuses on setup, usage, and frequently asked questions.
+Any PRs to fix bugs, improve training, reward implementation, etc are welcome!
+
 
 ## Requirements
 
@@ -46,6 +39,8 @@ export PATH="$HOME/.local/bin:$PATH"
 uv venv ar1_venv
 source ar1_venv/bin/activate
 uv sync --active
+# For RL-post training, install the packages in `requirements.txt`.
+uv pip install -r requirements.txt
 ```
 
 ### 3. Authenticate with HuggingFace
@@ -97,11 +92,68 @@ Alpamayo 1 implements the architecture described in our paper [*"Alpamayo-R1: Br
 | **Chain-of-Causation (CoC) reasoning** | Hybrid auto-labeling with human in the loop for reasoning traces | ✅ Included |
 | **Vision-Language-Action architecture** | Cosmos-Reason backbone + action expert | ✅ Included |
 | **Trajectory prediction** | 6.4s horizon, 64 waypoints at 10 Hz | ✅ Included |
-| **RL post-training** | Reinforcement learning for reasoning/action consistency | ❌ Not in this release |
+| **RL post-training** | Reinforcement learning for reasoning/action consistency | ✅ this fork |
 | **Route/navigation conditioning** | Explicit navigation or route inputs | ❌ Not in this release |
 | **Meta-actions/General VQA** | High-level behavior and visual question answering | ❌ Not in this release |
 
-The current release focuses on the core supervised learning components. RL post-training and route conditioning are potential candidates for future releases. Stay tuned!
+The official release focuses on the core supervised learning components. This fork adds the GRPO post-training pipeline (see below). Route conditioning and meta-actions remain unreleased.
+
+## GRPO Post-Training (Unofficial)
+
+This fork implements the GRPO reinforcement learning post-training stage described in Section 3.3 of the [Alpamayo-R1 paper](https://arxiv.org/abs/2511.00088). During GRPO, the VLM generates both Chain-of-Causation (CoC) reasoning text and discrete trajectory tokens via rollouts, then optimizes a composite reward signal using group-relative advantage estimation.
+
+### Features
+
+- **VLM-only rollouts** — the VLM autoregressively generates CoC text + 64 trajectory tokens; Expert and Diffusion modules are kept on CPU (not used during rollouts)
+- **Heuristic reward functions** — trajectory quality (minADE-based), reasoning quality (rule-based), and reasoning-trajectory consistency
+- **LoRA fine-tuning** — trains only VLM attention layers (q/k/v/o_proj) with LoRA (r=16, alpha=32) by default
+- **Multi-GPU support** — DDP via Accelerate (FSDP is currently broken; see [Limitations](#limitations-vs-the-paper))
+
+### Quick Start
+
+```bash
+# Smoke test (3 samples, 1 epoch)
+./scripts/run_grpo.sh --smoke
+
+# Full training run (DDP, auto-detected GPUs)
+./scripts/run_grpo.sh --no-fsdp
+
+# Single-GPU mode
+./scripts/run_grpo.sh --no-fsdp --num-gpus 1
+
+# Custom overrides
+./scripts/run_grpo.sh --no-fsdp training.num_train_epochs=3 training.learning_rate=5e-6
+```
+
+See [`docs/grpo-training.md`](docs/grpo-training.md) for detailed documentation, configuration reference, and design decisions.
+
+### Preliminary Results
+
+Evaluated on 253 curated test clips (6.4s prediction horizon, 64 waypoints at 10 Hz, 5 trajectory samples per prediction). The best GRPO checkpoint (temperature=1.0, step 600) shows improvement over the base model:
+
+| Model | minADE mean | minFDE mean | minADE median | minFDE median |
+|-------|-------------|-------------|---------------|---------------|
+| Alpamayo-R1 base | 0.928 | 2.667 | 0.613 | 1.581 |
+| **+ GRPO (temp=1.0, 600 steps)** | 0.873 | 2.404 | 0.619 | 1.295 |
+
+#### Training Curves
+
+![GRPO Training Curves](docs/grpo_training_curves_full.png)
+
+### Limitations vs. the Paper
+
+This is a community reimplementation based on the paper description. Several aspects differ from what is described in the paper or remain unknown:
+
+| Aspect | Paper | This Implementation |
+|--------|-------|---------------------|
+| **CoC quality reward** | Uses a reasoning critic to score reasoning quality | Rule-based heuristic scoring causal connectors, driving vocabulary, length, and repetition. No LLM judge. |
+| **Consistency reward** | Rule-based matching between CoC keywords and meta-actions | Keyword matching between CoC text and coarse trajectory behaviors (turning, braking, etc.). Currently disabled by default (weight=0.0). |
+| **Reward weights** | Not disclosed | Trajectory 50%, reasoning 50%, consistency 0% (tuned empirically) |
+| **Training data** | Internal dataset curation and filtering pipeline | Uses the public PhysicalAI-AV dataset with a single fixed timestamp per clip (t0=5.1s) |
+| **FSDP** | Unknown | **Broken.** FSDP wrapping conflicts with LoRA + Qwen3-VL's tied embeddings, causing crashes during checkpoint saving. Use DDP (`--no-fsdp`) instead. |
+| **vLLM rollouts** | Used in paper | Experimental support available when using this [PR](https://github.com/huggingface/trl/pull/5228) of TRL, but throughput is slower than native TRL Trainer |
+
+The most significant gap is how the rewards are implemented.
 
 ## Frequently Asked Questions (FAQ)
 
@@ -122,7 +174,7 @@ While we have experimented with meta-action and general VQA capabilities, the re
 <details>
 <summary><strong>Was the 10B model post-trained with Reinforcement Learning (RL)?</strong></summary>
 
-No. The current 10B model release has **not** undergone RL post-training. While the paper describes RL stages for improving reasoning quality and action consistency, this release focuses on the supervised learning components. As mentioned above, we may release RL post-trained models in future releases.
+The official `nvidia/Alpamayo-R1-10B` weights have **not** undergone RL post-training. This fork provides a GRPO pipeline to perform that stage — see [GRPO Post-Training](#grpo-post-training-unofficial) above. Note that the resulting model will differ from what the paper describes due to the [limitations](#limitations-vs-the-paper) listed above.
 
 </details>
 
@@ -144,8 +196,13 @@ No. The model weights are released under a **non-commercial license**. This rele
 
 ```
 alpamayo/
-├── notebook/
+├── docs/
+│   └── grpo-training.md                 # GRPO training documentation
+├── notebooks/
 │   └── inference.ipynb                  # Example notebook
+├── scripts/
+│   ├── run_grpo.sh                      # GRPO training launcher
+│   └── evaluate_reward_signal.py        # Reward function evaluation
 ├── src/
 │   └── alpamayo_r1/
 │       ├── action_space/
@@ -155,12 +212,20 @@ alpamayo/
 │       ├── geometry/
 │       │   └── ...                      # Geometry utilities and modules
 │       ├── models/
-│       │   ├── ...                      # Model components and utils functions
-│       ├── __init__.py                  # Package marker
+│       │   └── ...                      # Model components and utils functions
+│       ├── training/                    # GRPO post-training (this fork)
+│       │   ├── configs/
+│       │   │   └── grpo_default.yaml    # Hydra config for GRPO
+│       │   ├── rollout.py               # AlpamayoGRPOTrainer (VLM-only rollouts)
+│       │   ├── rewards.py               # Reward functions
+│       │   ├── dataset.py               # Dataset builder
+│       │   └── train_grpo.py            # Hydra entry point
 │       ├── config.py                    # Model and experiment configuration
 │       ├── helper.py                    # Utility functions
 │       ├── load_physical_aiavdataset.py # Dataset loader
-│       ├── test_inference.py            # Inference test script
+│       └── test_inference.py            # Inference test script
+├── tests/
+│   └── test_training.py                 # GRPO training tests
 ├── pyproject.toml                       # Project dependencies
 └── uv.lock                              # Locked dependency versions
 ```
