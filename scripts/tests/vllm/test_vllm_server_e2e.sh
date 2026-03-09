@@ -9,7 +9,7 @@
 #   ./scripts/tests/vllm/test_vllm_server_e2e.sh --server-gpu 0,1 --tp 2 --with-images
 
 set -euo pipefail
-export HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN env var}
+export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN env var}"
 
 # ---------------------------------------------------------------
 # Defaults (mirror run_grpo_server.sh)

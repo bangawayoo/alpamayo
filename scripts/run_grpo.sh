@@ -23,7 +23,7 @@
 #   ./scripts/run_grpo.sh --fsdp --accelerate-config path/to/config.yaml  # custom accelerate config
 
 set -euo pipefail
-export HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN env var}
+export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN env var}"
 # ---------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------

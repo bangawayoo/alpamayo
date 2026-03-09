@@ -37,7 +37,7 @@ done
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="evaluation_results/curated_set-$(basename "$MODEL")"
 fi
-export HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN env var}
+export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN env var}"
 
 echo "Running curated test set evaluation (1,181 clips)..."
 echo "  Model: ${MODEL}"
