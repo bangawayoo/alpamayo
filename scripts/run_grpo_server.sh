@@ -194,7 +194,7 @@ echo ""
 echo "Starting vLLM server on GPU $SERVER_GPU (port $PORT)..."
 
 CUDA_VISIBLE_DEVICES="$SERVER_GPU" "$VENV_PYTHON" \
-    "$SCRIPT_DIR/vllm_serve_patched.py" \
+    "$SCRIPT_DIR/vllm/vllm_serve_patched.py" \
     --model "$VLM_CACHE_DIR" \
     --vllm_model_impl "$MODEL_IMPL" \
     --tensor_parallel_size "$TENSOR_PARALLEL_SIZE" \

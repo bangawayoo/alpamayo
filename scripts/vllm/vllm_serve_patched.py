@@ -7,7 +7,7 @@ returning a tuple instead of a tensor, which causes the unpatched vLLM
 to hang during multimodal request preprocessing.
 
 Usage (drop-in replacement for ``trl vllm-serve``):
-    python scripts/vllm_serve_patched.py --model ... --port 8000
+    python scripts/vllm/vllm_serve_patched.py --model ... --port 8000
 
 The patches are applied at import time so they propagate to the worker
 subprocesses spawned by TRL's ``llm_worker``.

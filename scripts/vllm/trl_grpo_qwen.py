@@ -2,14 +2,14 @@
 TRL GRPO training script for a standard Qwen model using vLLM server mode.
 
 This script is meant to be launched on GPUs separate from the vLLM server.
-See scripts/run_trl_grpo_qwen.sh for the full pipeline.
+See scripts/vllm/run_trl_grpo_qwen.sh for the full pipeline.
 
 Usage:
     # Server mode (vLLM server must already be running):
-    CUDA_VISIBLE_DEVICES=1 accelerate launch scripts/trl_grpo_qwen.py
+    CUDA_VISIBLE_DEVICES=1 accelerate launch scripts/vllm/trl_grpo_qwen.py
 
     # Server mode with custom args:
-    CUDA_VISIBLE_DEVICES=1 accelerate launch scripts/trl_grpo_qwen.py \
+    CUDA_VISIBLE_DEVICES=1 accelerate launch scripts/vllm/trl_grpo_qwen.py \
         --model Qwen/Qwen2.5-3B --dataset trl-lib/DeepMath-103K
 """
 

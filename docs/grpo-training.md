@@ -219,7 +219,7 @@ The Alpamayo model **pops** `input_ids` from the input dict during forward pass 
 
 **OOM errors**: Reduce `num_generations` (e.g., 4), `logprob_mini_batch_size` (e.g., 1), or `max_generation_length`.
 
-**Slow rollouts**: Download the PhysicalAI-AV dataset locally (streaming is slow) through [download_eval_clips.py](scripts/download_eval_clips.py). `ClipDataCache` caches loaded clips in CPU RAM to avoid redundant I/O.
+**Slow rollouts**: Download the PhysicalAI-AV dataset locally (streaming is slow) through [download_eval_clips.py](../scripts/data/download_eval_clips.py). `ClipDataCache` caches loaded clips in CPU RAM to avoid redundant I/O.
 
 **FSDP crashes**: Use `--no-fsdp` for DDP mode. FSDP conflicts with LoRA + Qwen3-VL during checkpoint saving.
 

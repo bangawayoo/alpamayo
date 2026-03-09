@@ -7,9 +7,9 @@ evaluation script's ``maybe_stream=True`` calls will hit local files instead of
 making HTTP requests to HuggingFace.
 
 Usage:
-    python scripts/download_eval_clips.py
-    python scripts/download_eval_clips.py --all-test     # full test split, not just curated
-    python scripts/download_eval_clips.py --max-workers 4
+    python scripts/data/download_eval_clips.py
+    python scripts/data/download_eval_clips.py --all-test     # full test split, not just curated
+    python scripts/data/download_eval_clips.py --max-workers 4
 """
 
 import argparse

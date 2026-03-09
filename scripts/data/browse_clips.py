@@ -5,8 +5,8 @@ All interactions use fetch() — no page navigation, so it works behind
 Kubeflow/JupyterHub reverse proxies without losing the connection.
 
 Usage:
-    python scripts/tools/browse_clips.py
-    python scripts/tools/browse_clips.py --port 7860
+    python scripts/data/browse_clips.py
+    python scripts/data/browse_clips.py --port 7860
 """
 import argparse
 import base64

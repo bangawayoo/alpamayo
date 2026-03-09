@@ -23,8 +23,8 @@ the rewards are well-calibrated and non-trivial.
 Automatically uses all available GPUs in parallel (one process per GPU).
 
 Usage:
-    python scripts/evaluate_reward_signal.py --num-samples 50
-    python scripts/evaluate_reward_signal.py --num-samples 20 --num-traj-samples 4
+    python scripts/evaluate/evaluate_reward_signal.py --num-samples 50
+    python scripts/evaluate/evaluate_reward_signal.py --num-samples 20 --num-traj-samples 4
 """
 
 import argparse

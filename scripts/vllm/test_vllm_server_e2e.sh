@@ -3,10 +3,10 @@
 # the diagnostic test script against it.
 #
 # Usage:
-#   ./scripts/tests/vllm/test_vllm_server_e2e.sh                      # text-only tests
-#   ./scripts/tests/vllm/test_vllm_server_e2e.sh --with-images         # 16-image tests on 5 clips
-#   ./scripts/tests/vllm/test_vllm_server_e2e.sh --with-images --num-clips 3
-#   ./scripts/tests/vllm/test_vllm_server_e2e.sh --server-gpu 0,1 --tp 2 --with-images
+#   ./scripts/vllm/test_vllm_server_e2e.sh                      # text-only tests
+#   ./scripts/vllm/test_vllm_server_e2e.sh --with-images         # 16-image tests on 5 clips
+#   ./scripts/vllm/test_vllm_server_e2e.sh --with-images --num-clips 3
+#   ./scripts/vllm/test_vllm_server_e2e.sh --server-gpu 0,1 --tp 2 --with-images
 
 set -euo pipefail
 export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN env var}"
@@ -44,7 +44,7 @@ done
 # Paths
 # ---------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SCRIPTS_ROOT="$PROJECT_ROOT/scripts"
 VENV_PYTHON="/home/jovyan/conda/.venv/bin/python"
 
@@ -104,7 +104,7 @@ SERVER_LOG="$PROJECT_ROOT/.cache/vllm_server.log"
 echo "Starting vLLM server on GPU $SERVER_GPU (port $PORT)..."
 echo "  Server log: $SERVER_LOG"
 
-CUDA_VISIBLE_DEVICES="$SERVER_GPU" "$VENV_PYTHON" "$SCRIPTS_ROOT/vllm_serve_patched.py" \
+CUDA_VISIBLE_DEVICES="$SERVER_GPU" "$VENV_PYTHON" "$SCRIPTS_ROOT/vllm/vllm_serve_patched.py" \
     --model "$VLM_CACHE_DIR" \
     --vllm_model_impl "$MODEL_IMPL" \
     --tensor_parallel_size "$TENSOR_PARALLEL_SIZE" \

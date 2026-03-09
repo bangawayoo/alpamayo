@@ -2,8 +2,8 @@
 """Save camera frames from a clip to disk for visual inspection.
 
 Usage:
-    python scripts/save_clip_images.py --clip-id 25cd4769-5dcf-4b53-a351-bf2c5deb6124
-    python scripts/save_clip_images.py --clip-id 25cd4769-5dcf-4b53-a351-bf2c5deb6124 --output outputs/clip_frames
+    python scripts/data/save_clip_images.py --clip-id 25cd4769-5dcf-4b53-a351-bf2c5deb6124
+    python scripts/data/save_clip_images.py --clip-id 25cd4769-5dcf-4b53-a351-bf2c5deb6124 --output outputs/clip_frames
 """
 import argparse
 import sys

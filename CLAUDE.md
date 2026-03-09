@@ -26,7 +26,7 @@ python src/alpamayo_r1/test_inference.py
 ./scripts/run_grpo.sh --fsdp --num-gpus 2 # explicit GPU count
 
 # Reward signal evaluation
-python scripts/evaluate_reward_signal.py --num-samples 50
+python scripts/evaluate/evaluate_reward_signal.py --num-samples 50
 ```
 
 Training uses Hydra for config management. Extra args to `run_grpo.sh` are passed as Hydra overrides (e.g., `training.num_train_epochs=3`). The default config is `src/alpamayo_r1/training/configs/grpo_default.yaml`.

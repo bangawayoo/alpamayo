@@ -6,8 +6,8 @@ training rollout (``alpamayo_r1.training.rollout``), so a passing test here
 means the server will work during training.
 
 Usage (while server is running on port 8000):
-    python scripts/test_vllm_server.py --model .cache/vlm_extracted
-    python scripts/test_vllm_server.py --model .cache/vlm_extracted --with-images
+    python scripts/vllm/test_vllm_server.py --model .cache/vlm_extracted
+    python scripts/vllm/test_vllm_server.py --model .cache/vlm_extracted --with-images
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@ Tests whether vLLM's native Qwen3-VL backend can handle multimodal inputs.
 No CUDA is touched before vLLM starts, avoiding the fork/spawn issue.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 python scripts/test_vllm_direct.py
+    CUDA_VISIBLE_DEVICES=0 python scripts/vllm/test_vllm_direct.py
 """
 import numpy as np
 from PIL import Image

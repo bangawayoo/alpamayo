@@ -8,10 +8,10 @@
 #   4. Cleans up the server on exit
 #
 # Usage:
-#   ./scripts/run_trl_grpo_qwen.sh                              # defaults: server GPU 0, train GPU 1
-#   ./scripts/run_trl_grpo_qwen.sh --smoke                      # quick smoke test (20 samples, short gen)
-#   ./scripts/run_trl_grpo_qwen.sh --model Qwen/Qwen2.5-7B-Instruct --server-gpus 0,1 --train-gpus 2,3
-#   ./scripts/run_trl_grpo_qwen.sh --tp 2 --dp 1                # tensor parallel=2 on server
+#   ./scripts/vllm/run_trl_grpo_qwen.sh                              # defaults: server GPU 0, train GPU 1
+#   ./scripts/vllm/run_trl_grpo_qwen.sh --smoke                      # quick smoke test (20 samples, short gen)
+#   ./scripts/vllm/run_trl_grpo_qwen.sh --model Qwen/Qwen2.5-7B-Instruct --server-gpus 0,1 --train-gpus 2,3
+#   ./scripts/vllm/run_trl_grpo_qwen.sh --tp 2 --dp 1                # tensor parallel=2 on server
 #
 # Prerequisites:
 #   pip install "trl[vllm]" datasets
@@ -53,7 +53,7 @@ done
 # Paths
 # ---------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Try project venv, then ar1_venv, then system python
 if [[ -x "$PROJECT_ROOT/.venv/bin/python" ]]; then

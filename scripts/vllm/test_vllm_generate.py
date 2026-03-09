@@ -6,10 +6,10 @@ vLLM's llm.generate() with the native Qwen3-VL backend.
 
 Usage:
     # Phase 1 (run once, or when changing n_images):
-    python scripts/test_vllm_build_prompt.py --n-images 1
+    python scripts/vllm/test_vllm_build_prompt.py --n-images 1
 
     # Phase 2 (run on GPU):
-    CUDA_VISIBLE_DEVICES=0 python scripts/test_vllm_generate.py
+    CUDA_VISIBLE_DEVICES=0 python scripts/vllm/test_vllm_generate.py
 """
 from __future__ import annotations
 

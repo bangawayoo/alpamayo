@@ -7,7 +7,7 @@ strips image pads, extracts PIL images, and saves everything to a pickle file.
 This script must run in a SEPARATE process from vLLM to avoid CUDA conflicts.
 
 Usage:
-    python scripts/test_vllm_build_prompt.py [--output PATH] [--n-images N]
+    python scripts/vllm/test_vllm_build_prompt.py [--output PATH] [--n-images N]
 """
 from __future__ import annotations
 

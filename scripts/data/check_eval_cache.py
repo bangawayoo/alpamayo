@@ -2,8 +2,8 @@
 """Check how many evaluation clip features are cached locally vs would stream.
 
 Usage:
-    python scripts/check_eval_cache.py
-    python scripts/check_eval_cache.py --all-test
+    python scripts/data/check_eval_cache.py
+    python scripts/data/check_eval_cache.py --all-test
 """
 
 import argparse
@@ -72,7 +72,7 @@ def main():
         print(f"\nFirst 10 missing files:")
         for f in missing_files[:10]:
             print(f"  {f}")
-        print(f"\nRun 'python scripts/download_eval_clips.py' to download missing files.")
+        print(f"\nRun 'python scripts/data/download_eval_clips.py' to download missing files.")
     else:
         print("\nAll files cached. Evaluation will not make HF streaming requests.")
 
