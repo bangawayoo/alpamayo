@@ -4,11 +4,13 @@
 # Usage:
 #   ./evaluate_quick_test.sh                     # single GPU
 #   ./evaluate_quick_test.sh --num-gpus 4        # multi-GPU data parallelism
+#   ./evaluate_quick_test.sh --seed 123          # custom seed
 
 set -euo pipefail
 
 NUM_GPUS=1
 MODEL="nvidia/Alpamayo-R1-10B"
+SEED=42
 OUTPUT_DIR=""
 EXTRA_ARGS=()
 
@@ -24,6 +26,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --output-dir)
             OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --seed)
+            SEED="$2"
             shift 2
             ;;
         *)
@@ -55,7 +61,7 @@ if [[ "${NUM_GPUS}" -eq 1 ]]; then
         --use-clip-ids-file \
         --num-workers 4 \
         --prefetch-factor 2 \
-        --seed 42 \
+        --seed $SEED \
         "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 else
     echo "Launching ${NUM_GPUS} shards in parallel..."
@@ -70,7 +76,7 @@ else
             --use-clip-ids-file \
             --num-workers 4 \
             --prefetch-factor 2 \
-            --seed 42 \
+            --seed $SEED \
             --shard-id "${i}" \
             --num-shards "${NUM_GPUS}" \
             "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" &

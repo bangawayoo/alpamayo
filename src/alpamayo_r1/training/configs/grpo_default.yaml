@@ -91,7 +91,7 @@ vllm:
 # Early stopping on held-out validation set (uses eval clips from exclude_clip_ids_file)
 early_stopping:
   enabled: true
-  patience: 5              # stop after N evals with no improvement
+  patience: 3              # stop after N evals with no improvement
   threshold: 0.01          # minimum improvement to count
   eval_steps: 100          # evaluate every N training steps
   eval_split: val          # dataset split filter (train 153k, val 91k, test 62k)
