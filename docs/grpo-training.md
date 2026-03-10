@@ -195,6 +195,26 @@ tensorboard --logdir outputs/grpo
 
 ---
 
+## Preliminary Results
+
+Evaluated on 253 curated test clips (5 trajectory samples per clip, 5 seeds per model). All checkpoints use the same LoRA config (r=16, α=32) and reward weights (trajectory 50%, reasoning 50%).
+
+| Model | minADE mean ± std | minFDE mean ± std |
+|-------|-------------------|-------------------|
+| Base (no GRPO) | 0.918 ± 0.030 | 2.446 ± 0.071 |
+| temp=0.6, step 300 | 0.910 ± 0.040 | 2.431 ± 0.152 |
+| **temp=0.6, step 400** | **0.898 ± 0.030** | **2.334 ± 0.099** |
+| temp=0.6, step 600 | 0.918 ± 0.035 | 2.441 ± 0.088 |
+| temp=1.0, step 400 | 0.930 ± 0.023 | 2.544 ± 0.084 |
+| temp=1.0, step 600 | 0.959 ± 0.021 | 2.591 ± 0.092 |
+
+The temp=0.6, step 400 checkpoint shows the best trend on both metrics. The improvement does not reach statistical significance at p<0.05 (paired t-test: minADE p≈0.53, minFDE p≈0.21), so results should be read as suggestive rather than conclusive. Notable patterns:
+
+- **Lower sampling temperature** (0.6 vs 1.0) consistently produces better trajectories. Higher temperature increases diversity but introduces more stochasticity into the trajectory token distribution.
+- **Step 400 is a sweet spot**: step 300 is undertrained, while step 600 begins to regress, suggesting overfitting to the reward signal.
+
+---
+
 ## Design Decisions
 
 ### Why VLM-Only Rollouts?

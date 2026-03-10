@@ -129,16 +129,21 @@ See [`docs/grpo-training.md`](docs/grpo-training.md) for detailed documentation,
 
 ### Preliminary Results
 
-Evaluated on 253 curated test clips (6.4s prediction horizon, 64 waypoints at 10 Hz, 5 trajectory samples per prediction). The best GRPO checkpoint (temperature=1.0, step 600) shows improvement over the base model:
+Evaluated on 253 curated test clips (6.4s prediction horizon, 64 waypoints at 10 Hz, 5 trajectory samples per clip, averaged over 5 independent runs with different random seeds for token sampling). Results across all evaluated checkpoints:
 
-| Model | minADE mean | minFDE mean | minADE median | minFDE median |
-|-------|-------------|-------------|---------------|---------------|
-| Alpamayo-R1 base | 0.928 | 2.667 | 0.613 | 1.581 |
-| **+ GRPO (temp=1.0, 600 steps)** | 0.873 | 2.404 | 0.619 | 1.295 |
+| Model | minADE mean ± std | minFDE mean ± std |
+|-------|-------------------|-------------------|
+| Alpamayo-R1 base | 0.918 ± 0.030 | 2.446 ± 0.071 |
+| + GRPO (temp=0.6, 300 steps) | 0.910 ± 0.040 | 2.431 ± 0.152 |
+| **+ GRPO (temp=0.6, 400 steps)** | **0.898 ± 0.030** | **2.334 ± 0.099** |
+| + GRPO (temp=0.6, 600 steps) | 0.918 ± 0.035 | 2.441 ± 0.088 |
+
+
+The best checkpoint (temp=0.6, 400 steps) shows a trend toward lower minADE and minFDE compared to the base model. However, a paired statistical test (Wilcoxon signed-rank and paired t-test on per-clip scores) does not reach significance at the 0.05 level (minADE p≈0.53, minFDE p≈0.21).
 
 #### Training Curves
 
-![GRPO Training Curves](docs/grpo_training_curves_full.png)
+![GRPO Training Curves](docs/grpo_training_curves_temp06.png)
 
 ### Limitations vs. the Paper
 
