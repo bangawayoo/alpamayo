@@ -272,6 +272,7 @@ def main(cfg: DictConfig) -> None:
         rollout_top_p=rollout_cfg.get("top_p", 0.98),
         rollout_max_generation_length=rollout_cfg.get("max_generation_length", 256),
         logprob_mini_batch_size=int(rollout_cfg.get("logprob_mini_batch_size", 4)),
+        data_cache_max_size=int(rollout_cfg.get("data_cache_max_size", 200)),
     )
 
     # Rollout logging callback (CoC text + BEV trajectory plots to TensorBoard)

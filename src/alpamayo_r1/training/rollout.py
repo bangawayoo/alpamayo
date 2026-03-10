@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import OrderedDict
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
@@ -141,6 +142,11 @@ class ClipDataCache:
 
     When ``cache_pil_images=True``, raw PIL images are also cached for vLLM
     multimodal generation (vLLM expects PIL images, not pre-processed tensors).
+
+    ``max_size`` caps the number of cached clips. When the limit is reached,
+    the least-recently-used entry is evicted (LRU policy). Each clip entry
+    with PIL images occupies ~130 MB of CPU RAM, so the default of 200 clips
+    uses ~26 GB. Set lower if the training node has limited RAM.
     """
 
     def __init__(
@@ -148,16 +154,19 @@ class ClipDataCache:
         avdi: PhysicalAIAVDatasetInterface,
         processor: AutoProcessor,
         cache_pil_images: bool = False,
+        max_size: int = 200,
     ) -> None:
         self._avdi = avdi
         self._processor = processor
-        self._cache: dict[tuple[str, int], dict] = {}
+        self._cache: OrderedDict[tuple[str, int], dict] = OrderedDict()
         self._cache_pil_images = cache_pil_images
+        self._max_size = max_size
         self._hits = 0
         self._misses = 0
+        self._evictions = 0
 
     def _load_and_cache(self, clip_id: str, t0_us: int) -> None:
-        """Load raw data and populate the cache entry."""
+        """Load raw data and populate the cache entry, evicting LRU if full."""
         self._misses += 1
         data = load_physical_aiavdataset(clip_id=clip_id, t0_us=t0_us, avdi=self._avdi, maybe_stream=True)
         model_inputs_cpu = helper.prepare_model_inputs(data, self._processor, device="cpu")
@@ -173,9 +182,15 @@ class ClipDataCache:
                 for frame in frames
             ]
             entry["pil_images"] = pil_images
+        if len(self._cache) >= self._max_size:
+            self._cache.popitem(last=False)  # evict LRU (oldest) entry
+            self._evictions += 1
         self._cache[(clip_id, t0_us)] = entry
-        logger.debug("Cache miss for (%s, %d). Total: %d hits, %d misses.",
-                     clip_id, t0_us, self._hits, self._misses)
+        logger.debug(
+            "Cache miss for (%s, %d). Size: %d/%d. Hits: %d, misses: %d, evictions: %d.",
+            clip_id, t0_us, len(self._cache), self._max_size,
+            self._hits, self._misses, self._evictions,
+        )
 
     def get(self, clip_id: str, t0_us: int, device: torch.device) -> tuple[dict, torch.Tensor]:
         """Return (model_inputs_on_device, ego_future_xyz_cpu).
@@ -188,6 +203,7 @@ class ClipDataCache:
             self._load_and_cache(clip_id, t0_us)
         else:
             self._hits += 1
+            self._cache.move_to_end(key)  # mark as recently used
         cached = self._cache[key]
         return helper.to_device(cached["model_inputs"], device=device), cached["ego_future_xyz"]
 
@@ -200,6 +216,8 @@ class ClipDataCache:
         key = (clip_id, t0_us)
         if key not in self._cache:
             self._load_and_cache(clip_id, t0_us)
+        else:
+            self._cache.move_to_end(key)  # mark as recently used
         return self._cache[key]["pil_images"]
 
 
@@ -568,6 +586,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         rollout_top_p: float = 0.98,
         rollout_max_generation_length: int = 256,
         logprob_mini_batch_size: int = 4,
+        data_cache_max_size: int = 200,
         **kwargs,
     ):
         # Detect vLLM mode from GRPOConfig *before* calling super().__init__,
@@ -580,7 +599,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             # Create ClipDataCache early — shared between rollout_func and trainer.
             # processing_class may be passed as kwarg or positional arg.
             processor = kwargs.get("processing_class")
-            self._data_cache = ClipDataCache(avdi, processor, cache_pil_images=True)
+            self._data_cache = ClipDataCache(avdi, processor, cache_pil_images=True, max_size=data_cache_max_size)
             rollout_fn = make_vllm_rollout_func(
                 full_model=full_model,
                 data_cache=self._data_cache,
@@ -606,7 +625,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self.logprob_mini_batch_size = logprob_mini_batch_size
         self.use_vllm = use_vllm
         if not use_vllm:
-            self._data_cache = ClipDataCache(avdi, self.processing_class)
+            self._data_cache = ClipDataCache(avdi, self.processing_class, max_size=data_cache_max_size)
 
         # Patch FSDP1 weight sync on the VLLMGeneration instance.
         # TRL's default _sync_fsdp1_params_to_vllm does a post-order
