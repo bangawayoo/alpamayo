@@ -11,7 +11,71 @@
 
 > **This is a fork** of [NVlabs/alpamayo](https://github.com/NVlabs/alpamayo) that adds **GRPO (Group Relative Policy Optimization) post-training pipeline** — the RL stage described in the [paper](https://arxiv.org/abs/2511.00088) but not included in the official release. See [GRPO Training](#grpo-post-training-unofficial) below for details and [Limitations](#limitations-vs-the-paper) for known differences from the paper.
 
+## GRPO Post-Training (Unofficial)
+
+This fork implements the GRPO reinforcement learning post-training stage described in Section 3.3 of the [Alpamayo-R1 paper](https://arxiv.org/abs/2511.00088). During GRPO, the VLM generates both Chain-of-Causation (CoC) reasoning text and discrete trajectory tokens via rollouts, then optimizes a composite reward signal using group-relative advantage estimation.
+
+### GRPO Training Curves
+
+![GRPO Training Curves](docs/grpo_training_curves_temp06.png)
+
 Any PRs to fix bugs, improve training, reward implementation, etc are welcome!
+
+
+### Features
+
+- **VLM-only rollouts** — the VLM autoregressively generates CoC text + 64 trajectory tokens; Expert and Diffusion modules are kept on CPU (not used during rollouts)
+- **Heuristic reward functions** — trajectory quality (minADE-based), reasoning quality (rule-based), and reasoning-trajectory consistency
+- **LoRA fine-tuning** — trains only VLM attention layers (q/k/v/o_proj) with LoRA (r=16, alpha=32) by default
+- **Multi-GPU support** — DDP via Accelerate (FSDP is currently broken; see [Limitations](#limitations-vs-the-paper))
+
+### Quick Start
+
+```bash
+# Smoke test (3 samples, 1 epoch)
+./scripts/run_grpo.sh --smoke
+
+# Full training run (DDP, auto-detected GPUs)
+./scripts/run_grpo.sh --no-fsdp
+
+# Single-GPU mode
+./scripts/run_grpo.sh --no-fsdp --num-gpus 1
+
+# Custom overrides
+./scripts/run_grpo.sh --no-fsdp training.num_train_epochs=3 training.learning_rate=5e-6
+```
+
+See [`docs/grpo-training.md`](docs/grpo-training.md) for detailed documentation, configuration reference, and design decisions.
+
+### Preliminary Results
+
+Evaluated on 253 curated test clips (6.4s prediction horizon, 64 waypoints at 10 Hz, 5 trajectory samples per clip, averaged over 5 independent runs with different random seeds for token sampling). Results across all evaluated checkpoints:
+
+| Model | minADE mean ± std | minFDE mean ± std |
+|-------|-------------------|-------------------|
+| Alpamayo-R1 base | 0.918 ± 0.030 | 2.446 ± 0.071 |
+| + GRPO (temp=0.6, 300 steps) | 0.910 ± 0.040 | 2.431 ± 0.152 |
+| **+ GRPO (temp=0.6, 400 steps)** | **0.898 ± 0.030** | **2.334 ± 0.099** |
+| + GRPO (temp=0.6, 600 steps) | 0.918 ± 0.035 | 2.441 ± 0.088 |
+
+
+The best checkpoint (temp=0.6, 400 steps) shows a trend toward lower minADE and minFDE compared to the base model. However, a paired statistical test (Wilcoxon signed-rank and paired t-test on per-clip scores) does not reach significance at the 0.05 level (minADE p≈0.53, minFDE p≈0.21).
+
+
+### Limitations vs. the Paper
+
+This is a community reimplementation based on the paper description. Several aspects differ from what is described in the paper or remain unknown:
+
+| Aspect | Paper | This Implementation |
+|--------|-------|---------------------|
+| **CoC quality reward** | Uses a reasoning critic to score reasoning quality | Rule-based heuristic scoring causal connectors, driving vocabulary, length, and repetition. No LLM judge. |
+| **Consistency reward** | Rule-based matching between CoC keywords and meta-actions | Keyword matching between CoC text and coarse trajectory behaviors (turning, braking, etc.). Currently disabled by default (weight=0.0). |
+| **Reward weights** | Not disclosed | Trajectory 50%, reasoning 50%, consistency 0% (tuned empirically) |
+| **Training data** | Internal dataset curation and filtering pipeline | Uses the public PhysicalAI-AV dataset with a single fixed timestamp per clip (t0=5.1s) |
+| **FSDP** | Unknown | **Broken.** FSDP wrapping conflicts with LoRA + Qwen3-VL's tied embeddings, causing crashes during checkpoint saving. Use DDP (`--no-fsdp`) instead. |
+| **vLLM rollouts** | Used in paper | Experimental support available when using this [PR](https://github.com/huggingface/trl/pull/5228) of TRL, but throughput is slower than native TRL Trainer |
+
+The most significant gap is how the rewards are implemented.
 
 
 ## Requirements
@@ -98,67 +162,7 @@ Alpamayo 1 implements the architecture described in our paper [*"Alpamayo-R1: Br
 
 The official release focuses on the core supervised learning components. This fork adds the GRPO post-training pipeline (see below). Route conditioning and meta-actions remain unreleased.
 
-## GRPO Post-Training (Unofficial)
 
-This fork implements the GRPO reinforcement learning post-training stage described in Section 3.3 of the [Alpamayo-R1 paper](https://arxiv.org/abs/2511.00088). During GRPO, the VLM generates both Chain-of-Causation (CoC) reasoning text and discrete trajectory tokens via rollouts, then optimizes a composite reward signal using group-relative advantage estimation.
-
-### Features
-
-- **VLM-only rollouts** — the VLM autoregressively generates CoC text + 64 trajectory tokens; Expert and Diffusion modules are kept on CPU (not used during rollouts)
-- **Heuristic reward functions** — trajectory quality (minADE-based), reasoning quality (rule-based), and reasoning-trajectory consistency
-- **LoRA fine-tuning** — trains only VLM attention layers (q/k/v/o_proj) with LoRA (r=16, alpha=32) by default
-- **Multi-GPU support** — DDP via Accelerate (FSDP is currently broken; see [Limitations](#limitations-vs-the-paper))
-
-### Quick Start
-
-```bash
-# Smoke test (3 samples, 1 epoch)
-./scripts/run_grpo.sh --smoke
-
-# Full training run (DDP, auto-detected GPUs)
-./scripts/run_grpo.sh --no-fsdp
-
-# Single-GPU mode
-./scripts/run_grpo.sh --no-fsdp --num-gpus 1
-
-# Custom overrides
-./scripts/run_grpo.sh --no-fsdp training.num_train_epochs=3 training.learning_rate=5e-6
-```
-
-See [`docs/grpo-training.md`](docs/grpo-training.md) for detailed documentation, configuration reference, and design decisions.
-
-### Preliminary Results
-
-Evaluated on 253 curated test clips (6.4s prediction horizon, 64 waypoints at 10 Hz, 5 trajectory samples per clip, averaged over 5 independent runs with different random seeds for token sampling). Results across all evaluated checkpoints:
-
-| Model | minADE mean ± std | minFDE mean ± std |
-|-------|-------------------|-------------------|
-| Alpamayo-R1 base | 0.918 ± 0.030 | 2.446 ± 0.071 |
-| + GRPO (temp=0.6, 300 steps) | 0.910 ± 0.040 | 2.431 ± 0.152 |
-| **+ GRPO (temp=0.6, 400 steps)** | **0.898 ± 0.030** | **2.334 ± 0.099** |
-| + GRPO (temp=0.6, 600 steps) | 0.918 ± 0.035 | 2.441 ± 0.088 |
-
-
-The best checkpoint (temp=0.6, 400 steps) shows a trend toward lower minADE and minFDE compared to the base model. However, a paired statistical test (Wilcoxon signed-rank and paired t-test on per-clip scores) does not reach significance at the 0.05 level (minADE p≈0.53, minFDE p≈0.21).
-
-#### Training Curves
-
-![GRPO Training Curves](docs/grpo_training_curves_temp06.png)
-
-### Limitations vs. the Paper
-
-This is a community reimplementation based on the paper description. Several aspects differ from what is described in the paper or remain unknown:
-
-| Aspect | Paper | This Implementation |
-|--------|-------|---------------------|
-| **CoC quality reward** | Uses a reasoning critic to score reasoning quality | Rule-based heuristic scoring causal connectors, driving vocabulary, length, and repetition. No LLM judge. |
-| **Consistency reward** | Rule-based matching between CoC keywords and meta-actions | Keyword matching between CoC text and coarse trajectory behaviors (turning, braking, etc.). Currently disabled by default (weight=0.0). |
-| **Reward weights** | Not disclosed | Trajectory 50%, reasoning 50%, consistency 0% (tuned empirically) |
-| **Training data** | Internal dataset curation and filtering pipeline | Uses the public PhysicalAI-AV dataset with a single fixed timestamp per clip (t0=5.1s) |
-| **FSDP** | Unknown | **Broken.** FSDP wrapping conflicts with LoRA + Qwen3-VL's tied embeddings, causing crashes during checkpoint saving. Use DDP (`--no-fsdp`) instead. |
-| **vLLM rollouts** | Used in paper | Experimental support available when using this [PR](https://github.com/huggingface/trl/pull/5228) of TRL, but throughput is slower than native TRL Trainer |
-
-The most significant gap is how the rewards are implemented.
 
 ## Frequently Asked Questions (FAQ)
 
