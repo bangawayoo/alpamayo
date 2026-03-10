@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paired Wilcoxon signed-rank test on per-clip minADE/minFDE.
+"""Paired statistical tests on per-clip minADE/minFDE.
 
 Each model directory should contain a results.csv produced by
 evaluate_quick_test.sh. The script handles both single-trial outputs
@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import wilcoxon
+from scipy.stats import ttest_rel, wilcoxon
 
 
 METRICS = ["minADE", "minFDE"]
@@ -44,7 +44,7 @@ def load_results(model_dir: Path) -> pd.DataFrame:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Paired Wilcoxon test on per-clip metrics from evaluate_quick_test.sh output."
+        description="Paired statistical tests on per-clip metrics from evaluate_quick_test.sh output."
     )
     parser.add_argument("model_a", type=Path, help="Directory for model A (contains results.csv)")
     parser.add_argument("model_b", type=Path, help="Directory for model B (contains results.csv)")
@@ -70,16 +70,18 @@ def main():
         mean_a = np.mean(vals_a)
         mean_b = np.mean(vals_b)
         diff = vals_a - vals_b
-        stat, p = wilcoxon(vals_a, vals_b)
         better = name_b if np.mean(diff) > 0 else name_a
+
+        w_stat, w_p = wilcoxon(vals_a, vals_b)
+        t_stat, t_p = ttest_rel(vals_a, vals_b)
 
         print(f"=== {metric} ===")
         print(f"  {name_a:>25s}: {mean_a:.4f}")
         print(f"  {name_b:>25s}: {mean_b:.4f}")
         print(f"  {'mean diff (A - B)':>25s}: {np.mean(diff):+.4f}")
-        print(f"  {'Wilcoxon stat':>25s}: {stat:.1f}")
-        print(f"  {'p-value':>25s}: {p:.4f}")
         print(f"  {'better':>25s}: {better}")
+        print(f"  {'Wilcoxon stat':>25s}: {w_stat:.1f}   p={w_p:.4f}")
+        print(f"  {'paired t stat':>25s}: {t_stat:+.3f}   p={t_p:.4f}")
         print()
 
 
