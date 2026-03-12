@@ -115,8 +115,7 @@ def _patch_vllm_qwen3vl_embed() -> None:
                     vision_embeddings, num_image_patches.flatten().tolist()
                 )
                 vision_embeddings = [
-                    embed.flatten(start_dim=0, end_dim=-2)
-                    for embed in vision_embeddings
+                    embed.flatten(start_dim=0, end_dim=-2) for embed in vision_embeddings
                 ]
 
             return vision_embeddings
@@ -168,7 +167,9 @@ class ClipDataCache:
     def _load_and_cache(self, clip_id: str, t0_us: int) -> None:
         """Load raw data and populate the cache entry, evicting LRU if full."""
         self._misses += 1
-        data = load_physical_aiavdataset(clip_id=clip_id, t0_us=t0_us, avdi=self._avdi, maybe_stream=True)
+        data = load_physical_aiavdataset(
+            clip_id=clip_id, t0_us=t0_us, avdi=self._avdi, maybe_stream=True
+        )
         model_inputs_cpu = helper.prepare_model_inputs(data, self._processor, device="cpu")
         entry: dict[str, Any] = {
             "model_inputs": model_inputs_cpu,
@@ -178,8 +179,7 @@ class ClipDataCache:
             # Convert (N_cameras, num_frames, 3, H, W) → flat list of PIL images
             frames = data["image_frames"].flatten(0, 1)  # (N*F, 3, H, W)
             pil_images = [
-                Image.fromarray(frame.permute(1, 2, 0).numpy().astype(np.uint8))
-                for frame in frames
+                Image.fromarray(frame.permute(1, 2, 0).numpy().astype(np.uint8)) for frame in frames
             ]
             entry["pil_images"] = pil_images
         if len(self._cache) >= self._max_size:
@@ -188,8 +188,13 @@ class ClipDataCache:
         self._cache[(clip_id, t0_us)] = entry
         logger.debug(
             "Cache miss for (%s, %d). Size: %d/%d. Hits: %d, misses: %d, evictions: %d.",
-            clip_id, t0_us, len(self._cache), self._max_size,
-            self._hits, self._misses, self._evictions,
+            clip_id,
+            t0_us,
+            len(self._cache),
+            self._max_size,
+            self._hits,
+            self._misses,
+            self._evictions,
         )
 
     def get(self, clip_id: str, t0_us: int, device: torch.device) -> tuple[dict, torch.Tensor]:
@@ -357,7 +362,9 @@ def make_vllm_rollout_func(
         """
 
         device = trainer.accelerator.device
-        num_generations = trainer.num_generations if trainer.model.training else trainer.num_generations_eval
+        num_generations = (
+            trainer.num_generations if trainer.model.training else trainer.num_generations_eval
+        )
 
         # De-duplicate prompts: TRL repeats each prompt, but distributed
         # training may split repetitions across GPUs.  Detect actual local
@@ -382,12 +389,15 @@ def make_vllm_rollout_func(
         hist_rot_per_unique: list[list[float]] = []
         clip_ids_per_unique: list[str] = []
 
-        for (prompt, local_gen_count) in prompt_groups:
+        for prompt, local_gen_count in prompt_groups:
             # Resolve prompt to string if conversational
             if isinstance(prompt, list):
                 prompt_text = " ".join(
-                    m.get("content", "") if isinstance(m.get("content"), str)
-                    else " ".join(c.get("text", "") for c in m.get("content", []) if isinstance(c, dict))
+                    m.get("content", "")
+                    if isinstance(m.get("content"), str)
+                    else " ".join(
+                        c.get("text", "") for c in m.get("content", []) if isinstance(c, dict)
+                    )
                     for m in prompt
                 )
             else:
@@ -430,10 +440,12 @@ def make_vllm_rollout_func(
 
             # Repeat each prompt local_gen_count times (colocate uses n=1)
             for _ in range(local_gen_count):
-                vllm_inputs.append({
-                    "prompt_token_ids": prompt_token_ids,
-                    "multi_modal_data": {"image": pil_images},
-                })
+                vllm_inputs.append(
+                    {
+                        "prompt_token_ids": prompt_token_ids,
+                        "multi_modal_data": {"image": pil_images},
+                    }
+                )
 
         # Call vLLM generate — branch on mode
         if vllm_mode == "colocate":
@@ -508,7 +520,10 @@ def make_vllm_rollout_func(
                 top_p=rollout_top_p,
                 max_tokens=max_new_tokens,
                 logprobs=1,
-                mm_processor_kwargs={"min_pixels": helper.MIN_PIXELS, "max_pixels": helper.MAX_PIXELS},
+                mm_processor_kwargs={
+                    "min_pixels": helper.MIN_PIXELS,
+                    "max_pixels": helper.MAX_PIXELS,
+                },
                 generation_kwargs={"stop_token_ids": [traj_future_end_id]},
             )
 
@@ -587,6 +602,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         rollout_max_generation_length: int = 256,
         logprob_mini_batch_size: int = 4,
         data_cache_max_size: int = 200,
+        value_head_cfg: dict | None = None,
         **kwargs,
     ):
         # Detect vLLM mode from GRPOConfig *before* calling super().__init__,
@@ -599,7 +615,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             # Create ClipDataCache early — shared between rollout_func and trainer.
             # processing_class may be passed as kwarg or positional arg.
             processor = kwargs.get("processing_class")
-            self._data_cache = ClipDataCache(avdi, processor, cache_pil_images=True, max_size=data_cache_max_size)
+            self._data_cache = ClipDataCache(
+                avdi, processor, cache_pil_images=True, max_size=data_cache_max_size
+            )
             rollout_fn = make_vllm_rollout_func(
                 full_model=full_model,
                 data_cache=self._data_cache,
@@ -625,7 +643,55 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self.logprob_mini_batch_size = logprob_mini_batch_size
         self.use_vllm = use_vllm
         if not use_vllm:
-            self._data_cache = ClipDataCache(avdi, self.processing_class, max_size=data_cache_max_size)
+            self._data_cache = ClipDataCache(
+                avdi, self.processing_class, max_size=data_cache_max_size
+            )
+
+        # Value head (optional scene-level baseline)
+        self.value_head = None
+        self.value_optimizer = None
+        self._value_h0_stash: list[torch.Tensor] = []  # h_0 per completion (CPU)
+        self._value_rewards_stash: list[float] = []  # composite reward per completion
+        self._value_reward_weights: list[float] = [0.5, 0.25, 0.25]  # traj/reasoning/consistency
+        self._value_pretrain_remaining: int = 0
+        self._value_save_path: str | None = None
+
+        _vh_cfg = value_head_cfg or {}
+        if _vh_cfg.get("enabled", False):
+            from alpamayo_r1.training.value_head import SceneValueHead
+
+            _hidden_dim = int(_vh_cfg.get("hidden_dim", 4096))
+            _vh_device = self.accelerator.device
+            self.value_head = SceneValueHead(_hidden_dim).to(_vh_device)
+            self.value_optimizer = torch.optim.Adam(
+                self.value_head.parameters(),
+                lr=float(_vh_cfg.get("lr", 1e-4)),
+            )
+            self._value_pretrain_remaining = int(_vh_cfg.get("pretrain_steps", 0))
+            self._value_save_path = _vh_cfg.get("save_path", None) or None
+
+            # Load pre-trained weights if a checkpoint path is provided
+            _load_path = _vh_cfg.get("load_path", None) or None
+            if _load_path is not None:
+                import os
+
+                if os.path.isfile(_load_path):
+                    state = torch.load(_load_path, map_location=_vh_device)
+                    self.value_head.load_state_dict(state)
+                    logger.info("Loaded SceneValueHead weights from %s", _load_path)
+                else:
+                    logger.warning(
+                        "value_head.load_path=%s not found — starting from random init",
+                        _load_path,
+                    )
+
+            logger.info(
+                "SceneValueHead enabled: hidden_dim=%d, lr=%.2e, pretrain_steps=%d, device=%s",
+                _hidden_dim,
+                _vh_cfg.get("lr", 1e-4),
+                self._value_pretrain_remaining,
+                _vh_device,
+            )
 
         # Patch FSDP1 weight sync on the VLLMGeneration instance.
         # TRL's default _sync_fsdp1_params_to_vllm does a post-order
@@ -652,7 +718,42 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                             llm_model.load_weights([(name, param.data)])
 
             vllm_gen._sync_fsdp1_params_to_vllm = _patched_sync_fsdp1
-            logger.info("Patched VLLMGeneration._sync_fsdp1_params_to_vllm for FSDP root-level sync.")
+            logger.info(
+                "Patched VLLMGeneration._sync_fsdp1_params_to_vllm for FSDP root-level sync."
+            )
+
+    def _compute_scene_h0(
+        self,
+        prompt_input_ids: torch.Tensor,
+        model_inputs: dict,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Get VLM hidden state at last prompt token (scene encoding).
+
+        Runs a single VLM forward pass with output_hidden_states=True on the
+        prompt only. The hidden state at the last prompt position encodes the
+        model's full scene understanding before any generation begins.
+
+        Args:
+            prompt_input_ids: Prompt token IDs, shape (1, L_prompt).
+            model_inputs: Dict from ClipDataCache, containing 'tokenized_data'
+                with pixel_values, attention_mask, image_grid_thw.
+            device: Target compute device.
+
+        Returns:
+            h_0: shape (1, hidden_dim), float32, on CPU.
+        """
+        tokenized = model_inputs["tokenized_data"]
+        forward_kwargs = {k: v for k, v in tokenized.items() if k not in ("input_ids",)}
+        with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
+            outputs = self.full_model.vlm(
+                input_ids=prompt_input_ids,
+                output_hidden_states=True,
+                **forward_kwargs,
+            )
+        # Last hidden layer, last token position: (1, hidden_dim)
+        h0 = outputs.hidden_states[-1][:, -1, :].float().cpu()
+        return h0
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         """Override to mutate the ``logs`` dict in-place during eval.
@@ -669,11 +770,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         """
         mode = "train" if self.model.training else "eval"
         if mode == "eval" and self._metrics[mode]:
-            extra = {
-                f"eval_{k}": sum(v) / len(v)
-                for k, v in self._metrics[mode].items()
-                if v
-            }
+            extra = {f"eval_{k}": sum(v) / len(v) for k, v in self._metrics[mode].items() if v}
             logs.update(extra)
         super().log(logs, start_time)
 
@@ -684,22 +781,30 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         causes PEFT's auto-detection to crash with AttributeError. Since we
         know the vocabulary is resized (trajectory + special tokens), we
         explicitly tell PEFT to save embedding layers.
-        """
-        if state_dict is not None and not (hasattr(self.model, "peft_config")):
-            super()._save(output_dir, state_dict=state_dict)
-            return
 
+        If ``value_head.save_path`` is configured, the value head weights are
+        also saved there so stage-0 checkpoints can be reloaded for stage 1.
+        """
         import os
 
-        os.makedirs(output_dir, exist_ok=True)
-        self.model.save_pretrained(
-            output_dir,
-            state_dict=state_dict,
-            safe_serialization=self.args.save_safetensors,
-            save_embedding_layers=True,
-        )
-        if self.processing_class is not None:
-            self.processing_class.save_pretrained(output_dir)
+        if state_dict is not None and not (hasattr(self.model, "peft_config")):
+            super()._save(output_dir, state_dict=state_dict)
+        else:
+            os.makedirs(output_dir, exist_ok=True)
+            self.model.save_pretrained(
+                output_dir,
+                state_dict=state_dict,
+                safe_serialization=self.args.save_safetensors,
+                save_embedding_layers=True,
+            )
+            if self.processing_class is not None:
+                self.processing_class.save_pretrained(output_dir)
+
+        # Save value head weights when a save_path is configured
+        if self.value_head is not None and self._value_save_path is not None:
+            os.makedirs(os.path.dirname(os.path.abspath(self._value_save_path)), exist_ok=True)
+            torch.save(self.value_head.state_dict(), self._value_save_path)
+            logger.info("Saved SceneValueHead weights to %s", self._value_save_path)
 
     def _generate_single_turn(self, prompts: list):
         """Generate CoC text + discrete trajectory tokens via VLM only.
@@ -718,6 +823,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         """
         if self.use_vllm:
             return super()._generate_single_turn(prompts)
+
+        # Clear value head stashes at the start of each new rollout
+        if self.value_head is not None:
+            self._value_h0_stash.clear()
+            self._value_rewards_stash.clear()
 
         device = self.accelerator.device
         num_generations = self.num_generations if self.model.training else self.num_generations_eval
@@ -752,7 +862,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         # pipeline (accessed via self.full_model) sees complete params.
         fsdp_ctx = (
             FSDP.summon_full_params(self.model_wrapped, recurse=False)
-            if self.is_fsdp_enabled else nullcontext()
+            if self.is_fsdp_enabled
+            else nullcontext()
         )
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator):
             with torch.no_grad(), fsdp_ctx:
@@ -760,8 +871,13 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     # Resolve prompt to string if conversational
                     if isinstance(prompt, list):
                         prompt_text = " ".join(
-                            m.get("content", "") if isinstance(m.get("content"), str)
-                            else " ".join(c.get("text", "") for c in m.get("content", []) if isinstance(c, dict))
+                            m.get("content", "")
+                            if isinstance(m.get("content"), str)
+                            else " ".join(
+                                c.get("text", "")
+                                for c in m.get("content", [])
+                                if isinstance(c, dict)
+                            )
                             for m in prompt
                         )
                     else:
@@ -783,6 +899,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     prompt_len = input_ids.shape[1]
                     prompt_input_ids = input_ids.clone()
 
+                    # Compute scene h_0 once per unique scene for value head
+                    if self.value_head is not None:
+                        scene_h0 = self._compute_scene_h0(prompt_input_ids, model_inputs, device)
+
                     # 3. VLM-only generation (no ExpertLogitsProcessor)
                     # Generate only as many sequences as this GPU needs for this
                     # prompt group (may be less than num_generations when
@@ -792,12 +912,16 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         temperature=self.rollout_temperature,
                         top_p=self.rollout_top_p,
                         num_return_sequences=local_gen_count,
-                        max_new_tokens=self.rollout_max_generation_length + tokens_per_future_traj + 10,
+                        max_new_tokens=self.rollout_max_generation_length
+                        + tokens_per_future_traj
+                        + 10,
                         pad_token_id=pad_token_id,
                     )
-                    stopping = StoppingCriteriaList([
-                        StopAfterEOS(eos_token_id=traj_future_end_id),
-                    ])
+                    stopping = StoppingCriteriaList(
+                        [
+                            StopAfterEOS(eos_token_id=traj_future_end_id),
+                        ]
+                    )
 
                     with torch.autocast(str(device), dtype=torch.bfloat16):
                         vlm_output = self.full_model.vlm.generate(
@@ -812,8 +936,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
                     # 4. Extract trajectory tokens and decode to continuous xyz
                     traj_tokens = extract_traj_tokens(
-                        vlm_output, special_token_ids,
-                        tokens_per_future_traj, traj_token_start_idx, traj_vocab_size,
+                        vlm_output,
+                        special_token_ids,
+                        tokens_per_future_traj,
+                        traj_token_start_idx,
+                        traj_vocab_size,
                     )
                     hist_xyz = model_inputs["ego_history_xyz"][:, -1]  # (1, T, 3)
                     hist_rot = model_inputs["ego_history_rot"][:, -1]  # (1, T, 3, 3)
@@ -821,7 +948,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     hist_rot_rep = hist_rot.expand(local_gen_count, -1, -1, -1)
                     with torch.no_grad():
                         pred_xyz_tensor, pred_rot_tensor, _ = traj_tokenizer.decode(
-                            hist_xyz_rep, hist_rot_rep, traj_tokens,
+                            hist_xyz_rep,
+                            hist_rot_rep,
+                            traj_tokens,
                         )
 
                     # 5. Build per-sample outputs (local_gen_count per unique prompt)
@@ -859,6 +988,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         all_completion_ids.append(completion_ids)
                         all_coc_texts.append(coc_text)
                         all_clip_ids.append(clip_id)
+
+                        # Stash h_0 (same scene embedding for all G completions of this scene)
+                        if self.value_head is not None:
+                            self._value_h0_stash.append(scene_h0)  # (1, hidden_dim) CPU tensor
 
                         # Trajectory data for reward computation
                         pred_traj = pred_xyz_tensor[sample_idx].cpu().numpy().flatten().tolist()
@@ -908,7 +1041,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         ``_generate_single_turn``), so we just pass through.
         """
         if not self.use_vllm or not inputs or "hist_xyz" not in inputs[0]:
-            return super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+            result = super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+            if self.value_head is not None:
+                self._stash_value_rewards(inputs, completions)
+            return result
 
         # vLLM path: decode trajectory tokens from completion_ids
         traj_token_start_idx = self.full_model.future_token_start_idx
@@ -930,8 +1066,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
             # Extract trajectory tokens
             traj_tokens = extract_traj_tokens(
-                comp_tensor, special_token_ids,
-                tokens_per_future_traj, traj_token_start_idx, traj_vocab_size,
+                comp_tensor,
+                special_token_ids,
+                tokens_per_future_traj,
+                traj_token_start_idx,
+                traj_vocab_size,
             )
 
             # Reconstruct hist_xyz/hist_rot from flattened lists
@@ -948,7 +1087,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             # Decode trajectory tokens → continuous xyz
             with torch.no_grad():
                 pred_xyz_tensor, _, _ = traj_tokenizer.decode(
-                    hist_xyz, hist_rot, traj_tokens,
+                    hist_xyz,
+                    hist_rot,
+                    traj_tokens,
                 )
 
             pred_traj = pred_xyz_tensor[0].cpu().numpy().flatten().tolist()
@@ -981,7 +1122,121 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             "num_generations": num_generations,
         }
 
-        return super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        result = super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        if self.value_head is not None:
+            self._stash_value_rewards(inputs, completions)
+        return result
+
+    def _stash_value_rewards(self, inputs: list[dict], completions: list[str]) -> None:
+        """Compute composite rewards and stash them for value head training.
+
+        Args:
+            inputs: Per-sample input dicts (must have pred_xyz and gt_xyz populated).
+            completions: CoC text strings, one per sample.
+        """
+        from alpamayo_r1.training.rewards import (
+            consistency_reward,
+            reasoning_quality_reward,
+            trajectory_quality_reward,
+        )
+
+        pred_xyz_list = [inp.get("pred_xyz") for inp in inputs]
+        gt_xyz_list = [inp.get("gt_xyz") for inp in inputs]
+        w_traj, w_reason, w_consist = self._value_reward_weights
+
+        r_traj = trajectory_quality_reward(completions, pred_xyz=pred_xyz_list, gt_xyz=gt_xyz_list)
+        r_reason = reasoning_quality_reward(completions)
+        r_consist = consistency_reward(completions, pred_xyz=pred_xyz_list)
+
+        for rt, rr, rc in zip(r_traj, r_reason, r_consist):
+            composite = w_traj * rt + w_reason * rr + w_consist * rc
+            self._value_rewards_stash.append(composite)
+
+    def _train_value_head_step(self, batch_size: int) -> None:
+        """Consume one batch from the stash and update the value head.
+
+        Pops up to ``batch_size`` (h_0, reward) pairs from the stashes,
+        runs an MSE update via the separate value optimizer, and accumulates
+        metrics into ``self._metrics["train"]`` so they appear in TRL's log.
+        No-ops silently if the stash is empty (e.g. vLLM path before h_0
+        collection is wired in).
+
+        Args:
+            batch_size: Number of samples to consume from the stash.
+        """
+        n = min(batch_size, len(self._value_h0_stash), len(self._value_rewards_stash))
+        if n == 0:
+            logger.debug(
+                "value head stash empty (h0=%d, rewards=%d) — skipping update",
+                len(self._value_h0_stash),
+                len(self._value_rewards_stash),
+            )
+            return
+
+        device = self.accelerator.device
+
+        h0_batch = self._value_h0_stash[:n]
+        rewards_batch = self._value_rewards_stash[:n]
+        self._value_h0_stash = self._value_h0_stash[n:]
+        self._value_rewards_stash = self._value_rewards_stash[n:]
+
+        h0_tensor = torch.cat(h0_batch, dim=0).to(device)  # (n, hidden_dim)
+        rewards_tensor = torch.tensor(rewards_batch, dtype=torch.float32, device=device)
+
+        v_pred = self.value_head(h0_tensor)  # (n,)
+        value_loss = F.mse_loss(v_pred, rewards_tensor)
+
+        self.value_optimizer.zero_grad()
+        value_loss.backward()
+        self.value_optimizer.step()
+
+        # Accumulate into TRL's metric dict so values appear in the training log.
+        # self._metrics["train"] is a defaultdict(list) maintained by GRPOTrainer.
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode]["value_head/loss"].append(value_loss.item())
+        self._metrics[mode]["value_head/pred_mean"].append(v_pred.detach().mean().item())
+        self._metrics[mode]["value_head/target_mean"].append(rewards_tensor.mean().item())
+        is_pretrain = self._value_pretrain_remaining > 0
+        self._metrics[mode]["value_head/pretrain_steps_remaining"].append(
+            float(self._value_pretrain_remaining)
+        )
+        logger.debug(
+            "value head%s | loss=%.4f pred=%.3f target=%.3f",
+            " [pretrain]" if is_pretrain else "",
+            value_loss.item(),
+            v_pred.detach().mean().item(),
+            rewards_tensor.mean().item(),
+        )
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """Override to train value head alongside (or instead of) the GRPO policy loss.
+
+        **Stage 0** (``_value_pretrain_remaining > 0``): only the value head
+        trains.  The policy loss is replaced by a zero scalar so the VLM
+        receives no gradient.  The expensive GRPO forward pass is skipped
+        entirely for efficiency.  The counter decrements each call.
+
+        **Stage 1** (``_value_pretrain_remaining == 0``): normal GRPO plus a
+        value head update from the stash.
+
+        When the value head is disabled, delegates to the parent unchanged.
+        """
+        if self.value_head is None:
+            return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+
+        batch_size = inputs["input_ids"].shape[0] if "input_ids" in inputs else 1
+        self._train_value_head_step(batch_size)
+
+        # Stage 0: skip GRPO policy update
+        if self._value_pretrain_remaining > 0:
+            self._value_pretrain_remaining -= 1
+            zero_loss = torch.tensor(0.0, requires_grad=True, device=self.accelerator.device)
+            if return_outputs:
+                return zero_loss, None
+            return zero_loss
+
+        # Stage 1: normal GRPO
+        return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
 
 
 def _compute_batch_logprobs(
@@ -1020,7 +1275,8 @@ def _compute_batch_logprobs(
 
         # Build per-completion tensors (use a placeholder token for empties)
         comp_tensors = [
-            torch.tensor(ids, dtype=torch.long, device=device) if ids
+            torch.tensor(ids, dtype=torch.long, device=device)
+            if ids
             else torch.tensor([0], dtype=torch.long, device=device)
             for ids in batch_comp_ids
         ]
@@ -1117,9 +1373,7 @@ def _collate_rollout_outputs(
             completion_ids_padded[i, : t.shape[0]] = t
 
     # Pad logprobs to same length (pad with 0.0)
-    logprobs_padded = torch.zeros(
-        (len(all_logprobs), max_comp_len), dtype=torch.float32
-    )
+    logprobs_padded = torch.zeros((len(all_logprobs), max_comp_len), dtype=torch.float32)
     for i, t in enumerate(all_logprobs):
         if t.shape[0] > 0:
             logprobs_padded[i, : t.shape[0]] = t
@@ -1139,6 +1393,7 @@ def _collate_rollout_outputs(
 # GPU utilization callback
 # ---------------------------------------------------------------------------
 
+
 class GpuUtilizationCallback(TrainerCallback):
     """Prints GPU SM utilization and memory usage to the log on each logging step.
 
@@ -1149,6 +1404,7 @@ class GpuUtilizationCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         try:
             import pynvml
+
             pynvml.nvmlInit()
             n = pynvml.nvmlDeviceGetCount()
             parts = []
@@ -1157,8 +1413,7 @@ class GpuUtilizationCallback(TrainerCallback):
                 util = pynvml.nvmlDeviceGetUtilizationRates(handle)
                 mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
                 parts.append(
-                    f"GPU{i} {util.gpu:3d}% SM  "
-                    f"{mem.used / 2**30:.1f}/{mem.total / 2**30:.1f} GB"
+                    f"GPU{i} {util.gpu:3d}% SM  {mem.used / 2**30:.1f}/{mem.total / 2**30:.1f} GB"
                 )
             logger.info("GPU util | step %d | %s", state.global_step, " | ".join(parts))
         except Exception:
@@ -1168,6 +1423,7 @@ class GpuUtilizationCallback(TrainerCallback):
 # ---------------------------------------------------------------------------
 # Rollout logging callback
 # ---------------------------------------------------------------------------
+
 
 class RolloutLoggingCallback(TrainerCallback):
     """Logs CoC text and BEV trajectory plots to TensorBoard periodically.
@@ -1188,7 +1444,9 @@ class RolloutLoggingCallback(TrainerCallback):
         max_samples: Max unique prompts to log per interval.
     """
 
-    def __init__(self, log_interval: int = 1, plot_interval: int | None = None, max_samples: int = 2):
+    def __init__(
+        self, log_interval: int = 1, plot_interval: int | None = None, max_samples: int = 2
+    ):
         self.log_interval = log_interval
         self.plot_interval = plot_interval if plot_interval is not None else log_interval
         self.max_samples = max_samples
@@ -1213,6 +1471,7 @@ class RolloutLoggingCallback(TrainerCallback):
         # Fallback: create our own writer using the trainer's logging dir
         try:
             from torch.utils.tensorboard import SummaryWriter
+
             log_dir = getattr(self.trainer.args, "logging_dir", None)
             if log_dir:
                 logger.info("RolloutLoggingCallback: creating own SummaryWriter at %s", log_dir)
@@ -1263,9 +1522,7 @@ class RolloutLoggingCallback(TrainerCallback):
                 # --- CoC text (as markdown) ---
                 text_parts = []
                 for j in range(min(num_gen, 4)):
-                    text_parts.append(
-                        f"**Sample {j}:**\n\n{data['coc_texts'][base + j]}"
-                    )
+                    text_parts.append(f"**Sample {j}:**\n\n{data['coc_texts'][base + j]}")
                 text_md = f"**Clip:** `{clip_id}`\n\n" + "\n\n---\n\n".join(text_parts)
                 writer.add_text(f"rollout/coc_text_{i}", text_md, step)
 
@@ -1286,7 +1543,9 @@ class RolloutLoggingCallback(TrainerCallback):
                     writer.add_text(f"rollout/generated_tokens_{i}", tokens_md, step)
                     logger.info(
                         "Step %d | Clip %s | Sample 0 (%d tokens): %s",
-                        step, clip_id, len(completion_ids[base]),
+                        step,
+                        clip_id,
+                        len(completion_ids[base]),
                         tokenizer.decode(completion_ids[base], skip_special_tokens=False)[:200],
                     )
 
@@ -1300,6 +1559,7 @@ class RolloutLoggingCallback(TrainerCallback):
                     )
                     writer.add_figure(f"rollout/trajectory_bev_{i}", fig, step)
                     import matplotlib.pyplot as plt
+
                     plt.close(fig)
                 except OSError as e:
                     logger.warning("Skipping BEV plot at step %d (matplotlib error: %s)", step, e)
@@ -1323,6 +1583,7 @@ def _plot_trajectories_bev(
         matplotlib Figure (caller must close it).
     """
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -1335,8 +1596,12 @@ def _plot_trajectories_bev(
     for j, pred_flat in enumerate(pred_list):
         pred = np.array(pred_flat, dtype=np.float32).reshape(-1, 3)
         ax.plot(
-            pred[:, 0], pred[:, 1], "--",
-            color=cmap(j % 10), alpha=0.6, linewidth=1.0,
+            pred[:, 0],
+            pred[:, 1],
+            "--",
+            color=cmap(j % 10),
+            alpha=0.6,
+            linewidth=1.0,
             label=f"Pred {j}" if j < 6 else None,
         )
 

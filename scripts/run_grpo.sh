@@ -122,6 +122,7 @@ if [[ "$SMOKE" -eq 1 ]]; then
         "training.save_steps=999999"
         "training.output_dir=outputs/grpo_smoke"
         "training.report_to=none"
+        "early_stopping.enabled=false"
         "rollout.num_traj_samples=2"
         "rollout.max_generation_length=128"
     )

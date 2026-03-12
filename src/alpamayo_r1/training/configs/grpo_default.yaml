@@ -62,6 +62,7 @@ rollout:
   temperature: 0.6
   top_p: 0.98
   max_generation_length: 256
+  num_traj_samples: 8    # trajectory samples per scene; must equal training.num_generations
   logprob_mini_batch_size: 2  # completions per VLM forward pass — reduced for 40GB GPU
   log_interval: 10       # steps between rollout text logging (CoC text + generated tokens)
   plot_interval: 50      # steps between BEV trajectory plots (null = same as log_interval)
@@ -104,3 +105,28 @@ rewards:
   trajectory_weight: 0.50
   reasoning_weight: 0.5
   consistency_weight: 0.0
+
+# Scene-level value head (learned GRPO baseline)
+# When enabled, trains a small MLP to predict E[composite_reward | scene]
+# online alongside GRPO. V1: auxiliary predictor only (no advantage replacement).
+#
+# Two-stage training:
+#   Stage 0 (pretrain_steps > 0): only the value head trains; policy loss is
+#     zero. Run for ~200-500 steps to bootstrap V(scene) before GRPO begins.
+#   Stage 1 (online): value head continues training alongside GRPO.
+#
+# Workflow:
+#   # Stage 0 — pre-train value head, save checkpoint
+#   ./scripts/run_grpo.sh value_head.enabled=true \
+#     value_head.pretrain_steps=300 value_head.save_path=outputs/value_head_pretrained.pt
+#
+#   # Stage 1 — full GRPO with warm-started value head
+#   ./scripts/run_grpo.sh value_head.enabled=true \
+#     value_head.load_path=outputs/value_head_pretrained.pt
+value_head:
+  enabled: false       # set true to enable
+  hidden_dim: 4096     # must match VLM hidden size
+  lr: 1e-4
+  pretrain_steps: 0    # stage 0: steps where only value head trains (0 = skip stage 0)
+  save_path: null      # save value head weights here after training (null = don't save)
+  load_path: null      # load pre-trained value head weights at init (null = random init)
