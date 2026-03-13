@@ -52,6 +52,7 @@ from alpamayo_r1.training.rollout import (
     AlpamayoGRPOTrainer,
     GpuUtilizationCallback,
     RolloutLoggingCallback,
+    prepare_vlm_for_training,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,13 +91,34 @@ def main(cfg: DictConfig) -> None:
     np.random.seed(seed)
 
     model_name = cfg.get("model_name", "nvidia/Alpamayo-R1-10B")
+    base_model_name = cfg.get("base_model_name", None)
 
     # ---------------------------------------------------------------
     # 1. Load the full AlpamayoR1 model (on CPU; FSDP/accelerator
     #    will handle VLM device placement)
     # ---------------------------------------------------------------
-    logger.info("Loading model: %s", model_name)
-    full_model = AlpamayoR1.from_pretrained(model_name, dtype=torch.bfloat16)
+    adapter_config_path = Path(model_name) / "adapter_config.json"
+    if adapter_config_path.exists():
+        if base_model_name is None:
+            raise ValueError(
+                f"model_name={model_name!r} appears to be a LoRA adapter checkpoint "
+                "(contains adapter_config.json). Set base_model_name= to the full "
+                "AlpamayoR1 model (e.g., nvidia/Alpamayo-R1-10B)."
+            )
+        logger.info(
+            "Detected LoRA adapter checkpoint; loading base model %s then applying adapter",
+            base_model_name,
+        )
+        full_model = AlpamayoR1.from_pretrained_with_lora(
+            adapter_path=model_name,
+            base_model_name=base_model_name,
+            dtype=torch.bfloat16,
+            device_map=None,  # keep on CPU; FSDP/accelerator handles placement
+            merge=True,
+        )
+    else:
+        logger.info("Loading model: %s", model_name)
+        full_model = AlpamayoR1.from_pretrained(model_name, dtype=torch.bfloat16)
 
     # ---------------------------------------------------------------
     # 2. Freeze non-VLM parameters
@@ -107,7 +129,9 @@ def main(cfg: DictConfig) -> None:
     # 3. Processor and dataset interface
     # ---------------------------------------------------------------
     processor = helper.get_processor(full_model.tokenizer)
-    avdi = PhysicalAIAVDatasetInterface()
+    data_cfg = cfg.get("data", {})
+    dataset_revision = data_cfg.get("dataset_revision", None)
+    avdi = PhysicalAIAVDatasetInterface(revision=dataset_revision)
 
     # ---------------------------------------------------------------
     # 4. LoRA configuration (optional — disabled for full-parameter training)
@@ -211,6 +235,7 @@ def main(cfg: DictConfig) -> None:
         seed=seed,
         gradient_checkpointing=train_cfg.get("gradient_checkpointing", False),
         report_to=train_cfg.get("report_to", "tensorboard"),
+        resume_from_checkpoint=train_cfg.get("resume_from_checkpoint", None),
         reward_weights=reward_weights,
         **eval_kwargs,
         **vllm_kwargs,
@@ -251,12 +276,7 @@ def main(cfg: DictConfig) -> None:
     # 7. Create trainer and train
     # ---------------------------------------------------------------
     rollout_cfg = cfg.get("rollout", {})
-    # Ensure the VLM has name_or_path set so TRL's VLLMGeneration can
-    # locate the model checkpoint when initialising the vLLM engine.
-    if not getattr(full_model.vlm, "name_or_path", ""):
-        full_model.vlm.name_or_path = full_model.config.vlm_name_or_path
-    if not getattr(full_model.vlm.config, "_name_or_path", ""):
-        full_model.vlm.config._name_or_path = full_model.config.vlm_name_or_path
+    prepare_vlm_for_training(full_model)
 
     logger.info("Initializing AlpamayoGRPOTrainer...")
     trainer = AlpamayoGRPOTrainer(

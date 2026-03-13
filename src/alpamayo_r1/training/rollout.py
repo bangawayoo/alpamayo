@@ -567,6 +567,39 @@ def make_vllm_rollout_func(
     return rollout_func
 
 
+def prepare_vlm_for_training(full_model: AlpamayoR1) -> None:
+    """Patch the VLM and its config for compatibility with TRL, PEFT, and FSDP.
+
+    Must be called before passing ``full_model.vlm`` to ``AlpamayoGRPOTrainer``.
+
+    Patches applied:
+    - Sets ``name_or_path`` / ``_name_or_path`` so TRL/vLLM can locate the
+      checkpoint.
+    - Monkey-patches ``Qwen3VLConfig.__init__`` to expose ``vocab_size`` at
+      the top level (PEFT's ``get_peft_model_state_dict`` expects it there
+      for the embedding-resize check during checkpoint saving).
+    """
+    # name_or_path for TRL/vLLM checkpoint lookup
+    if not getattr(full_model.vlm, "name_or_path", ""):
+        full_model.vlm.name_or_path = full_model.config.vlm_name_or_path
+    if not getattr(full_model.vlm.config, "_name_or_path", ""):
+        full_model.vlm.config._name_or_path = full_model.config.vlm_name_or_path
+
+    # Qwen3VLConfig keeps vocab_size inside text_config, but PEFT loads a
+    # fresh config via from_pretrained() and accesses .vocab_size directly.
+    vlm_config_cls = type(full_model.vlm.config)
+    if not hasattr(vlm_config_cls, "_patched_vocab_size"):
+        _original_init = vlm_config_cls.__init__
+
+        def _patched_init(self, *args, **kwargs):
+            _original_init(self, *args, **kwargs)
+            if not hasattr(self, "vocab_size") and hasattr(self, "text_config"):
+                self.vocab_size = self.text_config.vocab_size
+
+        vlm_config_cls.__init__ = _patched_init
+        vlm_config_cls._patched_vocab_size = True
+
+
 class AlpamayoGRPOTrainer(GRPOTrainer):
     """GRPOTrainer subclass with VLM-only rollouts for Alpamayo-R1.
 
@@ -781,33 +814,12 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         super().log(logs, start_time)
 
     def _save(self, output_dir, state_dict=None):
-        """Override to pass save_embedding_layers=True for PEFT models.
+        """Extend default save to also persist value head weights."""
+        super()._save(output_dir, state_dict=state_dict)
 
-        Qwen3VLConfig doesn't expose ``vocab_size`` at the top level, which
-        causes PEFT's auto-detection to crash with AttributeError. Since we
-        know the vocabulary is resized (trajectory + special tokens), we
-        explicitly tell PEFT to save embedding layers.
-
-        If ``value_head.save_path`` is configured, the value head weights are
-        also saved there so stage-0 checkpoints can be reloaded for stage 1.
-        """
-        import os
-
-        if state_dict is not None and not (hasattr(self.model, "peft_config")):
-            super()._save(output_dir, state_dict=state_dict)
-        else:
-            os.makedirs(output_dir, exist_ok=True)
-            self.model.save_pretrained(
-                output_dir,
-                state_dict=state_dict,
-                safe_serialization=self.args.save_safetensors,
-                save_embedding_layers=True,
-            )
-            if self.processing_class is not None:
-                self.processing_class.save_pretrained(output_dir)
-
-        # Save value head weights when a save_path is configured
         if self.value_head is not None and self._value_save_path is not None:
+            import os
+
             os.makedirs(os.path.dirname(os.path.abspath(self._value_save_path)), exist_ok=True)
             torch.save(self.value_head.state_dict(), self._value_save_path)
             logger.info("Saved SceneValueHead weights to %s", self._value_save_path)

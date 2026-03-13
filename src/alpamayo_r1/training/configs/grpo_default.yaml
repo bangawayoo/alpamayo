@@ -16,6 +16,7 @@ defaults:
 seed: 42
 device: cuda
 model_name: nvidia/Alpamayo-R1-10B
+base_model_name: nvidia/Alpamayo-R1-10B
 
 # LoRA configuration for VLM text attention layers
 # Set lora.enabled=false for full-parameter training (requires FSDP for multi-GPU)
@@ -48,6 +49,7 @@ training:
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   report_to: tensorboard
+  resume_from_checkpoint: null  # path to checkpoint dir to resume training, or null
 
 # Dataset
 data:
@@ -56,6 +58,7 @@ data:
   max_samples: 3000  # null = use all samples; set to int for debugging
   clip_ids_file: null  # optional path to parquet with clip_id column
   exclude_clip_ids_file: notebooks/clip_ids.parquet  # exclude evaluation clips from training
+  dataset_revision: 05e158af89ba  # HF dataset revision (pin to avoid breaking changes)
 
 # Rollout function parameters
 rollout:
