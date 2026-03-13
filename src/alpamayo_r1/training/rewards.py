@@ -285,10 +285,15 @@ def consistency_reward(
             for kw in _META_ACTION_KEYWORDS.get(action, [])
         )
 
+        # Going straight is the implicit default — if the trajectory only
+        # goes straight laterally, not mentioning it in the CoC text is
+        # consistent (humans omit redundant lateral descriptions).
+        if lat_set == {"go_straight"}:
+            lat_match = True
+
+        # Binary: both axes must match for reward (sharper GRPO signal)
         if lon_match and lat_match:
             rewards.append(1.0)
-        elif lon_match or lat_match:
-            rewards.append(0.5)
         else:
             rewards.append(0.0)
 

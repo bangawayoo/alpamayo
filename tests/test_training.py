@@ -203,12 +203,33 @@ class TestConsistencyReward:
         rewards = self.reward_fn([text], pred_xyz=[pred])
         assert rewards[0] == 1.0
 
-    def test_partial_match_is_half(self):
-        """Only one axis matches → r=0.5 (partial credit)."""
+    def test_partial_match_is_zero(self):
+        """Only one axis matches → r=0.0 (binary: both axes must match)."""
         text = "The vehicle is turning left."  # lateral matches but no lon keyword
         pred = self._make_left_turn_traj()
         rewards = self.reward_fn([text], pred_xyz=[pred])
-        assert rewards[0] == 0.5
+        assert rewards[0] == 0.0
+
+    def test_implicit_straight_gives_full_credit(self):
+        """Lon-only CoC with straight trajectory should get r=1 (implicit go_straight)."""
+        text = "Stop at the stop line since the traffic light is red."
+        # Make a stopping-straight trajectory
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, 2, T)  # barely moving forward
+        pred = traj.flatten().tolist()
+        rewards = self.reward_fn([text], pred_xyz=[pred])
+        assert rewards[0] == 1.0
+
+    def test_implicit_straight_not_applied_to_turns(self):
+        """Implicit go_straight should NOT apply when trajectory actually turns."""
+        # Left-turn traj: lon=maintain_speed, lat=steer_left
+        # Text mentions "maintain speed" (lon match) but no lateral keyword
+        text = "The vehicle will maintain speed."
+        pred = self._make_left_turn_traj()
+        rewards = self.reward_fn([text], pred_xyz=[pred])
+        # lon matches, but lat_set={steer_left} so implicit straight doesn't fire → 0
+        assert rewards[0] == 0.0
 
     def test_none_pred_xyz(self):
         """Missing trajectories should return 0.0."""
