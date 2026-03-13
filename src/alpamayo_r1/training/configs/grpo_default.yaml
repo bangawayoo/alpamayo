@@ -106,7 +106,7 @@ early_stopping:
 # Reward function weights (must sum to 1.0)
 rewards:
   trajectory_weight: 0.50
-  reasoning_weight: 0.5
+  reasoning_weight: 0.50
   consistency_weight: 0.0
 
 # Scene-level value head (learned GRPO baseline)
@@ -129,7 +129,8 @@ rewards:
 value_head:
   enabled: false       # set true to enable
   hidden_dim: 4096     # must match VLM hidden size
-  lr: 1e-4
+  lr: 1e-5
   pretrain_steps: 0    # stage 0: steps where only value head trains (0 = skip stage 0)
-  save_path: null      # save value head weights here after training (null = don't save)
+  save_path: null      # save value head weights here (null = don't save)
+                       # step-numbered checkpoints (e.g. *_step200.pt) are also saved at each interval
   load_path: null      # load pre-trained value head weights at init (null = random init)
