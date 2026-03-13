@@ -627,6 +627,12 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         if not use_vllm:
             self._data_cache = ClipDataCache(avdi, self.processing_class, max_size=data_cache_max_size)
 
+        # Override EOS token so TRL metrics (clipped_ratio, terminated_length)
+        # and the EOS mask in _generate_completions recognise <|traj_future_end|>
+        # as a valid termination token instead of only the default <|endoftext|>.
+        traj_future_end_id = full_model.special_token_ids["traj_future_end"]
+        self.eos_token_id = traj_future_end_id
+
         # Patch FSDP1 weight sync on the VLLMGeneration instance.
         # TRL's default _sync_fsdp1_params_to_vllm does a post-order
         # traversal calling FSDP.summon_full_params on each sub-module.
