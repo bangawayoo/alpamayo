@@ -14,7 +14,6 @@ defaults:
 
 # General
 seed: 42
-device: cuda
 model_name: nvidia/Alpamayo-R1-10B
 base_model_name: nvidia/Alpamayo-R1-10B
 
@@ -65,7 +64,6 @@ rollout:
   temperature: 0.6
   top_p: 0.98
   max_generation_length: 256
-  num_traj_samples: 8    # trajectory samples per scene; must equal training.num_generations
   logprob_mini_batch_size: 2  # completions per VLM forward pass — reduced for 40GB GPU
   log_interval: 10       # steps between rollout text logging (CoC text + generated tokens)
   plot_interval: 100      # steps between BEV trajectory plots (null = same as log_interval)
