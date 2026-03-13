@@ -8,6 +8,7 @@
 #   ./evaluate_quick_test.sh --temperature 0          # greedy decoding
 #   ./evaluate_quick_test.sh --num-traj-samples 20    # more trajectory samples
 #   ./evaluate_quick_test.sh --top-p 0.95             # nucleus sampling threshold
+#   ./evaluate_quick_test.sh --traj-mode vlm          # VLM-only discrete trajectory tokens
 #   ./evaluate_quick_test.sh --num-trials 4 --num-gpus 4   # 4 trials in parallel, 1 GPU each
 #
 # Multi-trial parallelism:
@@ -27,6 +28,7 @@ OUTPUT_DIR=""
 NUM_TRAJ_SAMPLES=5
 TEMPERATURE=0.6
 TOP_P=0.98
+TRAJ_MODE="expert"
 NUM_TRIALS=1
 EXTRA_ARGS=()
 
@@ -60,6 +62,10 @@ while [[ $# -gt 0 ]]; do
             TOP_P="$2"
             shift 2
             ;;
+        --traj-mode)
+            TRAJ_MODE="$2"
+            shift 2
+            ;;
         --num-trials)
             NUM_TRIALS="$2"
             shift 2
@@ -81,6 +87,7 @@ echo "Running curated test set evaluation (1,181 clips)..."
 echo "  Model: ${MODEL}"
 echo "  GPUs: ${NUM_GPUS}"
 echo "  Traj samples: ${NUM_TRAJ_SAMPLES}"
+echo "  Traj mode: ${TRAJ_MODE}"
 echo "  Temperature: ${TEMPERATURE}"
 echo "  Top-p: ${TOP_P}"
 if [[ "${NUM_TRIALS}" -gt 1 ]]; then
@@ -101,6 +108,7 @@ run_trial() {
     python src/alpamayo_r1/evaluate_test_set.py \
         --model-name "${MODEL}" \
         --num-traj-samples "${NUM_TRAJ_SAMPLES}" \
+        --traj-mode "${TRAJ_MODE}" \
         --temperature "${TEMPERATURE}" \
         --top-p "${TOP_P}" \
         --output-dir "${trial_output_dir}" \
@@ -124,6 +132,7 @@ if [[ "${NUM_TRIALS}" -eq 1 ]]; then
             CUDA_VISIBLE_DEVICES="${i}" python src/alpamayo_r1/evaluate_test_set.py \
                 --model-name "${MODEL}" \
                 --num-traj-samples "${NUM_TRAJ_SAMPLES}" \
+                --traj-mode "${TRAJ_MODE}" \
                 --temperature "${TEMPERATURE}" \
                 --top-p "${TOP_P}" \
                 --output-dir "${OUTPUT_DIR}" \

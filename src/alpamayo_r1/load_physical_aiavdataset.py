@@ -15,6 +15,8 @@
 
 """Load data from physical_ai_av.PhysicalAIAVDatasetInterface for model inference."""
 
+import logging
+import time
 from typing import Any
 
 import numpy as np
@@ -22,6 +24,38 @@ import physical_ai_av
 import scipy.spatial.transform as spt
 import torch
 from einops import rearrange
+
+logger = logging.getLogger(__name__)
+
+
+def _get_clip_feature_with_retry(
+    avdi: physical_ai_av.PhysicalAIAVDatasetInterface,
+    clip_id: str,
+    feature: str,
+    maybe_stream: bool = True,
+    max_retries: int = 5,
+    base_delay: float = 10.0,
+) -> Any:
+    """Call ``avdi.get_clip_feature`` with exponential backoff on HTTP 429 errors.
+
+    HuggingFace Hub rate-limits to 5000 resolver requests per 5 minutes.
+    Multi-GPU training easily exceeds this. Retrying with jittered backoff
+    lets transient 429s resolve without crashing the run.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return avdi.get_clip_feature(clip_id, feature, maybe_stream=maybe_stream)
+        except Exception as e:
+            is_rate_limit = "429" in str(e) or "Too Many Requests" in str(e)
+            if not is_rate_limit or attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** attempt) + np.random.uniform(0, base_delay)
+            logger.warning(
+                "Rate-limited (429) loading %s for clip %s. "
+                "Retry %d/%d in %.1fs...",
+                feature, clip_id, attempt + 1, max_retries, delay,
+            )
+            time.sleep(delay)
 
 
 def load_physical_aiavdataset(
@@ -89,10 +123,8 @@ def load_physical_aiavdataset(
     }
 
     # Load egomotion data
-    egomotion = avdi.get_clip_feature(
-        clip_id,
-        avdi.features.LABELS.EGOMOTION,
-        maybe_stream=maybe_stream,
+    egomotion = _get_clip_feature_with_retry(
+        avdi, clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=maybe_stream,
     )
 
     assert t0_us > num_history_steps * time_step * 1_000_000, (
@@ -165,10 +197,8 @@ def load_physical_aiavdataset(
     )
 
     for cam_feature in camera_features:
-        camera = avdi.get_clip_feature(
-            clip_id,
-            cam_feature,
-            maybe_stream=maybe_stream,
+        camera = _get_clip_feature_with_retry(
+            avdi, clip_id, cam_feature, maybe_stream=maybe_stream,
         )
 
         # frames: (num_frames, H, W, 3) uint8

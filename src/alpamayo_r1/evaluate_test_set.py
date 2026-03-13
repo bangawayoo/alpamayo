@@ -6,10 +6,8 @@ Optimized evaluation script with batched processing and parallel data loading.
 
 import argparse
 import json
-import multiprocessing as mp
 import os
 from pathlib import Path
-from typing import Optional
 
 # Must be set before any CUDA import/init.  In MIG environments the default
 # CUDA caching allocator queries NVML for per-device free memory, which fails
@@ -27,6 +25,10 @@ from tqdm import tqdm
 from alpamayo_r1 import helper
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+
+# Pin to avoid breaking changes when the upstream HF dataset is updated.
+# Must match the revision in training/configs/grpo_default.yaml.
+DEFAULT_DATASET_REVISION = "05e158af89ba"
 
 
 class AlpamayoDataset(Dataset):
@@ -117,8 +119,15 @@ def evaluate_batch(
     top_p: float,
     device: str,
     t0_us: int = 5_100_000,
+    traj_mode: str = "expert",
 ) -> list:
-    """Evaluate a batch of samples."""
+    """Evaluate a batch of samples.
+
+    Args:
+        traj_mode: Trajectory generation mode.
+            ``"expert"`` uses the full VLM + Expert + Diffusion pipeline.
+            ``"vlm"`` uses VLM-only discrete trajectory token generation.
+    """
     results = []
 
     for sample in batch:
@@ -140,16 +149,26 @@ def evaluate_batch(
             # Prepare inputs
             model_inputs = helper.prepare_model_inputs(sample, processor, device)
 
-            # Run inference
+            # Run inference with the selected trajectory generation mode
             with torch.autocast(device, dtype=torch.bfloat16):
-                pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
-                    data=model_inputs,
-                    top_p=top_p,
-                    temperature=temperature,
-                    num_traj_samples=num_traj_samples,
-                    max_generation_length=256,
-                    return_extra=True,
-                )
+                if traj_mode == "vlm":
+                    pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_only(
+                        data=model_inputs,
+                        top_p=top_p,
+                        temperature=temperature,
+                        num_traj_samples=num_traj_samples,
+                        max_generation_length=256,
+                        return_extra=True,
+                    )
+                else:
+                    pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+                        data=model_inputs,
+                        top_p=top_p,
+                        temperature=temperature,
+                        num_traj_samples=num_traj_samples,
+                        max_generation_length=256,
+                        return_extra=True,
+                    )
 
             # Compute metrics
             min_ade = compute_minADE(pred_xyz, sample["ego_future_xyz"])
@@ -219,6 +238,17 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=0.98, help="Nucleus sampling top-p")
     parser.add_argument(
+        "--traj-mode",
+        type=str,
+        choices=["expert", "vlm"],
+        default="expert",
+        help=(
+            "Trajectory generation mode: "
+            "'expert' uses VLM + Expert + Diffusion (full pipeline), "
+            "'vlm' uses VLM-only discrete trajectory tokens (no Expert/Diffusion)"
+        ),
+    )
+    parser.add_argument(
         "--t0-us", type=int, default=5_100_000, help="Default t0 timestamp in microseconds"
     )
     parser.add_argument(
@@ -260,6 +290,12 @@ def main():
         default=None,
         help="Total number of shards for multi-GPU data parallelism",
     )
+    parser.add_argument(
+        "--dataset-revision",
+        type=str,
+        default=DEFAULT_DATASET_REVISION,
+        help="HF dataset revision for PhysicalAI-AV (default: pinned revision)",
+    )
 
     args = parser.parse_args()
 
@@ -283,6 +319,7 @@ def main():
     print(f"Model: {args.model_name}")
     print(f"Device: {args.device}")
     print(f"Trajectory samples per prediction: {args.num_traj_samples}")
+    print(f"Trajectory mode: {args.traj_mode}")
     print(f"Temperature: {args.temperature}")
     print(f"Top-p: {args.top_p}")
     print(f"Data loading workers: {args.num_workers}")
@@ -321,7 +358,7 @@ def main():
     print("Model loaded successfully!")
 
     # Get clip IDs
-    avdi = PhysicalAIAVDatasetInterface()
+    avdi = PhysicalAIAVDatasetInterface(revision=args.dataset_revision)
     if args.use_clip_ids_file:
         print("\nUsing clip_ids.parquet file (test split only)...")
         clip_ids_df = pd.read_parquet("notebooks/clip_ids.parquet")
@@ -381,6 +418,7 @@ def main():
                 top_p=args.top_p,
                 device=args.device,
                 t0_us=args.t0_us,
+                traj_mode=args.traj_mode,
             )
             all_results.extend(results)
 
@@ -420,6 +458,7 @@ def main():
             "config": {
                 "model_name": args.model_name,
                 "num_traj_samples": args.num_traj_samples,
+                "traj_mode": args.traj_mode,
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "t0_us": args.t0_us,
