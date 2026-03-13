@@ -217,3 +217,6 @@ __marimo__/
 
 # Notes
 notebooks/image_processing_pipeline.md
+outputs/
+notes/
+evaluation_results/
