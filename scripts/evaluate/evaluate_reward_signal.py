@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """Evaluate reward signal quality on a training-set subset.
 
@@ -52,6 +38,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from alpamayo_r1 import helper
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+from alpamayo_r1.training.meta_actions import (
+    _META_ACTION_KEYWORDS,
+    extract_meta_actions,
+    trajectory_to_meta_action_sets,
+    trajectory_to_meta_actions,
+)
 from alpamayo_r1.training.rewards import (
     consistency_reward,
     reasoning_quality_reward,
@@ -95,10 +87,13 @@ def run_inference(model, processor, avdi, clip_id: str, t0_us: int,
     except Exception as e:
         return {"error": f"inference failed: {e}"}
 
-    # pred_xyz: (1, 1, S, T, 3)  →  flatten (S, T, 3) for reward functions
-    pred_flat = pred_xyz.cpu().numpy()[0, 0].flatten().tolist()
-    # gt_xyz:   (1, 1, T, 3)    →  flatten (T, 3)
-    gt_flat = data["ego_future_xyz"].cpu().numpy()[0, 0].flatten().tolist()
+    # pred_xyz: (1, 1, S, T, 3), gt_xyz: (1, 1, T, 3)
+    pred_samples = pred_xyz.cpu().numpy()[0, 0]  # (S, T, 3)
+    gt = data["ego_future_xyz"].cpu().numpy()[0, 0]  # (T, 3)
+
+    # Per-sample flattened trajectories (one per rollout)
+    pred_per_sample = [pred_samples[i].flatten().tolist() for i in range(pred_samples.shape[0])]
+    gt_flat = gt.flatten().tolist()
 
     # CoC texts: extra["cot"] shape is (1, S) or nested list
     coc_texts = []
@@ -115,7 +110,7 @@ def run_inference(model, processor, avdi, clip_id: str, t0_us: int,
 
     return {
         "clip_id": clip_id,
-        "pred_flat": pred_flat,
+        "pred_per_sample": pred_per_sample,
         "gt_flat": gt_flat,
         "coc_texts": coc_texts,
         "error": None,
@@ -124,23 +119,28 @@ def run_inference(model, processor, avdi, clip_id: str, t0_us: int,
 
 def compute_rewards_for_sample(result: dict, ade_threshold: float) -> dict:
     """Compute all three rewards for a single inference result."""
-    pred_flat = result["pred_flat"]
+    pred_per_sample = result["pred_per_sample"]
     gt_flat = result["gt_flat"]
     coc_texts = result["coc_texts"]
     n_texts = len(coc_texts) if coc_texts else 1
 
+    per_sample_preds = pred_per_sample[:n_texts]
+    assert len(per_sample_preds) == n_texts
+
+    # trajectory_quality_reward: each rollout sample scored against gt individually
     traj_r = trajectory_quality_reward(
         completions=[""] * n_texts,
-        pred_xyz=[pred_flat] * n_texts,
+        pred_xyz=per_sample_preds,
         gt_xyz=[gt_flat] * n_texts,
         ade_threshold=ade_threshold,
     )
 
     if coc_texts:
         reason_r = reasoning_quality_reward(completions=coc_texts)
+        # consistency_reward: pair each CoC text with its own trajectory sample
         consist_r = consistency_reward(
             completions=coc_texts,
-            pred_xyz=[pred_flat] * n_texts,
+            pred_xyz=per_sample_preds,
         )
     else:
         reason_r = [0.0]
@@ -153,12 +153,63 @@ def compute_rewards_for_sample(result: dict, ade_threshold: float) -> dict:
                 + REASONING_WEIGHT * reason_mean
                 + CONSISTENCY_WEIGHT * consist_mean)
 
+    # Per-sample meta-action debugging info
+    meta_debug: list[dict] = []
+    for j, pred_flat in enumerate(per_sample_preds):
+        summary = trajectory_to_meta_actions(pred_flat)
+        sets_result = trajectory_to_meta_action_sets(pred_flat, min_fraction=0.25)
+        coc = coc_texts[j] if j < len(coc_texts) else ""
+        text_lower = coc.lower()
+
+        if sets_result is not None:
+            lon_set, lat_set = sets_result
+
+            # Which keywords from the full action set matched
+            lon_matched = [
+                f"{action}: {kw}"
+                for action in lon_set
+                for kw in _META_ACTION_KEYWORDS.get(action, [])
+                if kw in text_lower
+            ]
+            lat_matched = [
+                f"{action}: {kw}"
+                for action in lat_set
+                for kw in _META_ACTION_KEYWORDS.get(action, [])
+                if kw in text_lower
+            ]
+
+            # Per-timestep sequence (ordered unique)
+            meta_seq = extract_meta_actions(
+                np.array(pred_flat, dtype=np.float32).reshape(-1, 3)
+            )
+            lon_seq = list(dict.fromkeys(meta_seq.longitudinal))
+            lat_seq = list(dict.fromkeys(meta_seq.lateral))
+        else:
+            lon_set, lat_set = set(), set()
+            lon_matched, lat_matched = [], []
+            lon_seq, lat_seq = [], []
+
+        meta_debug.append({
+            "coc_text": coc,
+            "traj_score": float(traj_r[j]) if j < len(traj_r) else 0.0,
+            "reason_score": float(reason_r[j]) if j < len(reason_r) else 0.0,
+            "consist_score": float(consist_r[j]) if j < len(consist_r) else 0.0,
+            "lon_summary": summary.longitudinal if summary else None,
+            "lat_summary": summary.lateral if summary else None,
+            "lon_set": sorted(lon_set),
+            "lat_set": sorted(lat_set),
+            "lon_seq": lon_seq,
+            "lat_seq": lat_seq,
+            "lon_matched_kws": lon_matched,
+            "lat_matched_kws": lat_matched,
+        })
+
     return {
         "traj_reward":        traj_mean,
         "reasoning_reward":   reason_mean,
         "consistency_reward": consist_mean,
         "weighted_reward":    weighted,
-        "first_coc":          coc_texts[0] if coc_texts else "",
+        "meta_debug":         meta_debug,
     }
 
 
@@ -367,16 +418,27 @@ def main():
     # ----------------------------------------------------------------
     if args.show_coc_samples > 0:
         print(f"\n{'=' * 70}")
-        print(f"  SAMPLE CoC TEXTS (first {args.show_coc_samples} successful clips)")
+        print(f"  SAMPLE ROLLOUTS (first {args.show_coc_samples} successful clips)")
         print("=" * 70)
         for r in all_rewards[:args.show_coc_samples]:
             print(f"\n  --- Clip: {r['clip_id']} ---")
-            print(f"  traj={r['traj_reward']:.3f}  "
+            print(f"  Mean:  traj={r['traj_reward']:.3f}  "
                   f"reason={r['reasoning_reward']:.3f}  "
                   f"consist={r['consistency_reward']:.3f}  "
                   f"weighted={r['weighted_reward']:.3f}")
-            coc = r["first_coc"]
-            print(f"  CoC: {coc[:400]!r}" if coc else "  CoC: (empty)")
+
+            for k, m in enumerate(r.get("meta_debug", [])):
+                coc = m.get("coc_text", "")
+                print(f"\n  [sample {k}]  traj={m['traj_score']:.3f}  "
+                      f"reason={m['reason_score']:.3f}  "
+                      f"consist={m['consist_score']:.3f}")
+                print(f"    CoC: {coc[:200]!r}" if coc else "    CoC: (empty)")
+                print(f"    LON: {m['lon_summary']}  |  set: {m['lon_set']}")
+                print(f"    LAT: {m['lat_summary']}  |  set: {m['lat_set']}")
+                print(f"    LON seq: {' -> '.join(m['lon_seq'])}")
+                print(f"    LAT seq: {' -> '.join(m['lat_seq'])}")
+                print(f"    LON kw matched: {m['lon_matched_kws'] or '(none)'}")
+                print(f"    LAT kw matched: {m['lat_matched_kws'] or '(none)'}")
 
     # ----------------------------------------------------------------
     # Save results
