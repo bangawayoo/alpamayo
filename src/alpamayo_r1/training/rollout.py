@@ -1307,7 +1307,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         # Stage 0: skip GRPO policy update
         if self._value_pretrain_remaining > 0:
             self._value_pretrain_remaining -= 1
-            zero_loss = torch.tensor(0.0, requires_grad=True, device=self.accelerator.device)
+            # Build a zero-valued loss that still touches the DDP-wrapped model
+            # parameters, so DDP's allreduce backward hooks fire on every rank.
+            zero_loss = 0.0 * sum(p.sum() for p in model.parameters() if p.requires_grad)
             if return_outputs:
                 return zero_loss, None
             return zero_loss
