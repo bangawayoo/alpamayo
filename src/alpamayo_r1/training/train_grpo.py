@@ -337,7 +337,7 @@ def main(cfg: DictConfig) -> None:
         )
 
     logger.info("Starting GRPO training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
     # ---------------------------------------------------------------
     # 8. Save final model
