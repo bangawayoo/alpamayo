@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
@@ -683,8 +683,15 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         # Value head (optional scene-level baseline)
         self.value_head = None
         self.value_optimizer = None
-        self._value_h0_stash: list[torch.Tensor] = []  # h_0 per completion (CPU)
-        self._value_rewards_stash: list[float] = []  # composite reward per completion
+
+        # Pending groups: queue of (h0, group_size) awaiting reward collection.
+        # One entry per scene, appended during generation, drained during reward stashing.
+        self._value_pending_groups: deque[tuple[torch.Tensor, int]] = deque()
+        self._value_pending_rewards: list[float] = []
+
+        # Ready pairs: scene-level (h0, V_mc) after Monte Carlo aggregation
+        self._value_h0_stash: list[torch.Tensor] = []
+        self._value_targets_stash: list[float] = []
         self._value_reward_weights: list[float] = [0.5, 0.25, 0.25]  # traj/reasoning/consistency
         self._value_pretrain_remaining: int = 0
         self._value_save_path: str | None = None
@@ -920,6 +927,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     # Compute scene h_0 once per unique scene for value head
                     if self.value_head is not None:
                         scene_h0 = self._compute_scene_h0(prompt_input_ids, model_inputs, device)
+                        self._value_pending_groups.append((scene_h0, local_gen_count))
 
                     # 3. VLM-only generation (no ExpertLogitsProcessor)
                     # Generate only as many sequences as this GPU needs for this
@@ -1006,10 +1014,6 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         all_completion_ids.append(completion_ids)
                         all_coc_texts.append(coc_text)
                         all_clip_ids.append(clip_id)
-
-                        # Stash h_0 (same scene embedding for all G completions of this scene)
-                        if self.value_head is not None:
-                            self._value_h0_stash.append(scene_h0)  # (1, hidden_dim) CPU tensor
 
                         # Trajectory data for reward computation
                         pred_traj = pred_xyz_tensor[sample_idx].cpu().numpy().flatten().tolist()
@@ -1148,6 +1152,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
     def _stash_value_rewards(self, inputs: list[dict], completions: list[str]) -> None:
         """Compute composite rewards and stash them for value head training.
 
+        Per-sample composite rewards are accumulated into the pending buffer.
+        When the buffer reaches the expected group size, rewards are aggregated
+        into a Monte Carlo target ``V_mc = mean(rewards)`` and flushed to the
+        ready stash as a single ``(h0, V_mc)`` pair.
+
         Args:
             inputs: Per-sample input dicts (must have pred_xyz and gt_xyz populated).
             completions: CoC text strings, one per sample.
@@ -1168,41 +1177,73 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
         for rt, rr, rc in zip(r_traj, r_reason, r_consist):
             composite = w_traj * rt + w_reason * rr + w_consist * rc
-            self._value_rewards_stash.append(composite)
+            self._value_pending_rewards.append(composite)
+
+        self._flush_value_pending()
+
+    def _flush_value_pending(self) -> None:
+        """Aggregate pending rewards into Monte Carlo scene-level targets.
+
+        Drains the pending groups queue in FIFO order.  For each group
+        ``(h0, G)``, consumes the first ``G`` rewards from the pending
+        reward buffer, computes ``V_mc = mean(rewards[:G])``, and appends
+        ``(h0, V_mc)`` to the ready stash.  Stops when the next group
+        cannot be fully satisfied (i.e. fewer rewards remain than the
+        group size).
+        """
+        while self._value_pending_groups:
+            h0, group_size = self._value_pending_groups[0]
+            if len(self._value_pending_rewards) < group_size:
+                break  # not enough rewards yet for this group
+
+            # Consume exactly group_size rewards
+            group_rewards = self._value_pending_rewards[:group_size]
+            self._value_pending_rewards = self._value_pending_rewards[group_size:]
+            self._value_pending_groups.popleft()
+
+            v_mc = sum(group_rewards) / len(group_rewards)
+            self._value_h0_stash.append(h0)
+            self._value_targets_stash.append(v_mc)
+
+            logger.debug(
+                "value head MC flush | group_size=%d v_mc=%.4f",
+                group_size,
+                v_mc,
+            )
 
     def _train_value_head_step(self, batch_size: int) -> None:
         """Consume one batch from the stash and update the value head.
 
-        Pops up to ``batch_size`` (h_0, reward) pairs from the stashes,
-        runs an MSE update via the separate value optimizer, and accumulates
-        metrics into ``self._metrics["train"]`` so they appear in TRL's log.
-        No-ops silently if the stash is empty (e.g. vLLM path before h_0
-        collection is wired in).
+        Pops up to ``batch_size`` scene-level ``(h_0, V_mc)`` pairs from the
+        ready stashes, runs an MSE update via the separate value optimizer,
+        and accumulates metrics into ``self._metrics["train"]`` so they appear
+        in TRL's log.  No-ops silently if the stash is empty (e.g. vLLM path
+        before h_0 collection is wired in).
 
         Args:
-            batch_size: Number of samples to consume from the stash.
+            batch_size: Number of scene-level samples to consume from the stash.
         """
-        n = min(batch_size, len(self._value_h0_stash), len(self._value_rewards_stash))
+        n = min(batch_size, len(self._value_h0_stash), len(self._value_targets_stash))
         if n == 0:
             logger.debug(
-                "value head stash empty (h0=%d, rewards=%d) — skipping update",
+                "value head stash empty (h0=%d, targets=%d) — skipping update",
                 len(self._value_h0_stash),
-                len(self._value_rewards_stash),
+                len(self._value_targets_stash),
             )
             return
 
         device = self.accelerator.device
 
         h0_batch = self._value_h0_stash[:n]
-        rewards_batch = self._value_rewards_stash[:n]
+        targets_batch = self._value_targets_stash[:n]
         self._value_h0_stash = self._value_h0_stash[n:]
-        self._value_rewards_stash = self._value_rewards_stash[n:]
+        self._value_targets_stash = self._value_targets_stash[n:]
 
         h0_tensor = torch.cat(h0_batch, dim=0).to(device)  # (n, hidden_dim)
-        rewards_tensor = torch.tensor(rewards_batch, dtype=torch.float32, device=device)
+        targets_tensor = torch.tensor(targets_batch, dtype=torch.float32, device=device)
 
         v_pred = self.value_head(h0_tensor)  # (n,)
-        value_loss = F.mse_loss(v_pred, rewards_tensor)
+        value_loss = F.mse_loss(v_pred, targets_tensor)
 
         self.value_optimizer.zero_grad()
         value_loss.backward()
@@ -1213,17 +1254,19 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         mode = "train" if self.model.training else "eval"
         self._metrics[mode]["value_head/loss"].append(value_loss.item())
         self._metrics[mode]["value_head/pred_mean"].append(v_pred.detach().mean().item())
-        self._metrics[mode]["value_head/target_mean"].append(rewards_tensor.mean().item())
+        self._metrics[mode]["value_head/target_mean"].append(targets_tensor.mean().item())
+        self._metrics[mode]["value_head/mc_group_size"].append(float(n))
         is_pretrain = self._value_pretrain_remaining > 0
         self._metrics[mode]["value_head/pretrain_steps_remaining"].append(
             float(self._value_pretrain_remaining)
         )
         logger.debug(
-            "value head%s | loss=%.4f pred=%.3f target=%.3f",
+            "value head%s | loss=%.4f pred=%.3f target=%.3f mc_scenes=%d",
             " [pretrain]" if is_pretrain else "",
             value_loss.item(),
             v_pred.detach().mean().item(),
-            rewards_tensor.mean().item(),
+            targets_tensor.mean().item(),
+            n,
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
