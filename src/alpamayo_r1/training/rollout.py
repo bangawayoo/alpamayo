@@ -689,6 +689,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         # Ready pairs: scene-level (h0, V_mc) after Monte Carlo aggregation
         self._value_h0_stash: list[torch.Tensor] = []
         self._value_targets_stash: list[float] = []
+        self._value_group_sizes_stash: list[int] = []
         self._value_reward_weights: list[float] = [0.5, 0.25, 0.25]  # traj/reasoning/consistency
         self._value_pretrain_remaining: int = 0
         self._value_save_path: str | None = None
@@ -869,6 +870,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             self._value_pending_rewards.clear()
             self._value_h0_stash.clear()
             self._value_targets_stash.clear()
+            self._value_group_sizes_stash.clear()
 
         device = self.accelerator.device
         num_generations = self.num_generations if self.model.training else self.num_generations_eval
@@ -1220,6 +1222,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             v_mc = sum(group_rewards) / len(group_rewards)
             self._value_h0_stash.append(h0)
             self._value_targets_stash.append(v_mc)
+            self._value_group_sizes_stash.append(group_size)
 
             logger.debug(
                 "value head MC flush | group_size=%d v_mc=%.4f",
@@ -1252,8 +1255,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
         h0_batch = self._value_h0_stash[:n]
         targets_batch = self._value_targets_stash[:n]
+        group_sizes_batch = self._value_group_sizes_stash[:n]
         self._value_h0_stash = self._value_h0_stash[n:]
         self._value_targets_stash = self._value_targets_stash[n:]
+        self._value_group_sizes_stash = self._value_group_sizes_stash[n:]
 
         h0_tensor = torch.cat(h0_batch, dim=0).to(device)  # (n, hidden_dim)
         targets_tensor = torch.tensor(targets_batch, dtype=torch.float32, device=device)
@@ -1271,7 +1276,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self._metrics[mode]["value_head/loss"].append(value_loss.item())
         self._metrics[mode]["value_head/pred_mean"].append(v_pred.detach().mean().item())
         self._metrics[mode]["value_head/target_mean"].append(targets_tensor.mean().item())
-        self._metrics[mode]["value_head/mc_group_size"].append(float(n))
+        self._metrics[mode]["value_head/scenes_per_step"].append(float(n))
+        avg_mc_group = sum(group_sizes_batch) / len(group_sizes_batch)
+        self._metrics[mode]["value_head/mc_group_size"].append(avg_mc_group)
         is_pretrain = self._value_pretrain_remaining > 0
         self._metrics[mode]["value_head/pretrain_steps_remaining"].append(
             float(self._value_pretrain_remaining)
