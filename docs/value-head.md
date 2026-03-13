@@ -1,180 +1,340 @@
-# Scene-Level Value Head for GRPO Baseline Estimation
+# Segment-Level Value Head for Alpamayo-R1
 
 ## Motivation
 
-GRPO computes per-sample advantages by normalising rewards within a group of completions for the same prompt:
+Standard GRPO assigns a single scalar reward to an entire rollout, then broadcasts it as the advantage for every token. This means a good trajectory boosts all CoC tokens equally, and good reasoning boosts all trajectory tokens equally — there is no credit assignment between segments.
+
+We want segment-level advantages: the value network estimates expected return at three points in the sequence, enabling TD-style advantage computation that attributes credit to the right part of the generation.
+
+This design stays within `AlpamayoGRPOTrainer` (no separate PPO trainer needed) because the core optimization is still group-relative clipped surrogate. The value network serves as a **learned baseline for variance reduction**, not a PPO-style critic that changes the objective. However, as noted below, bootstrapping token-level values makes this a natural stepping stone toward a full GRPO–PPO hybrid.
+
+---
+
+## Current State (SceneValueHead)
+
+The existing `SceneValueHead` (in `value_head.py`) provides a single-point baseline:
 
 ```
-A_i = (r_i − mean(r_group)) / std(r_group)
+V(observation) = MLP(h_obs)
 ```
 
-The group mean is a noisy, scene-agnostic baseline. It has two failure modes:
+Where `h_obs` is the VLM's hidden state at the last prompt token, extracted via a separate forward pass before generation. This gives one scalar per scene, used only for logging — it does not yet feed back into advantage computation.
 
-1. **Scene heterogeneity** — a batch may mix easy (empty highway) and hard (crowded intersection) driving scenes. A hard scene with a decent trajectory looks "bad" if it is averaged against easy scenes, and vice versa. The advantage signal conflates intrinsic scene difficulty with policy quality.
+---
 
-2. **Small group variance** — with `num_generations=8` per scene, the group mean is a high-variance estimate. Across gradient accumulation steps the effective baseline for any single scene can drift substantially.
+## Three-Level Value Architecture
 
-A learned `V(scene)` that predicts `E[r | scene]` provides a scene-conditioned, low-variance baseline. The advantage becomes:
+### Sequence Structure
+
+A completion has three semantic segments:
 
 ```
-A_i = r_i − V(scene_i)
+[prompt tokens]  [CoC reasoning tokens]  [trajectory tokens]
+     s_obs    →    <cot_start>...<cot_end>   →   <traj_future_start> <i0>...<i63> <traj_future_end>
 ```
 
-This is the standard actor-critic advantage and is strictly lower-variance than the group mean when `V` is even a crude predictor of scene difficulty.
+### Value Estimates
 
-### Literature basis
+The value network computes V(s) at three granularities using VLM hidden states at specific positions:
 
-| Paper | Contribution used here |
+| Level | Position | Hidden state | Encodes |
+|---|---|---|---|
+| V_obs | Last prompt token | h_obs | Scene understanding before any generation |
+| V_coc | `<cot_end>` token | h_coc | Scene + quality of reasoning produced |
+| V_traj(t) | Each `<iN>` token | h_traj_t | Scene + reasoning + trajectory-so-far |
+
+All three levels share the same MLP weights. The hidden state at each position already carries different information — the VLM's autoregressive nature means h_traj_t has "seen" both the prompt and CoC text, so no explicit level embedding is needed (though one could be added if training signal is weak).
+
+### Network Architecture
+
+Upgrade `SceneValueHead` → `SegmentValueHead`:
+
+```python
+class SegmentValueHead(nn.Module):
+    """Shared MLP: h → V(s) at any sequence position."""
+
+    def __init__(self, hidden_dim: int = 4096) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, 512),
+            nn.GELU(),
+            nn.Linear(512, 128),
+            nn.GELU(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """h: (B, hidden_dim) or (B, T, hidden_dim) → (B,) or (B, T)"""
+        return self.net(h).squeeze(-1)
+```
+
+Same parameter count as today (~2.1M). The only change is that it accepts batched token-level hidden states, not just a single h_0.
+
+---
+
+## Reward Decomposition
+
+To compute segment-level advantages, we need segment-level rewards.
+
+### CoC Segment Rewards
+
+Received when CoC generation completes:
+- **R_reasoning**: rule-based reasoning quality (causal connectors, driving terms, length, no repetition)
+- **R_consistency**: agreement between CoC text and predicted trajectory (meta-action keyword matching)
+
+These are the existing `reasoning_quality_reward` and `consistency_reward` functions, unchanged.
+
+### Trajectory Token Rewards
+
+The existing `trajectory_quality_reward` computes a scalar ADE over the full trajectory. For token-level advantages, we decompose it into **per-timestep rewards**:
+
+```python
+# Current: single scalar
+ade = l2_per_step.mean()
+reward = max(0, 1 - ade / threshold)
+
+# New: per-timestep rewards
+r_t = max(0, 1 - l2_per_step[t] / threshold)   # one reward per trajectory token
+```
+
+Each trajectory token `<iN>` maps to a specific timestep in the decoded (T, 3) trajectory, so the mapping from token index to timestep reward is direct. With 64 trajectory tokens encoding T timesteps (T depends on tokenizer configuration), each token gets its own L2-based reward.
+
+---
+
+## Advantage Computation
+
+### Semi-MDP Formulation
+
+The generation process forms a semi-MDP with two segment types:
+
+```
+s_obs ──[CoC tokens]──→ s_coc ──[traj_1]──→ s_1 ──[traj_2]──→ ... ──→ s_T ──→ terminal
+         segment 1                          segment 2 (per-token)
+```
+
+### CoC Segment (Shared Advantage)
+
+All CoC tokens receive the same advantage — a single TD step spanning the entire reasoning segment:
+
+```
+A_coc = (R_reasoning + R_consistency) + γ · V(s_coc) - V(s_obs)
+```
+
+This says: "how much better was this reasoning trace than what we expected from the scene alone?"
+
+### Trajectory Tokens (Per-Token GAE)
+
+Each trajectory token gets its own advantage via Generalized Advantage Estimation:
+
+```
+δ_t = r_t + γ · V(s_{t+1}) - V(s_t)       for t = 1..T-1
+δ_T = r_T - V(s_T)                          terminal (γ · 0)
+
+A_t = Σ_{k=0}^{T-t-1} (γλ)^k · δ_{t+k}    GAE with discount γ, trace decay λ
+```
+
+With sequences of ~64 trajectory tokens, `γ = 1.0` (or 0.99) and `λ = 0.95` are reasonable starting points.
+
+### Resulting Advantage Tensor
+
+The output is a `(B, T_completion)` tensor where `T_completion` is the full completion length:
+
+```
+advantages[b, :] = [A_coc, A_coc, ..., A_coc, A_traj_1, A_traj_2, ..., A_traj_T]
+                    ├── CoC positions ──┤  ├── trajectory positions ──────────┤
+```
+
+TRL's `_compute_loss` already supports `(B, T)` advantages (see the `if advantages.dim() == 1: advantages = advantages.unsqueeze(1)` guard in the base GRPOTrainer).
+
+### Group Normalization
+
+GRPO's key property is normalizing within a group of G generations per prompt. With segment-level advantages, normalize **per segment type** across the G completions:
+
+```
+A_coc_normalized = (A_coc - mean(A_coc over G)) / (std(A_coc over G) + ε)
+A_traj_t_normalized = (A_traj_t - mean(A_traj_t over G)) / (std(A_traj_t over G) + ε)
+```
+
+This prevents the trajectory signal from dominating simply because it has more tokens. Each segment type competes on its own scale within the group.
+
+---
+
+## Where Hidden States Come From
+
+### Current: Separate Forward Pass
+
+`_compute_scene_h0()` runs an extra VLM forward on the prompt alone with `output_hidden_states=True`. This is expensive (~same cost as the generation forward pass).
+
+### Proposed: Piggyback on Teacher-Forced Pass
+
+`_compute_batch_logprobs()` already runs a teacher-forced VLM forward over [prompt + completion] to get per-token log-probs. Adding `output_hidden_states=True` to this pass gives hidden states at **every position** in the sequence — including all three value estimation points — for free (no additional forward pass).
+
+Extract:
+- `h_obs = hidden_states[-1][:, prompt_len - 1, :]` — last prompt token
+- `h_coc = hidden_states[-1][:, cot_end_pos, :]` — `<cot_end>` position
+- `h_traj = hidden_states[-1][:, traj_start:traj_end, :]` — all trajectory positions
+
+### Memory Cost
+
+Hidden states are extracted under `torch.no_grad()` and moved to CPU immediately.
+
+Per completion: `(2 + T_traj) × hidden_dim × 4 bytes`
+= `(2 + 64) × 4096 × 4 ≈ 1 MB`
+
+With G=8 generations and batch_size=4: ~32 MB total in CPU RAM. Negligible.
+
+The `output_hidden_states=True` flag does add GPU memory during the forward pass (stores all layers' activations). For Qwen3-VL with 28 layers, this roughly doubles activation memory for that pass. Since this already runs under `torch.no_grad()`, it should fit within the existing memory budget, but may need monitoring on the 10GB MIG.
+
+---
+
+## Training the Value Head
+
+### Loss Function
+
+MSE between predicted values and **returns-to-go** (actual cumulative reward from that point onward):
+
+```
+L_value = (1/N) Σ (V(s) - G(s))²
+```
+
+Where G(s) is the return-to-go:
+- G(s_obs) = R_reasoning + R_consistency + Σ r_t  (total return)
+- G(s_coc) = Σ r_t  (remaining trajectory return)
+- G(s_traj_t) = Σ_{k=t}^{T} r_k  (trajectory return from timestep t onward)
+
+### Training Schedule
+
+Keep the existing two-stage approach:
+- **Stage 0** (pretrain): value head trains alone on stashed (h, G) pairs; policy frozen
+- **Stage 1** (joint): value head trains alongside GRPO policy updates
+
+The pretrain phase is more important now since the value head needs to learn three levels instead of one.
+
+### Optimizer
+
+Separate Adam optimizer (existing design), `lr ≈ 1e-4`. The value head never receives gradients through the VLM backbone — it trains on detached hidden states.
+
+---
+
+## Integration Points in AlpamayoGRPOTrainer
+
+### Methods to Modify
+
+| Method | Change |
 |---|---|
-| [π₀.₆ / RECAP](https://arxiv.org/abs/2511.14759) | Distributional value head on a separate VLM backbone; MC return targets; offline advantage → policy improvement |
-| [RL for VLA Generalization](https://arxiv.org/abs/2505.19789) | Shared actor-critic backbone (no duplicate weights); value head attached to **first action-token** h₀; PPO >> GRPO for robotic POMDPs |
-| [VAPO](https://arxiv.org/abs/2504.05118) | Value pre-training on fixed-policy MC returns before RL begins; decoupled GAE (λ=1 for value, adaptive for policy); token-level loss |
-| [VinePPO](https://arxiv.org/abs/2410.01679) | Learned critics fail for long reasoning chains → MC rollouts from intermediate states are preferable for token-level credit assignment |
+| `_compute_batch_logprobs` | Add `output_hidden_states=True`, return hidden states at segment boundaries |
+| `_generate_single_turn` | Stash per-level hidden states and per-segment rewards (replaces h0-only stash) |
+| `_calculate_rewards` | Decompose trajectory reward into per-timestep values |
+| `_generate_and_score_completions` (new override) | Compute (B, T) advantages using value head + TD/GAE, replace scalar advantages |
+| `_train_value_head_step` | Train on all three levels jointly |
+| `value_head.py` | Rename to `SegmentValueHead`, accept (B, T, D) inputs |
 
----
-
-## Architecture
-
-```
-VLM (Qwen3-VL, frozen during value forward)
-  └─ last hidden layer, last prompt token → h₀: (1, 4096)
-
-SceneValueHead
-  ├─ Linear(4096 → 512) + GELU
-  ├─ Linear(512  → 128) + GELU
-  └─ Linear(128  →   1) → V(scene): scalar ∈ ℝ
-```
-
-**`h₀` is the VLM's hidden state at the final prompt token**, computed via a single forward pass with `output_hidden_states=True` before any generation tokens are produced. This position encodes the model's full scene understanding — camera images, history trajectory, and the task instruction — without yet committing to any completion tokens.
-
-This choice follows the RL-for-VLA paper (2505.19789), which found `h₀` (first action-token embedding) outperforms last-token or concatenated representations as a critic input.
-
-The value head is a **lightweight MLP** (~82k parameters) attached to the existing VLM backbone. No second backbone is used (unlike π₀.₆), keeping memory overhead negligible on the 40GB A100 run environment.
-
----
-
-## Value Estimation Pipeline
-
-### 1. h₀ collection (during rollout)
-
-Inside `AlpamayoGRPOTrainer._generate_single_turn`, once per **unique scene** (not per completion), `_compute_scene_h0` runs a no-grad VLM forward pass:
-
-```python
-outputs = self.full_model.vlm(
-    input_ids=prompt_input_ids,
-    output_hidden_states=True,
-    **vision_kwargs,          # pixel_values, attention_mask, image_grid_thw
-)
-h0 = outputs.hidden_states[-1][:, -1, :].float().cpu()  # (1, 4096)
-```
-
-The same `h₀` is then stashed once for each of the `G=num_generations` completions of that scene. This avoids recomputing the VLM forward `G` times — the scene embedding is identical for all completions.
-
-### 2. Composite reward collection (during reward computation)
-
-Inside `AlpamayoGRPOTrainer._calculate_rewards`, after the parent computes all reward function scores, `_stash_value_rewards` computes the weighted composite reward and appends it to a parallel stash:
+### Data Flow
 
 ```
-r_composite = 0.50 × r_trajectory + 0.25 × r_reasoning + 0.25 × r_consistency
-```
+_generate_single_turn
+    │
+    ├─ VLM generates completions
+    ├─ _compute_batch_logprobs (+ output_hidden_states)
+    │     └─ extract h_obs, h_coc, h_traj_1..T
+    │
+    └─ stash: {h_obs, h_coc, h_traj, R_reasoning, R_consistency, r_traj_1..T}
 
-The weights mirror the `rewards.{trajectory,reasoning,consistency}_weight` Hydra config values.
+_generate_and_score_completions (override)
+    │
+    ├─ super() → scalar rewards, scalar advantages
+    ├─ value_head(h_obs) → V_obs
+    ├─ value_head(h_coc) → V_coc
+    ├─ value_head(h_traj) → V_traj_1..T
+    ├─ TD/GAE → per-segment advantages
+    ├─ group-normalize per segment type
+    └─ output["advantages"] = (B, T) tensor
 
-### 3. Value head update (during compute_loss)
-
-Each call to `compute_loss` drains `batch_size` items from both stashes via `_train_value_head_step`:
-
-```python
-v_pred  = value_head(h0_tensor)                   # (B,)
-v_loss  = MSE(v_pred, r_composite_tensor)          # scalar
-value_optimizer.zero_grad()
-v_loss.backward()                                  # gradients stay inside value head
-value_optimizer.step()
-```
-
-The value head has a **separate Adam optimizer** (lr=1e-4, independent of the LoRA policy optimizer at 1e-5). Gradients from `v_loss.backward()` never reach the VLM because `h0_tensor` was detached at collection time (`.float().cpu()` severs the autograd graph). This matches VAPO's "decoupled" training design.
-
----
-
-## Two-Stage Training
-
-### Stage 0 — Value Pre-training (optional)
-
-Controlled by `value_head.pretrain_steps`. When set to N > 0, the first N `compute_loss` calls:
-- Train the value head normally (stash → MSE → Adam step)
-- **Skip** `super().compute_loss()` entirely — the VLM receives no gradient
-- Return `torch.tensor(0.0, requires_grad=True)` as a no-op policy loss
-
-This is the VAPO "value model pre-training" phase. Rollouts still run to collect (h₀, reward) pairs; only the policy update is suppressed. `_value_pretrain_remaining` counts down to zero and stage 1 begins automatically mid-training without any restart.
-
-```
-Step 1..N:    rollout → stash → value_head update → return loss=0
-Step N+1..:   rollout → stash → value_head update → GRPO policy update
-```
-
-### Stage 1 — Online Joint Training
-
-After stage 0, both the value head and the policy train simultaneously. The value head continues updating from the stash on every `compute_loss` call, tracking the shifting reward distribution as the policy improves.
-
-### Workflow
-
-```bash
-# Stage 0: bootstrap value head for 300 steps, save checkpoint
-./scripts/run_grpo.sh value_head.enabled=true \
-  value_head.pretrain_steps=300 \
-  "value_head.save_path=outputs/value_head_pretrained.pt"
-
-# Stage 1: full GRPO with warm-started value head
-./scripts/run_grpo.sh value_head.enabled=true \
-  "value_head.load_path=outputs/value_head_pretrained.pt"
+_compute_loss
+    │
+    ├─ TRL's standard clipped surrogate with (B, T) advantages
+    └─ _train_value_head_step (MSE on stashed data)
 ```
 
 ---
 
-## Configuration Reference
+## Path to GRPO–PPO Hybrid
 
-All options live under `value_head:` in `grpo_default.yaml`:
+This design naturally extends toward full PPO. The key insight: once you have a value network that bootstraps at the token level, the boundary between "GRPO with a learned baseline" and "PPO" becomes a spectrum.
 
-| Key | Default | Description |
-|---|---|---|
-| `enabled` | `false` | Enable the value head. When false, no code path changes. |
-| `hidden_dim` | `4096` | Must match VLM hidden size (4096 for Qwen3-VL-7B/10B). |
-| `lr` | `1e-4` | Adam learning rate for the value head (independent of policy lr). |
-| `pretrain_steps` | `0` | Stage 0 steps where only the value head trains. 0 = skip stage 0. |
-| `save_path` | `null` | If set, saves `value_head.state_dict()` here at each checkpoint. |
-| `load_path` | `null` | If set, restores weights from this path at init (pre-trained head). |
+### What Makes This Still GRPO
+
+- **No value gradient through the VLM backbone** — the value head trains on detached hidden states
+- **Group-relative normalization** — advantages are normalized within G completions per prompt
+- **No online value updates during rollout** — values are computed once after generation, not iteratively
+
+### What Would Make This PPO
+
+The following changes are each independent and can be adopted incrementally:
+
+1. **Backprop value gradients through the VLM** — instead of detached hidden states, share the backbone between policy and value head. This couples the representations but can improve value estimates. Requires careful loss balancing (`L = L_policy + c · L_value`).
+
+2. **Drop group normalization** — use raw TD/GAE advantages instead of normalizing within the group of G completions. The value baseline provides variance reduction, so group normalization becomes optional rather than essential.
+
+3. **Online value updates** — update the value head between GRPO iterations within a single training step, not just at step boundaries. This improves value accuracy for the current policy.
+
+4. **GAE everywhere** — extend per-token GAE from trajectory tokens to CoC tokens as well, giving every token its own advantage. This requires a value estimate at every token position (which the hidden states already support).
+
+### The Spectrum
+
+```
+Pure GRPO                          This design                         Full PPO
+─────────────────────────────────────────────────────────────────────────────────
+scalar reward     segment rewards + value baseline     per-token GAE + shared backbone
+broadcast adv     segment advantages (B,T)             full token-level advantages
+no critic         detached critic                      end-to-end critic
+group-relative    group-relative per segment           optional group normalization
+```
+
+Each step rightward adds more credit assignment precision at the cost of training complexity and stability. The segment-level design is the pragmatic middle ground: it captures the most important structural credit assignment (reasoning vs. trajectory) without the instability risks of full PPO (value-policy interference, reward hacking through the critic).
+
+### When to Move Further Toward PPO
+
+- If segment-level advantages show clear improvement over scalar GRPO but per-trajectory-token advantages plateau → the value head may need backbone gradients (step 1)
+- If group normalization suppresses useful signal → try raw advantages with the value baseline (step 2)
+- If value head lags behind rapid policy changes → add online updates (step 3)
+
+---
+
+## Configuration
+
+Extends the existing `value_head` config block in `grpo_default.yaml`:
+
+```yaml
+value_head:
+  enabled: true
+  hidden_dim: 4096
+  lr: 1e-4
+  pretrain_steps: 50
+  save_path: outputs/value_head.pt
+  load_path: null
+  # New fields for segment-level value
+  segment_level: true          # false = legacy SceneValueHead behavior
+  gamma: 1.0                   # discount factor (1.0 for short sequences)
+  gae_lambda: 0.95             # GAE trace decay
+  normalize_per_segment: true  # group-normalize advantages per segment type
+```
 
 ---
 
 ## Metrics
 
-When enabled, the following keys appear in the standard training log dict alongside reward metrics:
+New TensorBoard metrics alongside existing `value_head/loss`:
 
-| Metric | Meaning |
+| Metric | Description |
 |---|---|
-| `value_head/loss` | MSE between V(scene) predictions and composite rewards |
-| `value_head/pred_mean` | Mean predicted value across the batch |
-| `value_head/target_mean` | Mean composite reward (ground truth target) |
-| `value_head/pretrain_steps_remaining` | Counts down during stage 0; 0 in stage 1 |
-
-A healthy value head shows `pred_mean` converging toward `target_mean` over training, with `loss` decreasing monotonically through stage 0 and continuing to track the distribution in stage 1.
-
----
-
-## Current Limitations and Future Work
-
-**V1 (current):** The value head is an auxiliary predictor only. Its output does not yet replace the GRPO group-mean normalisation. Stage 0 produces a useful warm-started checkpoint, but the advantage computation in `super().compute_loss()` still uses:
-
-```
-A_i = (r_i − mean(r_group)) / std(r_group)
-```
-
-**V2 (planned):** Wire `V(scene)` into advantage computation:
-
-```python
-advantages = rewards - value_head(h0_stash).detach()
-```
-
-This requires overriding the section of TRL's `GRPOTrainer.compute_loss` that builds the advantage tensor, substituting the group mean with per-scene value predictions.
-
-**V3 (future):** Length-adaptive GAE (VAPO-style) for token-level credit assignment within the CoC reasoning chain. The λ parameter adapts to completion length: `λ(l) = 1 − 1/(α·l)`, providing unbiased estimates for short completions and bootstrapped estimates for long ones. This addresses heterogeneous CoC lengths (some 2-sentence, some 10-sentence reasoning chains) which fixed-λ GAE handles poorly.
+| `value_head/loss_obs` | MSE at observation level |
+| `value_head/loss_coc` | MSE at CoC level |
+| `value_head/loss_traj` | MSE at trajectory token level (averaged) |
+| `value_head/v_obs_mean` | Mean predicted V(obs) |
+| `value_head/v_coc_mean` | Mean predicted V(coc) |
+| `value_head/v_traj_mean` | Mean predicted V(traj) across tokens |
+| `advantages/coc_mean` | Mean CoC segment advantage |
+| `advantages/coc_std` | Std of CoC advantages within groups |
+| `advantages/traj_mean` | Mean trajectory token advantage |
+| `advantages/traj_std` | Std of trajectory advantages within groups |
