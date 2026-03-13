@@ -362,9 +362,6 @@ def make_vllm_rollout_func(
         """
 
         device = trainer.accelerator.device
-        num_generations = (
-            trainer.num_generations if trainer.model.training else trainer.num_generations_eval
-        )
 
         # De-duplicate prompts: TRL repeats each prompt, but distributed
         # training may split repetitions across GPUs.  Detect actual local
@@ -821,15 +818,32 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         super().log(logs, start_time)
 
     def _save(self, output_dir, state_dict=None):
-        """Extend default save to also persist value head weights."""
+        """Extend default save to also persist value head weights.
+
+        Saves both a step-numbered checkpoint (e.g. ``value_head_step200.pt``)
+        and the fixed ``save_path`` as a "latest" pointer.  This allows
+        stage 0 pre-training to produce a checkpoint per save interval rather
+        than only the final one.
+        """
         super()._save(output_dir, state_dict=state_dict)
 
         if self.value_head is not None and self._value_save_path is not None:
             import os
 
-            os.makedirs(os.path.dirname(os.path.abspath(self._value_save_path)), exist_ok=True)
-            torch.save(self.value_head.state_dict(), self._value_save_path)
+            vh_state = self.value_head.state_dict()
+            save_dir = os.path.dirname(os.path.abspath(self._value_save_path))
+            os.makedirs(save_dir, exist_ok=True)
+
+            # Always save the fixed "latest" path for backward compatibility
+            torch.save(vh_state, self._value_save_path)
             logger.info("Saved SceneValueHead weights to %s", self._value_save_path)
+
+            # Also save a step-numbered checkpoint
+            base, ext = os.path.splitext(self._value_save_path)
+            step = self.state.global_step
+            step_path = f"{base}_step{step}{ext}"
+            torch.save(vh_state, step_path)
+            logger.info("Saved SceneValueHead checkpoint to %s", step_path)
 
     def _generate_single_turn(self, prompts: list):
         """Generate CoC text + discrete trajectory tokens via VLM only.
@@ -851,8 +865,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
         # Clear value head stashes at the start of each new rollout
         if self.value_head is not None:
+            self._value_pending_groups.clear()
+            self._value_pending_rewards.clear()
             self._value_h0_stash.clear()
-            self._value_rewards_stash.clear()
+            self._value_targets_stash.clear()
 
         device = self.accelerator.device
         num_generations = self.num_generations if self.model.training else self.num_generations_eval
