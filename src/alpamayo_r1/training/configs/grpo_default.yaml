@@ -68,7 +68,7 @@ rollout:
   num_traj_samples: 8    # trajectory samples per scene; must equal training.num_generations
   logprob_mini_batch_size: 2  # completions per VLM forward pass — reduced for 40GB GPU
   log_interval: 10       # steps between rollout text logging (CoC text + generated tokens)
-  plot_interval: 50      # steps between BEV trajectory plots (null = same as log_interval)
+  plot_interval: 100      # steps between BEV trajectory plots (null = same as log_interval)
   log_max_samples: 2     # max prompts to log per interval
 
 # vLLM configuration for faster rollout generation

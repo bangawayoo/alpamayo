@@ -84,6 +84,13 @@ def main(cfg: DictConfig) -> None:
     """
     logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
 
+    # Save resolved Hydra config to training output_dir for reproducibility
+    output_dir = Path(cfg.get("training", {}).get("output_dir", "outputs/grpo"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config_save_path = output_dir / "resolved_config.yaml"
+    config_save_path.write_text(OmegaConf.to_yaml(cfg, resolve=True))
+    logger.info("Saved resolved config to %s", config_save_path)
+
     # Set seeds
     seed = cfg.get("seed", 42)
     torch.manual_seed(seed)
