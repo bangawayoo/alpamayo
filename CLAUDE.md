@@ -4,7 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Alpamayo-R1 is a Vision-Language-Action (VLA) model for autonomous driving that bridges reasoning and action prediction. It uses a Qwen3-VL backbone to generate Chain-of-Causation (CoC) text reasoning followed by discrete trajectory tokens, trained via GRPO (Group Relative Policy Optimization).
+Alpamayo-R1 is a Vision-Language-Action (VLA) model for autonomous driving that bridges reasoning and action prediction. It uses a Qwen3-VL backbone to generate Chain-of-Causation (CoC) text reasoning 
+followed by discrete trajectory tokens, trained via GRPO (Group Relative Policy Optimization).
+
+When writing new code, do not put any license statements.
 
 ## Environment
 
