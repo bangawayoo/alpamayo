@@ -16,7 +16,7 @@
 """Reward functions for GRPO post-training.
 
 Three reward signals:
-1. trajectory_quality_reward  – minADE-based trajectory quality
+1. trajectory_quality_reward  – L2 displacement-based trajectory quality
 2. reasoning_quality_reward   – rule-based chain-of-causation quality
 3. consistency_reward         – agreement between CoC text and predicted trajectory
 """
@@ -26,6 +26,11 @@ from __future__ import annotations
 import re
 
 import numpy as np
+
+from alpamayo_r1.training.meta_actions import (
+    _META_ACTION_KEYWORDS,
+    trajectory_to_meta_action_sets,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -38,19 +43,17 @@ def trajectory_quality_reward(
     gt_xyz: list[list[float]] | None = None,
     **kwargs,
 ) -> list[float]:
-    """Reward based on minADE between predicted and ground-truth trajectories.
+    """Reward based on L2 displacement between predicted and ground-truth trajectories.
 
-    Higher reward for lower displacement error. Uses a soft threshold so that
-    predictions within ``ade_threshold`` meters get close to 1.0 reward.
-
-    Extra fields ``pred_xyz`` and ``gt_xyz`` are forwarded from the rollout
-    function.  Each element is a flattened list encoding the trajectory arrays.
+    Each GRPO rollout produces a single independent trajectory. The reward is
+    computed as the mean per-timestep L2 distance (ADE) between that trajectory
+    and the ground truth, mapped to [0, 1] via a soft threshold.
 
     Args:
         completions: Generated CoC text (unused for trajectory scoring but
             required by the TRL reward function interface).
         pred_xyz: Per-sample predicted trajectories as flattened lists.
-            Original shape per sample: (num_traj_samples, T, 3).
+            Original shape per sample: (T, 3).
         gt_xyz: Per-sample ground-truth trajectories as flattened lists.
             Original shape per sample: (T, 3).
         **kwargs: Additional fields forwarded by TRL (ignored).
@@ -69,23 +72,19 @@ def trajectory_quality_reward(
             pred = np.array(pred_flat, dtype=np.float32)
             gt = np.array(gt_flat, dtype=np.float32)
 
-            # pred: (num_traj_samples, T, 3), gt: (T, 3)
-            # Reshape gt first so we can use its T for pred reshape
+            # Reshape to (T, 3)
             if gt.ndim == 1:
                 gt = gt.reshape(-1, 3)
             if pred.ndim == 1:
-                T = gt.shape[0]
-                pred = pred.reshape(-1, T, 3)
+                pred = pred.reshape(-1, 3)
 
-            # minADE: average L2 over timesteps, min over trajectory samples
-            # pred_xy: (S, T, 2), gt_xy: (T, 2)
-            pred_xy = pred[:, :, :2]
+            # Per-timestep L2 distance on xy plane, then average
+            pred_xy = pred[:, :2]
             gt_xy = gt[:, :2]
-            diff = np.linalg.norm(pred_xy - gt_xy[None, :, :], axis=-1)  # (S, T)
-            ade_per_sample = diff.mean(axis=-1)  # (S,)
-            min_ade = float(ade_per_sample.min())
+            l2_per_step = np.linalg.norm(pred_xy - gt_xy, axis=-1)  # (T,)
+            ade = float(l2_per_step.mean())
 
-            reward = max(0.0, 1.0 - min_ade / ade_threshold)
+            reward = max(0.0, 1.0 - ade / ade_threshold)
             rewards.append(reward)
         except Exception:
             rewards.append(0.0)
@@ -178,6 +177,7 @@ def reasoning_quality_reward(
 # 3. Consistency reward
 # ---------------------------------------------------------------------------
 
+# Deprecated: use meta_actions module instead. Kept for backward compatibility with tests.
 _BEHAVIOR_KEYWORDS = {
     "turning_left": ["turn left", "turning left", "left turn", "veer left"],
     "turning_right": ["turn right", "turning right", "right turn", "veer right"],
@@ -188,6 +188,7 @@ _BEHAVIOR_KEYWORDS = {
 }
 
 
+# Deprecated: use meta_actions.trajectory_to_meta_actions instead.
 def _trajectory_to_behaviors(pred_flat: list[float]) -> set[str]:
     """Infer coarse driving behaviors from a predicted trajectory.
 
@@ -264,19 +265,31 @@ def consistency_reward(
         if not isinstance(text, str):
             text = str(text) if text is not None else ""
 
-        traj_behaviors = _trajectory_to_behaviors(pred_flat)
-
-        if not traj_behaviors:
+        result = trajectory_to_meta_action_sets(pred_flat, min_fraction=0.25)
+        if result is None:
             rewards.append(0.0)
             continue
 
+        lon_set, lat_set = result
         text_lower = text.lower()
-        matched = 0
-        for behavior in traj_behaviors:
-            keywords = _BEHAVIOR_KEYWORDS.get(behavior, [])
-            if any(kw in text_lower for kw in keywords):
-                matched += 1
 
-        rewards.append(matched / len(traj_behaviors))
+        # Match if any meta-action (≥25% of timesteps) has a keyword in the text
+        lon_match = any(
+            kw in text_lower
+            for action in lon_set
+            for kw in _META_ACTION_KEYWORDS.get(action, [])
+        )
+        lat_match = any(
+            kw in text_lower
+            for action in lat_set
+            for kw in _META_ACTION_KEYWORDS.get(action, [])
+        )
+
+        if lon_match and lat_match:
+            rewards.append(1.0)
+        elif lon_match or lat_match:
+            rewards.append(0.5)
+        else:
+            rewards.append(0.0)
 
     return rewards

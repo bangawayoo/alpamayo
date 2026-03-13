@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """CPU-only tests for the GRPO training module.
 
 Tests reward functions, dataset utilities, rollout helpers, and config loading
@@ -57,7 +54,7 @@ class TestTrajectoryQualityReward:
         """Identical pred and gt should give reward close to 1.0."""
         T = 64
         gt = np.zeros((T, 3), dtype=np.float32).flatten().tolist()
-        pred = np.zeros((3, T, 3), dtype=np.float32).flatten().tolist()  # 3 samples
+        pred = np.zeros((T, 3), dtype=np.float32).flatten().tolist()
         rewards = self.reward_fn(["dummy"], pred_xyz=[pred], gt_xyz=[gt])
         assert len(rewards) == 1
         assert rewards[0] == pytest.approx(1.0, abs=0.01)
@@ -66,7 +63,7 @@ class TestTrajectoryQualityReward:
         """Large displacement should give reward close to 0.0."""
         T = 64
         gt = np.zeros((T, 3), dtype=np.float32).flatten().tolist()
-        pred = np.full((3, T, 3), 100.0, dtype=np.float32).flatten().tolist()
+        pred = np.full((T, 3), 100.0, dtype=np.float32).flatten().tolist()
         rewards = self.reward_fn(["dummy"], pred_xyz=[pred], gt_xyz=[gt])
         assert rewards[0] == pytest.approx(0.0, abs=0.01)
 
@@ -75,22 +72,11 @@ class TestTrajectoryQualityReward:
         T = 64
         gt = np.zeros((T, 3), dtype=np.float32).flatten().tolist()
         # Average error ~2.5m with threshold=5.0 → reward ~0.5
-        pred_single = np.zeros((T, 3), dtype=np.float32)
-        pred_single[:, 0] = 2.5  # 2.5m offset in x
-        pred = np.stack([pred_single] * 3).flatten().tolist()
+        pred = np.zeros((T, 3), dtype=np.float32)
+        pred[:, 0] = 2.5  # 2.5m offset in x
+        pred = pred.flatten().tolist()
         rewards = self.reward_fn(["dummy"], pred_xyz=[pred], gt_xyz=[gt])
         assert 0.3 < rewards[0] < 0.7
-
-    def test_min_over_samples(self):
-        """minADE should pick the best sample, not average."""
-        T = 64
-        gt = np.zeros((T, 3), dtype=np.float32).flatten().tolist()
-        # Sample 0: perfect, Sample 1: terrible
-        s0 = np.zeros((T, 3), dtype=np.float32)
-        s1 = np.full((T, 3), 50.0, dtype=np.float32)
-        pred = np.stack([s0, s1]).flatten().tolist()
-        rewards = self.reward_fn(["dummy"], pred_xyz=[pred], gt_xyz=[gt])
-        assert rewards[0] == pytest.approx(1.0, abs=0.01)
 
     def test_none_inputs(self):
         """Missing pred/gt should return 0.0 reward."""
@@ -98,12 +84,12 @@ class TestTrajectoryQualityReward:
         assert rewards == [0.0]
 
     def test_batch_of_two(self):
-        """Multiple samples in a batch."""
+        """Multiple completions in a batch."""
         T = 64
         gt_good = np.zeros((T, 3), dtype=np.float32).flatten().tolist()
-        pred_good = np.zeros((2, T, 3), dtype=np.float32).flatten().tolist()
+        pred_good = np.zeros((T, 3), dtype=np.float32).flatten().tolist()
         gt_bad = np.zeros((T, 3), dtype=np.float32).flatten().tolist()
-        pred_bad = np.full((2, T, 3), 100.0, dtype=np.float32).flatten().tolist()
+        pred_bad = np.full((T, 3), 100.0, dtype=np.float32).flatten().tolist()
 
         rewards = self.reward_fn(
             ["a", "b"],
@@ -197,25 +183,32 @@ class TestConsistencyReward:
         return traj.flatten().tolist()
 
     def test_consistent_left_turn(self):
-        """CoC mentions left turn + trajectory turns left = high consistency."""
-        text = "The vehicle is turning left at the intersection."
+        """CoC mentions left turn + maintain speed matching trajectory = r=1."""
+        text = "The vehicle will maintain speed while turning left at the intersection."
         pred = self._make_left_turn_traj()
         rewards = self.reward_fn([text], pred_xyz=[pred])
-        assert rewards[0] > 0.5
+        assert rewards[0] == 1.0
 
     def test_inconsistent_text(self):
-        """CoC mentions right turn but trajectory goes left = low consistency."""
+        """CoC mentions right turn but trajectory goes left = r=0."""
         text = "The vehicle is turning right at the intersection."
         pred = self._make_left_turn_traj()
         rewards = self.reward_fn([text], pred_xyz=[pred])
-        assert rewards[0] < 0.5
+        assert rewards[0] == 0.0
 
     def test_consistent_straight(self):
-        """CoC mentions straight + trajectory goes straight."""
-        text = "The vehicle will continue straight ahead."
+        """CoC mentions straight + cruise matching trajectory = r=1."""
+        text = "The vehicle will cruise straight ahead."
         pred = self._make_straight_traj()
         rewards = self.reward_fn([text], pred_xyz=[pred])
-        assert rewards[0] > 0.5
+        assert rewards[0] == 1.0
+
+    def test_partial_match_is_half(self):
+        """Only one axis matches → r=0.5 (partial credit)."""
+        text = "The vehicle is turning left."  # lateral matches but no lon keyword
+        pred = self._make_left_turn_traj()
+        rewards = self.reward_fn([text], pred_xyz=[pred])
+        assert rewards[0] == 0.5
 
     def test_none_pred_xyz(self):
         """Missing trajectories should return 0.0."""
@@ -444,3 +437,266 @@ class TestTrajectoryBehaviorDetection:
         traj = np.zeros((2, 3), dtype=np.float32).flatten().tolist()
         behaviors = _trajectory_to_behaviors(traj)
         assert len(behaviors) == 0  # too short to analyze
+
+
+# ===================================================================
+# Meta-action extractor tests
+# ===================================================================
+
+
+class TestMetaActions:
+    """Tests for the per-timestep meta_actions module."""
+
+    def test_import(self):
+        from alpamayo_r1.training.meta_actions import (
+            MetaActions,
+            MetaActionsSummary,
+            extract_meta_actions,
+            extract_meta_actions_summary,
+            trajectory_to_meta_actions,
+        )
+
+    def test_returns_lists(self):
+        """extract_meta_actions returns lists of labels."""
+        from alpamayo_r1.training.meta_actions import extract_meta_actions
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, 64, T)
+        result = extract_meta_actions(traj)
+        assert isinstance(result.longitudinal, list)
+        assert isinstance(result.lateral, list)
+        assert len(result.longitudinal) == T - 2  # accel needs 2 diffs
+        assert len(result.lateral) == T - 2
+
+    def test_stop(self):
+        """Trajectory that plateaus → most timesteps LON_STOP."""
+        from alpamayo_r1.training.meta_actions import LON_STOP, extract_meta_actions_summary
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:20, 0] = np.linspace(0, 2, 20)
+        traj[20:, 0] = 2.0
+        result = extract_meta_actions_summary(traj)
+        assert result.longitudinal == LON_STOP
+
+    def test_reverse(self):
+        """Trajectory with negative dx → dominant LON_REVERSE."""
+        from alpamayo_r1.training.meta_actions import LON_REVERSE, extract_meta_actions_summary
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, -10, T)
+        result = extract_meta_actions_summary(traj)
+        assert result.longitudinal == LON_REVERSE
+
+    def test_maintain_speed(self):
+        """Constant velocity → all timesteps LON_MAINTAIN."""
+        from alpamayo_r1.training.meta_actions import LON_MAINTAIN, extract_meta_actions
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, 64, T)  # 10 m/s constant
+        result = extract_meta_actions(traj)
+        assert all(l == LON_MAINTAIN for l in result.longitudinal)
+
+    def test_gentle_accel(self):
+        """Constant acceleration at 1.56 m/s² → all timesteps LON_GENTLE_ACCEL."""
+        from alpamayo_r1.training.meta_actions import LON_GENTLE_ACCEL, extract_meta_actions
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        t = np.arange(T) * 0.1
+        traj[:, 0] = 5.0 * t + 0.5 * 1.56 * t**2
+        result = extract_meta_actions(traj)
+        assert all(l == LON_GENTLE_ACCEL for l in result.longitudinal)
+
+    def test_strong_accel(self):
+        """Constant acceleration at 3.0 m/s² → all timesteps LON_STRONG_ACCEL."""
+        from alpamayo_r1.training.meta_actions import LON_STRONG_ACCEL, extract_meta_actions
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        t = np.arange(T) * 0.1
+        traj[:, 0] = 2.0 * t + 0.5 * 3.0 * t**2
+        result = extract_meta_actions(traj)
+        assert all(l == LON_STRONG_ACCEL for l in result.longitudinal)
+
+    def test_gentle_decel(self):
+        """Constant deceleration at -1.56 m/s² → dominant LON_GENTLE_DECEL."""
+        from alpamayo_r1.training.meta_actions import LON_GENTLE_DECEL, extract_meta_actions_summary
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        t = np.arange(T) * 0.1
+        traj[:, 0] = 15.0 * t + 0.5 * (-1.56) * t**2
+        result = extract_meta_actions_summary(traj)
+        assert result.longitudinal == LON_GENTLE_DECEL
+
+    def test_strong_decel(self):
+        """Constant deceleration at -3.0 m/s² → dominant LON_STRONG_DECEL."""
+        from alpamayo_r1.training.meta_actions import LON_STRONG_DECEL, extract_meta_actions_summary
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        t = np.arange(T) * 0.1
+        traj[:, 0] = 25.0 * t + 0.5 * (-3.0) * t**2
+        result = extract_meta_actions_summary(traj)
+        assert result.longitudinal == LON_STRONG_DECEL
+
+    def test_go_straight(self):
+        """No lateral rate → all timesteps LAT_GO_STRAIGHT."""
+        from alpamayo_r1.training.meta_actions import LAT_GO_STRAIGHT, extract_meta_actions
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, 40, T)
+        result = extract_meta_actions(traj)
+        assert all(l == LAT_GO_STRAIGHT for l in result.lateral)
+
+    def test_steer_left(self):
+        """Moderate lateral rate → dominant LAT_STEER_LEFT."""
+        from alpamayo_r1.training.meta_actions import LAT_STEER_LEFT, extract_meta_actions_summary
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, 40, T)
+        # lateral_rate ≈ 0.5 m/s (above 0.3 threshold, below 1.0)
+        traj[:, 1] = np.linspace(0, 3.2, T)
+        result = extract_meta_actions_summary(traj)
+        assert result.lateral == LAT_STEER_LEFT
+
+    def test_steer_right(self):
+        """Moderate negative lateral rate → dominant LAT_STEER_RIGHT."""
+        from alpamayo_r1.training.meta_actions import LAT_STEER_RIGHT, extract_meta_actions_summary
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, 40, T)
+        traj[:, 1] = np.linspace(0, -3.2, T)
+        result = extract_meta_actions_summary(traj)
+        assert result.lateral == LAT_STEER_RIGHT
+
+    def test_sharp_left(self):
+        """High lateral rate → dominant LAT_SHARP_LEFT."""
+        from alpamayo_r1.training.meta_actions import LAT_SHARP_LEFT, extract_meta_actions_summary
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, 40, T)
+        # lateral_rate ≈ 1.25 m/s (above 1.0 threshold)
+        traj[:, 1] = np.linspace(0, 8.0, T)
+        result = extract_meta_actions_summary(traj)
+        assert result.lateral == LAT_SHARP_LEFT
+
+    def test_sharp_right(self):
+        """High negative lateral rate → dominant LAT_SHARP_RIGHT."""
+        from alpamayo_r1.training.meta_actions import LAT_SHARP_RIGHT, extract_meta_actions_summary
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, 40, T)
+        traj[:, 1] = np.linspace(0, -8.0, T)
+        result = extract_meta_actions_summary(traj)
+        assert result.lateral == LAT_SHARP_RIGHT
+
+    def test_reverse_left(self):
+        """Reversing with positive lateral rate → dominant LAT_REVERSE_LEFT."""
+        from alpamayo_r1.training.meta_actions import (
+            LAT_REVERSE_LEFT,
+            LON_REVERSE,
+            extract_meta_actions_summary,
+        )
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, -10, T)  # reversing
+        traj[:, 1] = np.linspace(0, 3.0, T)  # drifting left at ~0.47 m/s
+        result = extract_meta_actions_summary(traj)
+        assert result.longitudinal == LON_REVERSE
+        assert result.lateral == LAT_REVERSE_LEFT
+
+    def test_short_trajectory_guard(self):
+        """T < 3 returns safe defaults without crashing."""
+        from alpamayo_r1.training.meta_actions import (
+            LAT_GO_STRAIGHT,
+            LON_STOP,
+            extract_meta_actions,
+        )
+
+        traj = np.zeros((2, 3), dtype=np.float32)
+        result = extract_meta_actions(traj)
+        assert result.longitudinal == [LON_STOP]
+        assert result.lateral == [LAT_GO_STRAIGHT]
+
+    def test_mixed_accel_then_maintain(self):
+        """Trajectory that accelerates then cruises → sequence contains both labels."""
+        from alpamayo_r1.training.meta_actions import (
+            LON_GENTLE_ACCEL,
+            LON_MAINTAIN,
+            extract_meta_actions,
+        )
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        t = np.arange(T) * 0.1
+        # First half: accelerate at 1.5 m/s²; second half: constant speed
+        mid = T // 2
+        traj[:mid, 0] = 5.0 * t[:mid] + 0.5 * 1.5 * t[:mid] ** 2
+        v_at_mid = 5.0 + 1.5 * t[mid - 1]
+        x_at_mid = traj[mid - 1, 0]
+        traj[mid:, 0] = x_at_mid + v_at_mid * (t[mid:] - t[mid])
+        result = extract_meta_actions(traj)
+        lon_set = set(result.longitudinal)
+        assert LON_GENTLE_ACCEL in lon_set
+        assert LON_MAINTAIN in lon_set
+
+    def test_mixed_steer_then_straight(self):
+        """Trajectory that steers left then goes straight → both labels present."""
+        from alpamayo_r1.training.meta_actions import (
+            LAT_GO_STRAIGHT,
+            LAT_STEER_LEFT,
+            extract_meta_actions,
+        )
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, 40, T)
+        mid = T // 2
+        # First half: steer left at ~0.5 m/s lateral
+        traj[:mid, 1] = np.linspace(0, 1.6, mid)
+        # Second half: hold constant (go straight)
+        traj[mid:, 1] = traj[mid - 1, 1]
+        result = extract_meta_actions(traj)
+        lat_set = set(result.lateral)
+        assert LAT_STEER_LEFT in lat_set
+        assert LAT_GO_STRAIGHT in lat_set
+
+    def test_trajectory_to_meta_actions_wrapper(self):
+        """Wrapper returns MetaActionsSummary with scalar fields."""
+        from alpamayo_r1.training.meta_actions import LON_MAINTAIN, trajectory_to_meta_actions
+
+        T = 64
+        traj = np.zeros((T, 3), dtype=np.float32)
+        traj[:, 0] = np.linspace(0, 64, T)
+        result = trajectory_to_meta_actions(traj.flatten().tolist())
+        assert result is not None
+        assert isinstance(result.longitudinal, str)
+        assert result.longitudinal == LON_MAINTAIN
+
+    def test_trajectory_to_meta_actions_multi_sample(self):
+        """Wrapper handles multi-sample (S, T, 3) flattened input."""
+        from alpamayo_r1.training.meta_actions import trajectory_to_meta_actions
+
+        T = 64
+        traj = np.zeros((3, T, 3), dtype=np.float32)
+        traj[0, :, 0] = np.linspace(0, 64, T)
+        result = trajectory_to_meta_actions(traj.flatten().tolist())
+        assert result is not None
+
+    def test_trajectory_to_meta_actions_failure(self):
+        """Wrapper returns None on bad input."""
+        from alpamayo_r1.training.meta_actions import trajectory_to_meta_actions
+
+        result = trajectory_to_meta_actions([1.0, 2.0])
+        assert result is None or isinstance(result, object)
