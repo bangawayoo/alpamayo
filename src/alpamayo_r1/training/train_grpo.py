@@ -48,7 +48,11 @@ from alpamayo_r1.training.rewards import (
     reasoning_quality_reward,
     trajectory_quality_reward,
 )
-from alpamayo_r1.training.rollout import AlpamayoGRPOTrainer, GpuUtilizationCallback, RolloutLoggingCallback
+from alpamayo_r1.training.rollout import (
+    AlpamayoGRPOTrainer,
+    GpuUtilizationCallback,
+    RolloutLoggingCallback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +82,7 @@ def main(cfg: DictConfig) -> None:
         cfg: Hydra config with model, training, data, and reward settings.
     """
     logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
-    
+
     # Set seeds
     seed = cfg.get("seed", 42)
     torch.manual_seed(seed)
@@ -118,7 +122,9 @@ def main(cfg: DictConfig) -> None:
             r=lora_cfg.get("r", 16),
             lora_alpha=lora_cfg.get("alpha", 32),
             lora_dropout=lora_cfg.get("dropout", 0.05),
-            target_modules=list(lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])),
+            target_modules=list(
+                lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
+            ),
             task_type="CAUSAL_LM",
         )
         logger.info("LoRA enabled: r=%d, alpha=%d", lora_config.r, lora_config.lora_alpha)
@@ -273,12 +279,11 @@ def main(cfg: DictConfig) -> None:
         rollout_max_generation_length=rollout_cfg.get("max_generation_length", 256),
         logprob_mini_batch_size=int(rollout_cfg.get("logprob_mini_batch_size", 4)),
         data_cache_max_size=int(rollout_cfg.get("data_cache_max_size", 200)),
+        value_head_cfg=dict(cfg.get("value_head", {})),
     )
 
     # Rollout logging callback (CoC text + BEV trajectory plots to TensorBoard)
-    rollout_log_interval = rollout_cfg.get(
-        "log_interval", train_cfg.get("logging_steps", 10)
-    )
+    rollout_log_interval = rollout_cfg.get("log_interval", train_cfg.get("logging_steps", 10))
     rollout_plot_interval = rollout_cfg.get("plot_interval", None)
     if rollout_plot_interval is not None:
         rollout_plot_interval = int(rollout_plot_interval)
@@ -306,7 +311,9 @@ def main(cfg: DictConfig) -> None:
         )
         logger.info(
             "Early stopping enabled: patience=%d, threshold=%.3f, metric=%s",
-            es_patience, es_threshold, training_args.metric_for_best_model,
+            es_patience,
+            es_threshold,
+            training_args.metric_for_best_model,
         )
 
     logger.info("Starting GRPO training...")
