@@ -31,6 +31,7 @@ from alpamayo_r1.diffusion.base import BaseDiffusion
 from alpamayo_r1.models.token_utils import (
     StopAfterEOS,
     extract_text_tokens,
+    extract_traj_tokens,
     replace_padding_after_eos,
     to_special_token,
 )
@@ -162,6 +163,94 @@ class AlpamayoR1(ReasoningVLA):
 
         self.post_init()
 
+    def _prepare_vlm_generation(
+        self,
+        data: dict[str, Any],
+        top_p: float,
+        top_k: int | None,
+        temperature: float,
+        num_traj_samples: int,
+        max_new_tokens: int,
+    ) -> tuple[torch.Tensor, dict, torch.Tensor, torch.Tensor, int]:
+        """Prepare inputs and generation config shared by both trajectory methods.
+
+        Unpacks ``data``, fuses history trajectory tokens into ``input_ids``,
+        and configures the VLM generation settings.
+
+        Returns:
+            input_ids, tokenized_data (remaining), ego_history_xyz,
+            ego_history_rot, B (batch size).
+        """
+        ego_history_xyz = data["ego_history_xyz"]
+        ego_history_rot = data["ego_history_rot"]
+        B, n_traj_group, _, _ = ego_history_xyz.shape
+        assert n_traj_group == 1, "Only one trajectory group is supported for inference."
+
+        tokenized_data = data["tokenized_data"]
+        input_ids = tokenized_data.pop("input_ids")
+        traj_data_vlm = {
+            "ego_history_xyz": ego_history_xyz,
+            "ego_history_rot": ego_history_rot,
+        }
+        input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
+
+        generation_config = self.vlm.generation_config
+        generation_config.top_p = top_p
+        generation_config.temperature = temperature
+        generation_config.do_sample = True
+        generation_config.num_return_sequences = num_traj_samples
+        generation_config.max_new_tokens = max_new_tokens
+        generation_config.top_k = top_k
+        generation_config.pad_token_id = self.tokenizer.pad_token_id
+
+        return input_ids, tokenized_data, ego_history_xyz, ego_history_rot, B
+
+    def _postprocess_trajectories(
+        self,
+        pred_xyz: torch.Tensor,
+        pred_rot: torch.Tensor,
+        vlm_sequences: torch.Tensor,
+        num_traj_sets: int,
+        num_traj_samples: int,
+        input_ids_B: int,
+        return_extra: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict]:
+        """Reshape predictions to (B, ns, nj, ...) and optionally extract CoC text.
+
+        This is shared post-processing for both the full-pipeline and
+        VLM-only trajectory generation methods.
+        """
+        pred_xyz = einops.rearrange(
+            pred_xyz, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
+        )
+        pred_rot = einops.rearrange(
+            pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
+        )
+
+        if return_extra:
+            extra = extract_text_tokens(self.tokenizer, vlm_sequences)
+            for text_tokens in extra.keys():
+                extra[text_tokens] = np.array(extra[text_tokens]).reshape(
+                    [input_ids_B, num_traj_sets, num_traj_samples]
+                )
+            return pred_xyz, pred_rot, extra
+        return pred_xyz, pred_rot
+
+    def _repeat_history(
+        self,
+        ego_history_xyz: torch.Tensor,
+        ego_history_rot: torch.Tensor,
+        n_samples_total: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Repeat history tensors to align with num_traj_samples * num_traj_sets."""
+        hist_xyz_rep = einops.repeat(
+            ego_history_xyz[:, -1], "b ... -> (b n) ...", n=n_samples_total
+        )
+        hist_rot_rep = einops.repeat(
+            ego_history_rot[:, -1], "b ... -> (b n) ...", n=n_samples_total
+        )
+        return hist_xyz_rep, hist_rot_rep
+
     def sample_trajectories_from_data_with_vlm_rollout(
         self,
         data: dict[str, Any],
@@ -174,7 +263,11 @@ class AlpamayoR1(ReasoningVLA):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample trajectories from the data with VLM rollout.
+        """Sample trajectories using VLM + Expert + Diffusion (full pipeline).
+
+        The VLM generates CoC reasoning text (trajectory tokens are masked by
+        ``ExpertLogitsProcessor``), then the Expert Transformer + Diffusion
+        model produces continuous trajectories in action space.
 
         Args:
             data: The input data.
@@ -192,33 +285,21 @@ class AlpamayoR1(ReasoningVLA):
             logprob: The log probability.
         """
         n_samples_total = num_traj_samples * num_traj_sets
-        ego_history_xyz = data["ego_history_xyz"]
-        ego_history_rot = data["ego_history_rot"]
-        B, n_traj_group, _, _ = ego_history_xyz.shape
-        assert n_traj_group == 1, "Only one trajectory group is supported for inference."
-        tokenized_data = data["tokenized_data"]
-        input_ids = tokenized_data.pop("input_ids")
-        traj_data_vlm = {
-            "ego_history_xyz": ego_history_xyz,
-            "ego_history_rot": ego_history_rot,
-        }
-        input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
-        device = input_ids.device
-
-        # 1) run autoregressive generation for the VLM
         max_generation_length = kwargs.get(
             "max_generation_length", self.config.tokens_per_future_traj
         )
+
+        input_ids, tokenized_data, ego_history_xyz, ego_history_rot, B = (
+            self._prepare_vlm_generation(
+                data, top_p, top_k, temperature, num_traj_samples, max_generation_length,
+            )
+        )
+        device = input_ids.device
+
+        # Full pipeline needs logits and KV cache for Expert
         generation_config = self.vlm.generation_config
-        generation_config.top_p = top_p
-        generation_config.temperature = temperature
-        generation_config.do_sample = True
-        generation_config.num_return_sequences = num_traj_samples
-        generation_config.max_new_tokens = max_generation_length
         generation_config.output_logits = True
         generation_config.return_dict_in_generate = True
-        generation_config.top_k = top_k
-        generation_config.pad_token_id = self.tokenizer.pad_token_id
 
         # use custom stopping criteria to stop after EOS token + one more token,
         # because the KV cache is updated after the next token is generated
@@ -339,36 +420,109 @@ class AlpamayoR1(ReasoningVLA):
             **diffusion_kwargs,
         )
 
-        # Repeat history to align with num_traj_samples
-        hist_xyz_rep = einops.repeat(
-            ego_history_xyz[:, -1], "b ... -> (b n) ...", n=n_samples_total
-        )
-        hist_rot_rep = einops.repeat(
-            ego_history_rot[:, -1], "b ... -> (b n) ...", n=n_samples_total
+        hist_xyz_rep, hist_rot_rep = self._repeat_history(
+            ego_history_xyz, ego_history_rot, n_samples_total
         )
 
         pred_xyz, pred_rot = self.action_space.action_to_traj(
             sampled_action, hist_xyz_rep, hist_rot_rep
         )
 
-        # 4) Reshape to (B, num_traj_samples, n_traj, ...)
-        pred_xyz = einops.rearrange(
-            pred_xyz, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
-        )
-        pred_rot = einops.rearrange(
-            pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
+        return self._postprocess_trajectories(
+            pred_xyz, pred_rot, vlm_outputs.sequences,
+            num_traj_sets, num_traj_samples,
+            input_ids.shape[0], kwargs.get("return_extra", False),
         )
 
-        # return the text tokens generated by the VLM
-        if kwargs.get("return_extra", False):
-            extra = extract_text_tokens(self.tokenizer, vlm_outputs.sequences)
-            # rearrange text tokens to shape [B, ns, nj] to match trajectory shape
-            for text_tokens in extra.keys():
-                extra[text_tokens] = np.array(extra[text_tokens]).reshape(
-                    [input_ids.shape[0], num_traj_sets, num_traj_samples]
-                )
-            return pred_xyz, pred_rot, extra
-        return pred_xyz, pred_rot
+    def sample_trajectories_from_data_with_vlm_only(
+        self,
+        data: dict[str, Any],
+        top_p: float = 0.98,
+        top_k: int | None = None,
+        temperature: float = 0.6,
+        num_traj_samples: int = 6,
+        num_traj_sets: int = 1,
+        max_generation_length: int = 256,
+        return_extra: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict]:
+        """Generate trajectories using VLM-only rollout (no Expert/Diffusion).
+
+        The VLM autoregressively generates both Chain-of-Causation reasoning
+        text AND discrete trajectory tokens.  Trajectory tokens are decoded
+        back to continuous (x, y, z) waypoints via ``traj_tokenizer.decode()``.
+
+        This mirrors the GRPO training rollout and is useful for evaluating
+        VLM trajectory prediction quality without the Expert/Diffusion modules
+        (which can be kept off-GPU to save memory).
+
+        Args:
+            data: Model inputs dict with keys ``tokenized_data``,
+                ``ego_history_xyz``, and ``ego_history_rot``.
+            top_p: Nucleus sampling threshold.
+            top_k: Top-k sampling (None to disable).
+            temperature: Sampling temperature.
+            num_traj_samples: Number of trajectory samples per input.
+            num_traj_sets: Number of trajectory sets.
+            max_generation_length: Max new tokens for CoC text generation
+                (trajectory token budget is added automatically).
+            return_extra: If True, return a dict with CoC text as third element.
+
+        Returns:
+            pred_xyz: Predicted future waypoints, shape
+                ``(B, num_traj_sets, num_traj_samples, T, 3)``.
+            pred_rot: Predicted future rotations, shape
+                ``(B, num_traj_sets, num_traj_samples, T, 3, 3)``.
+            extra: (only if ``return_extra=True``) Dict with ``"cot"`` key
+                containing CoC text, shape ``(B, num_traj_sets, num_traj_samples)``.
+        """
+        n_samples_total = num_traj_samples * num_traj_sets
+        tokens_per_future_traj = self.config.tokens_per_future_traj
+        max_new_tokens = max_generation_length + tokens_per_future_traj + 10
+
+        input_ids, tokenized_data, ego_history_xyz, ego_history_rot, B = (
+            self._prepare_vlm_generation(
+                data, top_p, top_k, temperature, num_traj_samples, max_new_tokens,
+            )
+        )
+
+        # No ExpertLogitsProcessor — VLM freely generates trajectory tokens.
+        # Stop at <|traj_future_end|> (the VLM generates tokens *through* the
+        # trajectory section, unlike the full pipeline which stops at _start).
+        traj_future_end_id = self.special_token_ids["traj_future_end"]
+        stopping_criteria = StoppingCriteriaList(
+            [StopAfterEOS(eos_token_id=traj_future_end_id)]
+        )
+
+        vlm_output = self.vlm.generate(
+            input_ids=input_ids,
+            generation_config=self.vlm.generation_config,
+            stopping_criteria=stopping_criteria,
+            **tokenized_data,
+        )
+        # vlm_output: (B * num_traj_samples, prompt_len + generated_len)
+
+        # Extract discrete trajectory tokens and decode to continuous xyz
+        traj_tokens = extract_traj_tokens(
+            vlm_output,
+            self.special_token_ids,
+            tokens_per_future_traj,
+            self.future_token_start_idx,
+            self.config.traj_vocab_size,
+        )
+
+        hist_xyz_rep, hist_rot_rep = self._repeat_history(
+            ego_history_xyz, ego_history_rot, n_samples_total
+        )
+
+        pred_xyz, pred_rot, _ = self.traj_tokenizer.decode(
+            hist_xyz_rep, hist_rot_rep, traj_tokens
+        )
+
+        return self._postprocess_trajectories(
+            pred_xyz, pred_rot, vlm_output,
+            num_traj_sets, num_traj_samples,
+            input_ids.shape[0], return_extra,
+        )
 
 
 AutoConfig.register("alpamayo_r1", AlpamayoR1Config)
