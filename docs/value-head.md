@@ -10,15 +10,38 @@ This design stays within `AlpamayoGRPOTrainer` (no separate PPO trainer needed) 
 
 ---
 
-## Current State (SceneValueHead)
+## Current State (SegmentValueHead — scene-level advantage)
 
-The existing `SceneValueHead` (in `value_head.py`) provides a single-point baseline:
+**Status: Implemented** (`feat/value-head-advantage` branch)
+
+`SegmentValueHead` (renamed from `SceneValueHead`, backward-compat alias kept) maps VLM hidden states to scalar value estimates. Currently used at the scene level (V_obs only):
 
 ```
 V(observation) = MLP(h_obs)
+A_i = r_i - V(s_obs)          # advantage for each completion
 ```
 
-Where `h_obs` is the VLM's hidden state at the last prompt token, extracted via a separate forward pass before generation. This gives one scalar per scene, used only for logging — it does not yet feed back into advantage computation.
+Key design decisions in the current implementation:
+
+- **No group normalization** — the learned baseline replaces GRPO's group-mean baseline entirely. Per-group normalization (`(A - mean) / std`) flattens scene difficulty: a rare good trajectory on a hard scene (std=0.3) gets a smaller normalized advantage than a slightly-above-average trajectory on an easy scene (std=0.01). Raw `r - V` advantages preserve this difficulty signal.
+- **G samples still useful** — multiple completions per prompt provide (1) low-variance MC targets for value head training (`V_mc = mean(rewards)`), and (2) gradient variance reduction through batching.
+- **`advantage_enabled` config flag** — set `false` for auxiliary-only mode (value head trains and logs but doesn't affect policy gradients).
+- **Two-stage training preserved** — stage 0 pretrains the value head with policy frozen; stage 1 runs both together. During stage 0, advantages are not replaced (policy receives zero loss).
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `value_head.py` | `SceneValueHead` → `SegmentValueHead`, accepts `(B, T, D)` for future segment-level use |
+| `rollout.py` | `_generate_and_score_completions` override, `_compute_value_advantages` method, advantage stash buffers |
+| `grpo_default.yaml` | `advantage_enabled: true` field |
+| `tests/test_training.py` | 13 new tests (SegmentValueHead shapes + advantage computation + no-group-norm verification) |
+
+### Observed training behavior
+
+- Policy loss goes negative — this is expected. The clipped surrogate loss `L = -ratio * A * log_p` is negative when positive advantages reinforce high-probability tokens.
+- Value head loss starts high (~0.6) and converges as V(scene) learns to predict expected return.
+- `advantages/mean` is non-zero (unlike group-normalized GRPO where it's always ~0). This is correct — it reflects `mean(r) - mean(V)`, which converges to zero as the value head improves.
 
 ---
 
@@ -146,16 +169,15 @@ advantages[b, :] = [A_coc, A_coc, ..., A_coc, A_traj_1, A_traj_2, ..., A_traj_T]
 
 TRL's `_compute_loss` already supports `(B, T)` advantages (see the `if advantages.dim() == 1: advantages = advantages.unsqueeze(1)` guard in the base GRPOTrainer).
 
-### Group Normalization
+### Group Normalization — Deliberately Omitted
 
-GRPO's key property is normalizing within a group of G generations per prompt. With segment-level advantages, normalize **per segment type** across the G completions:
+Standard GRPO normalizes within a group: `(A - mean) / (std + ε)`. We intentionally skip this for the value-head baseline because:
 
-```
-A_coc_normalized = (A_coc - mean(A_coc over G)) / (std(A_coc over G) + ε)
-A_traj_t_normalized = (A_traj_t - mean(A_traj_t over G)) / (std(A_traj_t over G) + ε)
-```
+1. **Difficulty flattening**: per-group std normalization forces every scene to unit variance. A hard scene (reward std=0.3) and an easy scene (std=0.01) get the same gradient magnitude — the model can't learn that rare successes on hard scenes are more valuable.
+2. **V cancels under centering**: since V(scene) is identical for all G samples from the same scene, `A_i - mean(A) = r_i - mean(r)` — the value head provides no benefit after group centering.
+3. **Variance reduction via batching**: G samples per prompt still reduce gradient variance through averaging, without needing explicit normalization.
 
-This prevents the trajectory signal from dominating simply because it has more tokens. Each segment type competes on its own scale within the group.
+For future segment-level advantages (CoC vs trajectory), per-segment-type normalization may be reconsidered to prevent the trajectory signal from dominating simply because it has more tokens. But this should be evaluated empirically against raw advantages.
 
 ---
 
@@ -265,7 +287,7 @@ This design naturally extends toward full PPO. The key insight: once you have a 
 ### What Makes This Still GRPO
 
 - **No value gradient through the VLM backbone** — the value head trains on detached hidden states
-- **Group-relative normalization** — advantages are normalized within G completions per prompt
+- **G completions per prompt** — multiple rollouts per scene provide gradient variance reduction and MC value targets (group normalization is dropped, but the group structure remains)
 - **No online value updates during rollout** — values are computed once after generation, not iteratively
 
 ### What Would Make This PPO
@@ -274,7 +296,7 @@ The following changes are each independent and can be adopted incrementally:
 
 1. **Backprop value gradients through the VLM** — instead of detached hidden states, share the backbone between policy and value head. This couples the representations but can improve value estimates. Requires careful loss balancing (`L = L_policy + c · L_value`).
 
-2. **Drop group normalization** — use raw TD/GAE advantages instead of normalizing within the group of G completions. The value baseline provides variance reduction, so group normalization becomes optional rather than essential.
+2. ~~**Drop group normalization**~~ — **Done.** Raw `r - V` advantages are used. The value baseline provides centering, and preserving per-scene variance gives harder scenes proportionally more gradient signal.
 
 3. **Online value updates** — update the value head between GRPO iterations within a single training step, not just at step boundaries. This improves value accuracy for the current policy.
 
@@ -283,58 +305,72 @@ The following changes are each independent and can be adopted incrementally:
 ### The Spectrum
 
 ```
-Pure GRPO                          This design                         Full PPO
-─────────────────────────────────────────────────────────────────────────────────
-scalar reward     segment rewards + value baseline     per-token GAE + shared backbone
-broadcast adv     segment advantages (B,T)             full token-level advantages
-no critic         detached critic                      end-to-end critic
-group-relative    group-relative per segment           optional group normalization
+Pure GRPO              Current (scene-level)        Planned (segment-level)        Full PPO
+────────────────────────────────────────────────────────────────────────────────────────────
+scalar reward          scalar reward + V baseline   segment rewards + V baseline   per-token GAE + shared backbone
+broadcast adv          A = r - V(scene) (B,)        segment advantages (B,T)       full token-level advantages
+no critic              detached critic               detached critic                end-to-end critic
+group-relative         no group norm ✓               TBD per segment type           optional group normalization
 ```
 
 Each step rightward adds more credit assignment precision at the cost of training complexity and stability. The segment-level design is the pragmatic middle ground: it captures the most important structural credit assignment (reasoning vs. trajectory) without the instability risks of full PPO (value-policy interference, reward hacking through the critic).
 
 ### When to Move Further Toward PPO
 
-- If segment-level advantages show clear improvement over scalar GRPO but per-trajectory-token advantages plateau → the value head may need backbone gradients (step 1)
-- If group normalization suppresses useful signal → try raw advantages with the value baseline (step 2)
+- If scene-level `r - V` advantages improve over scalar GRPO → proceed to segment-level (CoC + trajectory) advantages
+- If segment-level advantages plateau → the value head may need backbone gradients (step 1)
 - If value head lags behind rapid policy changes → add online updates (step 3)
 
 ---
 
 ## Configuration
 
-Extends the existing `value_head` config block in `grpo_default.yaml`:
+The `value_head` config block in `grpo_default.yaml`:
 
 ```yaml
 value_head:
   enabled: true
   hidden_dim: 4096
-  lr: 1e-4
-  pretrain_steps: 50
+  lr: 1e-5
+  pretrain_steps: 0            # stage 0: steps where only value head trains (0 = skip)
   save_path: outputs/value_head.pt
   load_path: null
-  # New fields for segment-level value
-  segment_level: true          # false = legacy SceneValueHead behavior
+  advantage_enabled: true      # replace GRPO group-mean baseline with V(scene)
+                               # set false for auxiliary-only mode (logging, no policy effect)
+```
+
+Future fields for segment-level value (not yet implemented):
+
+```yaml
+  segment_level: true          # false = scene-level only (current behavior)
   gamma: 1.0                   # discount factor (1.0 for short sequences)
   gae_lambda: 0.95             # GAE trace decay
-  normalize_per_segment: true  # group-normalize advantages per segment type
 ```
 
 ---
 
 ## Metrics
 
-New TensorBoard metrics alongside existing `value_head/loss`:
+### Currently logged (scene-level)
+
+| Metric | Description |
+|---|---|
+| `value_head/loss` | MSE between V(scene) and MC target |
+| `value_head/pred_mean` | Mean predicted V(scene) |
+| `value_head/target_mean` | Mean MC target (avg reward over G completions) |
+| `value_head/scenes_per_step` | Number of scenes consumed per training step |
+| `value_head/mc_group_size` | Average group size for MC aggregation |
+| `value_head/pretrain_steps_remaining` | Stage 0 countdown |
+| `advantages/v_baseline_mean` | Mean V(scene) used as baseline |
+| `advantages/mean` | Mean advantage (non-zero; converges to 0 as V improves) |
+| `advantages/std` | Std of advantages (reflects scene difficulty spread) |
+
+### Planned (segment-level)
 
 | Metric | Description |
 |---|---|
 | `value_head/loss_obs` | MSE at observation level |
 | `value_head/loss_coc` | MSE at CoC level |
 | `value_head/loss_traj` | MSE at trajectory token level (averaged) |
-| `value_head/v_obs_mean` | Mean predicted V(obs) |
-| `value_head/v_coc_mean` | Mean predicted V(coc) |
-| `value_head/v_traj_mean` | Mean predicted V(traj) across tokens |
 | `advantages/coc_mean` | Mean CoC segment advantage |
-| `advantages/coc_std` | Std of CoC advantages within groups |
 | `advantages/traj_mean` | Mean trajectory token advantage |
-| `advantages/traj_std` | Std of trajectory advantages within groups |
