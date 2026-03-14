@@ -66,7 +66,7 @@ The value network computes V(s) at three granularities using VLM hidden states a
 | V_coc | `<cot_end>` token | h_coc | Scene + quality of reasoning produced |
 | V_traj(t) | Each `<iN>` token | h_traj_t | Scene + reasoning + trajectory-so-far |
 
-All three levels share the same MLP weights. The hidden state at each position already carries different information — the VLM's autoregressive nature means h_traj_t has "seen" both the prompt and CoC text, so no explicit level embedding is needed (though one could be added if training signal is weak).
+All three levels share the same MLP weights but receive an explicit **level embedding** to help the network distinguish what "stage" of generation the hidden state comes from. While the VLM's autoregressive hidden states already encode positional context (h_traj_t has "seen" both prompt and CoC text), the value head's MLP is small — a level embedding gives it a direct signal about whether it's predicting total return (obs), post-reasoning return (coc), or mid-trajectory return-to-go (traj), without needing to infer this from the hidden state alone.
 
 ### Network Architecture
 
@@ -74,10 +74,16 @@ Upgrade `SceneValueHead` → `SegmentValueHead`:
 
 ```python
 class SegmentValueHead(nn.Module):
-    """Shared MLP: h → V(s) at any sequence position."""
+    """Shared MLP with level embedding: (h, level) → V(s)."""
 
-    def __init__(self, hidden_dim: int = 4096) -> None:
+    # Level indices
+    LEVEL_OBS = 0
+    LEVEL_COC = 1
+    LEVEL_TRAJ = 2
+
+    def __init__(self, hidden_dim: int = 4096, num_levels: int = 3) -> None:
         super().__init__()
+        self.level_embed = nn.Embedding(num_levels, hidden_dim)
         self.net = nn.Sequential(
             nn.Linear(hidden_dim, 512),
             nn.GELU(),
@@ -86,12 +92,21 @@ class SegmentValueHead(nn.Module):
             nn.Linear(128, 1),
         )
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """h: (B, hidden_dim) or (B, T, hidden_dim) → (B,) or (B, T)"""
+    def forward(self, h: torch.Tensor, level: int = 0) -> torch.Tensor:
+        """Predict value at one or more sequence positions.
+
+        Args:
+            h: Hidden state, shape (B, D) or (B, T, D).
+            level: 0=obs, 1=coc, 2=traj. Additive embedding.
+
+        Returns:
+            Value estimates, shape (B,) or (B, T).
+        """
+        h = h + self.level_embed.weight[level]  # broadcast across B (and T if 3D)
         return self.net(h).squeeze(-1)
 ```
 
-Same parameter count as today (~2.1M). The only change is that it accepts batched token-level hidden states, not just a single h_0.
+The level embedding adds `num_levels × hidden_dim` parameters (~12K for 3 levels × 4096). Negligible compared to the MLP's ~2.1M parameters. The additive design means the current scene-level behavior is recovered by calling `forward(h, level=0)` — backward compatible with `level=0` as default.
 
 ---
 
