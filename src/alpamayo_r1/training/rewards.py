@@ -37,6 +37,7 @@ from alpamayo_r1.training.meta_actions import (
 # 1. Trajectory quality reward
 # ---------------------------------------------------------------------------
 
+
 def trajectory_quality_reward(
     completions: list[str],
     pred_xyz: list[list[float]] | None = None,
@@ -90,6 +91,37 @@ def trajectory_quality_reward(
             rewards.append(0.0)
 
     return rewards
+
+
+def trajectory_per_timestep_rewards(
+    pred_flat: list[float],
+    gt_flat: list[float],
+    ade_threshold: float = 5.0,
+) -> np.ndarray | None:
+    """Compute per-timestep trajectory rewards (one per trajectory token).
+
+    Same formula as trajectory_quality_reward but applied per-timestep instead
+    of averaged.  Returns None on error or if inputs are malformed.
+
+    Args:
+        pred_flat: Flattened predicted trajectory, shape (T*3,).
+        gt_flat: Flattened ground-truth trajectory, shape (T*3,).
+        ade_threshold: Soft threshold for the reward mapping.
+
+    Returns:
+        Array of shape (T,) with per-timestep rewards in [0, 1], or None.
+    """
+    try:
+        pred = np.array(pred_flat, dtype=np.float32)
+        gt = np.array(gt_flat, dtype=np.float32)
+        if gt.ndim == 1:
+            gt = gt.reshape(-1, 3)
+        if pred.ndim == 1:
+            pred = pred.reshape(-1, 3)
+        l2_per_step = np.linalg.norm(pred[:, :2] - gt[:, :2], axis=-1)  # (T,)
+        return np.maximum(0.0, 1.0 - l2_per_step / ade_threshold)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -275,14 +307,10 @@ def consistency_reward(
 
         # Match if any meta-action (≥25% of timesteps) has a keyword in the text
         lon_match = any(
-            kw in text_lower
-            for action in lon_set
-            for kw in _META_ACTION_KEYWORDS.get(action, [])
+            kw in text_lower for action in lon_set for kw in _META_ACTION_KEYWORDS.get(action, [])
         )
         lat_match = any(
-            kw in text_lower
-            for action in lat_set
-            for kw in _META_ACTION_KEYWORDS.get(action, [])
+            kw in text_lower for action in lat_set for kw in _META_ACTION_KEYWORDS.get(action, [])
         )
 
         # Going straight is the implicit default — if the trajectory only
