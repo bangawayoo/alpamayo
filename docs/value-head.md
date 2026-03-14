@@ -97,19 +97,36 @@ Same parameter count as today (~2.1M). The only change is that it accepts batche
 
 ## Reward Decomposition
 
-To compute segment-level advantages, we need segment-level rewards.
+To compute segment-level advantages, we need to assign rewards to the correct segment based on **causal determination** — a reward belongs to the segment after which it is fully determined.
 
-### CoC Segment Rewards
+### What's determined at each state
 
-Received when CoC generation completes:
-- **R_reasoning**: rule-based reasoning quality (causal connectors, driving terms, length, no repetition)
-- **R_consistency**: agreement between CoC text and predicted trajectory (meta-action keyword matching)
+```
+s_obs                    s_coc                          s_T (terminal)
+  │                        │                              │
+  │  [CoC tokens]          │  [traj tokens]               │
+  │                        │                              │
+  │  R_reasoning: NO       │  R_reasoning: YES (fixed)    │  all determined
+  │  R_consistency: NO     │  R_consistency: NO           │
+  │  R_trajectory: NO      │  R_trajectory: NO            │
+```
 
-These are the existing `reasoning_quality_reward` and `consistency_reward` functions, unchanged.
+- `R_reasoning` is fully determined by the CoC text → **CoC segment reward**.
+- `R_consistency` measures agreement between CoC and trajectory → requires BOTH segments → **trajectory segment reward** (assigned causally to the later segment).
+- `R_trajectory` (ADE) depends on the generated trajectory → **trajectory segment reward**.
 
-### Trajectory Token Rewards
+> **Note on R_reasoning**: The current `reasoning_quality_reward` is a noisy, rule-based heuristic (checks for causal connectors, driving vocabulary, appropriate length, no repetition). It does not measure actual reasoning quality — a fluent but factually wrong CoC can score high. This means the CoC segment advantage `A_coc` may receive unreliable signal from `R_reasoning`. However, the `V(s_coc) - V(s_obs)` term provides a complementary, learned signal: if the CoC text leads to better-than-expected trajectory outcomes, `V(s_coc) > V(s_obs)` regardless of the heuristic score. As R_reasoning improves (e.g., via a learned reward model), the CoC advantage becomes more informative.
 
-The existing `trajectory_quality_reward` computes a scalar ADE over the full trajectory. For token-level advantages, we decompose it into **per-timestep rewards**:
+### Reward assignment by segment
+
+| Segment | Reward | Why |
+|---|---|---|
+| CoC | `w_reason · R_reasoning` | Only reward fully determined by CoC text alone |
+| Trajectory | `w_traj · R_trajectory + w_consist · R_consistency` | Both require the generated trajectory |
+
+### Per-timestep trajectory rewards
+
+The existing `trajectory_quality_reward` computes a scalar ADE. For per-token advantages, decompose into per-timestep rewards:
 
 ```python
 # Current: single scalar
@@ -117,10 +134,39 @@ ade = l2_per_step.mean()
 reward = max(0, 1 - ade / threshold)
 
 # New: per-timestep rewards
-r_t = max(0, 1 - l2_per_step[t] / threshold)   # one reward per trajectory token
+r_t = w_traj · max(0, 1 - l2_per_step[t] / threshold)   # one per trajectory token
 ```
 
-Each trajectory token `<iN>` maps to a specific timestep in the decoded (T, 3) trajectory, so the mapping from token index to timestep reward is direct. With 64 trajectory tokens encoding T timesteps (T depends on tokenizer configuration), each token gets its own L2-based reward.
+`R_consistency` is binary and doesn't decompose per-timestep. Assign it as a **terminal reward** at the last trajectory token (standard RL convention):
+
+```
+r_t = w_traj · per_step_ade_reward_t                              for t = 1..T-1
+r_T = w_traj · per_step_ade_reward_T + w_consist · R_consistency  terminal
+```
+
+Each trajectory token `<iN>` maps to a specific timestep in the decoded (T, 3) trajectory, so the mapping from token index to timestep reward is direct.
+
+---
+
+## Value Targets (Returns-to-Go)
+
+The value function V(s) predicts expected future return from state s. The training target G(s) is the actual return-to-go:
+
+```
+G(s_obs)    = w_reason · R_reasoning + Σ_t r_t           # total return
+G(s_coc)    = Σ_t r_t                                    # remaining: trajectory + consistency
+G(s_traj_t) = Σ_{k=t}^{T} r_k                           # remaining per-step (last includes consistency)
+```
+
+### Per-completion vs per-scene targets
+
+| Level | h source | Target | Samples per scene (G=8, T=64) |
+|---|---|---|---|
+| V(s_obs) | Same h_obs for all G | MC mean over G (low variance) | 1 |
+| V(s_coc) | Different h_coc per completion | Per-completion trajectory return | 8 |
+| V(s_traj_t) | Different h per completion per token | Per-completion return-to-go | 512 |
+
+V(s_obs) uses MC averaging because all G completions share the same h_obs — the value head can't distinguish between them, so averaging reduces target variance. V(s_coc) and V(s_traj_t) have distinct hidden states per completion and must use per-completion targets.
 
 ---
 
@@ -140,10 +186,14 @@ s_obs ──[CoC tokens]──→ s_coc ──[traj_1]──→ s_1 ──[traj_
 All CoC tokens receive the same advantage — a single TD step spanning the entire reasoning segment:
 
 ```
-A_coc = (R_reasoning + R_consistency) + γ · V(s_coc) - V(s_obs)
+A_coc = w_reason · R_reasoning + γ · V(s_coc) - V(s_obs)
 ```
 
-This says: "how much better was this reasoning trace than what we expected from the scene alone?"
+This captures two signals:
+1. `w_reason · R_reasoning` — did the reasoning text satisfy the heuristic quality checks? (noisy)
+2. `γ · V(s_coc) - V(s_obs)` — did this CoC text shift expected trajectory outcome up or down? (learned, potentially more reliable)
+
+Even with a noisy `R_reasoning`, the `V(s_coc) - V(s_obs)` term provides useful credit assignment: a CoC that produces confident, correct reasoning will yield `V(s_coc) > V(s_obs)` because the model expects better trajectory quality, regardless of whether the heuristic catches it.
 
 ### Trajectory Tokens (Per-Token GAE)
 
