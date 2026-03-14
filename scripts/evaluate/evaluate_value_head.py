@@ -564,7 +564,7 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=4096,
                         help="VLM hidden state dimension (must match value head)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--split", default="train")
+    parser.add_argument("--split", default="val")
     parser.add_argument("--dataset-revision", default="05e158af89ba",
                         help="HuggingFace dataset revision (default: 05e158af89ba)")
     parser.add_argument("--output-dir", default="outputs/value_head_eval")
