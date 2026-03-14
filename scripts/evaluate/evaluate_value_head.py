@@ -565,6 +565,8 @@ def main():
                         help="VLM hidden state dimension (must match value head)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split", default="train")
+    parser.add_argument("--dataset-revision", default="05e158af89ba",
+                        help="HuggingFace dataset revision (default: 05e158af89ba)")
     parser.add_argument("--output-dir", default="outputs/value_head_eval")
     args = parser.parse_args()
 
@@ -595,7 +597,8 @@ def main():
 
     # Sample clips
     print(f"Loading {args.split} clip index...")
-    avdi = PhysicalAIAVDatasetInterface()
+    avdi = PhysicalAIAVDatasetInterface(revision=args.dataset_revision)
+    print(f"  Dataset revision: {avdi.revision}")
     clip_index = avdi.clip_index
     split_df = clip_index[(clip_index["split"] == args.split) & clip_index["clip_is_valid"]]
     all_clips = split_df.index.tolist()
