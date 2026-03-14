@@ -117,7 +117,7 @@ To compute segment-level advantages, we need to assign rewards to the correct se
 ### What's determined at each state
 
 ```
-s_obs                    s_coc                          s_T (terminal)
+s_obs                    s_coc                           s_T (terminal)
   │                        │                              │
   │  [CoC tokens]          │  [traj tokens]               │
   │                        │                              │
@@ -177,11 +177,13 @@ G(s_traj_t) = Σ_{k=t}^{T} r_k                           # remaining per-step (l
 
 | Level | h source | Target | Samples per scene (G=8, T=64) |
 |---|---|---|---|
-| V(s_obs) | Same h_obs for all G | MC mean over G (low variance) | 1 |
+| V(s_obs) | Same h_obs for all G | MC mean over G (low variance)* | 1 |
 | V(s_coc) | Different h_coc per completion | Per-completion trajectory return | 8 |
 | V(s_traj_t) | Different h per completion per token | Per-completion return-to-go | 512 |
 
-V(s_obs) uses MC averaging because all G completions share the same h_obs — the value head can't distinguish between them, so averaging reduces target variance. V(s_coc) and V(s_traj_t) have distinct hidden states per completion and must use per-completion targets.
+V(s_obs) uses MC averaging because all G completions share the same h_obs — the value head can't distinguish between them, so averaging reduces target variance. V(s_coc) and V(s_traj_t) have distinct hidden states per completion and must use per-completion targets. Since V(s_traj_t) dominate in terms of numbers, we sub-sample from the trajectories to compute the loss.
+
+* In implementation, we don't actually take the mean, but compute gradient of the monte carlo samples, which has equivalent gradient.
 
 ---
 
@@ -221,7 +223,8 @@ Each trajectory token gets its own advantage via Generalized Advantage Estimatio
 A_t = Σ_{k=0}^{T-t-1} (γλ)^k · δ_{t+k}    GAE with discount γ, trace decay λ
 ```
 
-With sequences of ~64 trajectory tokens, `γ = 1.0` (or 0.99) and `λ = 0.95` are reasonable starting points.
+With sequences of ~64 trajectory tokens, `γ = 1.0` (or 0.99) and `λ = 1.0` are reasonable starting points.
+We use `λ = 1.0` to reduce bias.
 
 ### Resulting Advantage Tensor
 
@@ -233,6 +236,7 @@ advantages[b, :] = [A_coc, A_coc, ..., A_coc, A_traj_1, A_traj_2, ..., A_traj_T]
 ```
 
 TRL's `_compute_loss` already supports `(B, T)` advantages (see the `if advantages.dim() == 1: advantages = advantages.unsqueeze(1)` guard in the base GRPOTrainer).
+For  trajectory tokens, we mask out some of the tokens randomly so that the loss is not dominated by them.
 
 ### Group Normalization — Deliberately Omitted
 
@@ -270,7 +274,7 @@ Per completion: `(2 + T_traj) × hidden_dim × 4 bytes`
 
 With G=8 generations and batch_size=4: ~32 MB total in CPU RAM. Negligible.
 
-The `output_hidden_states=True` flag does add GPU memory during the forward pass (stores all layers' activations). For Qwen3-VL with 28 layers, this roughly doubles activation memory for that pass. Since this already runs under `torch.no_grad()`, it should fit within the existing memory budget, but may need monitoring on the 10GB MIG.
+The `output_hidden_states=True` flag does add GPU memory during the forward pass (stores all layers' activations). For Qwen3-VL with 28 layers, this roughly doubles activation memory for that pass. Since this already runs under `torch.no_grad()`, it should fit within the existing memory budget.
 
 ---
 
@@ -284,10 +288,12 @@ MSE between predicted values and **returns-to-go** (actual cumulative reward fro
 L_value = (1/N) Σ (V(s) - G(s))²
 ```
 
-Where G(s) is the return-to-go:
-- G(s_obs) = R_reasoning + R_consistency + Σ r_t  (total return)
-- G(s_coc) = Σ r_t  (remaining trajectory return)
-- G(s_traj_t) = Σ_{k=t}^{T} r_k  (trajectory return from timestep t onward)
+Where G(s) is the return-to-go (see [Value Targets](#value-targets-returns-to-go) for per-level definitions):
+- G(s_obs) = w_reason · R_reasoning + Σ_t r_t  (total return)
+- G(s_coc) = Σ_t r_t  (remaining trajectory + consistency return)
+- G(s_traj_t) = Σ_{k=t}^{T} r_k  (remaining per-step, last includes consistency)
+
+For V(s_obs), all G completions share the same h_obs — training on individual `(h_obs, reward_j)` pairs rather than on `(h_obs, mean(rewards))` produces equivalent gradients but avoids explicit MC aggregation. V(s_traj_t) produces the most samples per step; sub-sampling avoids dominating the value head loss.
 
 ### Training Schedule
 
@@ -333,8 +339,8 @@ _generate_and_score_completions (override)
     ├─ value_head(h_obs) → V_obs
     ├─ value_head(h_coc) → V_coc
     ├─ value_head(h_traj) → V_traj_1..T
-    ├─ TD/GAE → per-segment advantages
-    ├─ group-normalize per segment type
+    ├─ TD/GAE(λ=1) → per-segment advantages (no group normalization)
+    ├─ random mask on trajectory token positions to balance CoC vs traj gradient
     └─ output["advantages"] = (B, T) tensor
 
 _compute_loss
@@ -409,7 +415,8 @@ Future fields for segment-level value (not yet implemented):
 ```yaml
   segment_level: true          # false = scene-level only (current behavior)
   gamma: 1.0                   # discount factor (1.0 for short sequences)
-  gae_lambda: 0.95             # GAE trace decay
+  gae_lambda: 1.0              # GAE trace decay (1.0 = unbiased MC return minus baseline)
+  traj_mask_ratio: 0.5         # fraction of trajectory token positions to mask in policy loss
 ```
 
 ---
