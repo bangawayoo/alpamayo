@@ -1,0 +1,81 @@
+# Flow Matching Action Expert Training Configuration
+#
+# Supervised training for the Expert Transformer + action projections.
+# The VLM is frozen and used only to produce KV-cache conditioning.
+#
+# Run with:
+#   python -m alpamayo_r1.training.train_expert --config-name expert_default
+#
+# Override any value via CLI:
+#   python -m alpamayo_r1.training.train_expert training.num_epochs=5 data.max_samples=100
+
+# Hydra logging — disable Hydra's extra handlers to prevent duplicate log lines
+defaults:
+  - _self_
+  - override hydra/hydra_logging: none
+  - override hydra/job_logging: none
+
+# General
+seed: 42
+model_name: nvidia/Alpamayo-R1-10B
+base_model_name: nvidia/Alpamayo-R1-10B  # used when model_name is a LoRA adapter
+
+# Training hyperparameters
+training:
+  output_dir: outputs/expert
+  num_epochs: 10
+  batch_size: 4                   # scenes per gradient step (each produces num_noisy_samples CFM pairs)
+  num_noisy_samples: 8            # noise samples per GT action (increases batch diversity cheaply)
+  gradient_accumulation_steps: 4
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  logging_steps: 10
+  save_steps: 500
+  save_total_limit: 3
+  bf16: true
+  report_to: tensorboard
+
+# Dataset
+data:
+  split: train
+  t0_us: 5100000
+  max_samples: null               # null = use all; set to int for debugging
+  clip_ids_file: null
+  exclude_clip_ids_file: notebooks/clip_ids.parquet
+  dataset_revision: 05e158af89ba
+  num_dataloader_workers: 2
+
+# VLM forward pass settings (frozen, used for KV-cache conditioning)
+vlm:
+  max_generation_length: 256      # max CoC text tokens for teacher-forced VLM pass
+  use_gt_coc: false               # if true, use GT CoC text (requires annotations); else VLM generates
+
+# Flow matching
+flow_matching:
+  num_train_timesteps: 1000       # discretization for t ~ U(0,1) (continuous sampling used)
+  sigma_min: 0.0                  # minimum noise level (0 = standard OT-CFM)
+
+# LoRA for VLM (applied if model_name points to a LoRA adapter)
+# The VLM is always frozen during expert training — LoRA is only for loading
+# a previously fine-tuned VLM checkpoint.
+lora:
+  enabled: false                  # set true if model_name is a LoRA adapter dir
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+
+# Evaluation
+eval:
+  enabled: true
+  eval_steps: 200                 # evaluate every N training steps
+  eval_split: val
+  eval_max_samples: 50
+  eval_clip_ids_file: null        # defaults to data.exclude_clip_ids_file
+  num_diffusion_eval_steps: 10    # Euler steps for eval-time sampling
