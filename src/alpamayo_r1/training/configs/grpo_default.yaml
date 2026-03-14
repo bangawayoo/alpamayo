@@ -132,3 +132,24 @@ value_head:
   save_path: null      # save value head weights here (null = don't save)
                        # step-numbered checkpoints (e.g. *_step200.pt) are also saved at each interval
   load_path: null      # load pre-trained value head weights at init (null = random init)
+  advantage_enabled: true  # replace GRPO group-mean baseline with value-head advantages
+  segment_level: false     # true = three-level (obs/coc/traj) advantages; false = scene-level only
+  gamma: 1.0              # discount factor for TD/GAE (1.0 for short sequences)
+  gae_lambda: 1.0         # GAE trace decay (1.0 = unbiased MC return minus baseline)
+  traj_mask_ratio: 0.5    # fraction of trajectory token positions to randomly mask in policy loss
+
+# Expert CFM fine-tuning alongside GRPO
+# When enabled, trains the Expert Transformer + ActionInProj + ActionOutProj
+# using a Conditional Flow Matching (CFM) auxiliary loss. The expert learns from
+# the VLM's best rollouts (highest advantage) using a teacher-forced VLM forward
+# pass to produce KV-cache conditioning.
+expert_finetune:
+  enabled: false         # set true to enable expert fine-tuning during GRPO
+  lr: 1e-4               # expert optimizer learning rate
+  weight_decay: 0.01     # AdamW weight decay
+  num_noisy_samples: 4   # noise samples per GT action in CFM loss
+  rollouts_per_step: 1   # number of top-advantage rollouts to train expert on per GRPO step
+  every_n_steps: 1       # compute expert loss every N training steps
+  max_grad_norm: 1.0     # gradient clipping for expert optimizer
+  save_path: null        # save expert weights here (null = don't save separately)
+  load_path: null        # load pre-trained expert weights at init (null = use model defaults)

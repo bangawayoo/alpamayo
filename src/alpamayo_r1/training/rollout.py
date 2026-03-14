@@ -174,6 +174,7 @@ class ClipDataCache:
         entry: dict[str, Any] = {
             "model_inputs": model_inputs_cpu,
             "ego_future_xyz": data["ego_future_xyz"],
+            "ego_future_rot": data["ego_future_rot"],
         }
         if self._cache_pil_images:
             # Convert (N_cameras, num_frames, 3, H, W) → flat list of PIL images
@@ -211,6 +212,19 @@ class ClipDataCache:
             self._cache.move_to_end(key)  # mark as recently used
         cached = self._cache[key]
         return helper.to_device(cached["model_inputs"], device=device), cached["ego_future_xyz"]
+
+    def get_ego_future_rot(self, clip_id: str, t0_us: int) -> torch.Tensor:
+        """Return cached ego_future_rot tensor for a clip.
+
+        Returns:
+            ego_future_rot: shape (1, 1, T_future, 3, 3), CPU tensor.
+        """
+        key = (clip_id, t0_us)
+        if key not in self._cache:
+            self._load_and_cache(clip_id, t0_us)
+        else:
+            self._cache.move_to_end(key)
+        return self._cache[key]["ego_future_rot"]
 
     def get_pil_images(self, clip_id: str, t0_us: int) -> list[Image.Image]:
         """Return cached PIL images for vLLM multimodal generation.
@@ -597,6 +611,40 @@ def prepare_vlm_for_training(full_model: AlpamayoR1) -> None:
         vlm_config_cls._patched_vocab_size = True
 
 
+def _compute_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    gamma: float = 1.0,
+    lam: float = 1.0,
+) -> torch.Tensor:
+    """Compute Generalized Advantage Estimation for a single trajectory.
+
+    Args:
+        rewards: Per-timestep rewards, shape (T,).
+        values: Value estimates at each timestep, shape (T,).
+        gamma: Discount factor.
+        lam: GAE trace decay parameter.
+
+    Returns:
+        Advantages, shape (T,).
+    """
+    T = rewards.shape[0]
+    if T == 0:
+        return torch.zeros(0, device=rewards.device)
+
+    advantages = torch.zeros(T, device=rewards.device)
+    gae = 0.0
+    for t in reversed(range(T)):
+        if t == T - 1:
+            # Terminal: V(s_{T+1}) = 0
+            delta = rewards[t] - values[t]
+        else:
+            delta = rewards[t] + gamma * values[t + 1] - values[t]
+        gae = delta + gamma * lam * gae
+        advantages[t] = gae
+    return advantages
+
+
 class AlpamayoGRPOTrainer(GRPOTrainer):
     """GRPOTrainer subclass with VLM-only rollouts for Alpamayo-R1.
 
@@ -633,6 +681,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         logprob_mini_batch_size: int = 4,
         data_cache_max_size: int = 200,
         value_head_cfg: dict | None = None,
+        expert_finetune_cfg: dict | None = None,
         **kwargs,
     ):
         # Detect vLLM mode from GRPOConfig *before* calling super().__init__,
@@ -677,7 +726,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 avdi, self.processing_class, max_size=data_cache_max_size
             )
 
-        # Value head (optional scene-level baseline)
+        # Value head (optional scene-level or segment-level baseline)
         self.value_head = None
         self.value_optimizer = None
 
@@ -694,19 +743,36 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self._value_pretrain_remaining: int = 0
         self._value_save_path: str | None = None
 
+        # Segment-level value head state
+        self._segment_level: bool = False
+        self._gamma: float = 1.0
+        self._gae_lambda: float = 1.0
+        self._traj_mask_ratio: float = 0.5
+        self._advantage_enabled: bool = True
+        # Segment-level stashes: per-completion hidden states and decomposed rewards
+        self._segment_hidden_stash: list[dict] = []  # {h_obs, h_coc, h_traj, ...}
+        self._segment_reward_stash: list[dict] = []  # {r_coc, r_traj_per_step, r_consistency}
+        # Per-completion metadata for building (B, T) advantages after scoring
+        self._completion_segment_map: list[dict] = []  # {coc_len, traj_len, ...}
+
         _vh_cfg = value_head_cfg or {}
         if _vh_cfg.get("enabled", False):
-            from alpamayo_r1.training.value_head import SceneValueHead
+            from alpamayo_r1.training.value_head import SegmentValueHead
 
             _hidden_dim = int(_vh_cfg.get("hidden_dim", 4096))
             _vh_device = self.accelerator.device
-            self.value_head = SceneValueHead(_hidden_dim).to(_vh_device)
+            self.value_head = SegmentValueHead(_hidden_dim).to(_vh_device)
             self.value_optimizer = torch.optim.Adam(
                 self.value_head.parameters(),
                 lr=float(_vh_cfg.get("lr", 1e-4)),
             )
             self._value_pretrain_remaining = int(_vh_cfg.get("pretrain_steps", 0))
             self._value_save_path = _vh_cfg.get("save_path", None) or None
+            self._segment_level = bool(_vh_cfg.get("segment_level", False))
+            self._gamma = float(_vh_cfg.get("gamma", 1.0))
+            self._gae_lambda = float(_vh_cfg.get("gae_lambda", 1.0))
+            self._traj_mask_ratio = float(_vh_cfg.get("traj_mask_ratio", 0.5))
+            self._advantage_enabled = bool(_vh_cfg.get("advantage_enabled", True))
 
             # Load pre-trained weights if a checkpoint path is provided
             _load_path = _vh_cfg.get("load_path", None) or None
@@ -715,8 +781,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
                 if os.path.isfile(_load_path):
                     state = torch.load(_load_path, map_location=_vh_device)
-                    self.value_head.load_state_dict(state)
-                    logger.info("Loaded SceneValueHead weights from %s", _load_path)
+                    self.value_head.load_state_dict(state, strict=False)
+                    logger.info("Loaded SegmentValueHead weights from %s", _load_path)
                 else:
                     logger.warning(
                         "value_head.load_path=%s not found — starting from random init",
@@ -724,11 +790,89 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     )
 
             logger.info(
-                "SceneValueHead enabled: hidden_dim=%d, lr=%.2e, pretrain_steps=%d, device=%s",
+                "SegmentValueHead enabled: hidden_dim=%d, lr=%.2e, pretrain_steps=%d, "
+                "segment_level=%s, gamma=%.2f, gae_lambda=%.2f, traj_mask_ratio=%.2f, device=%s",
                 _hidden_dim,
                 _vh_cfg.get("lr", 1e-4),
                 self._value_pretrain_remaining,
+                self._segment_level,
+                self._gamma,
+                self._gae_lambda,
+                self._traj_mask_ratio,
                 _vh_device,
+            )
+
+            # Segment-level advantages require hidden state extraction from the
+            # teacher-forced forward pass, which only happens in the HF generation
+            # path.  vLLM generates in a separate engine and never runs this pass.
+            if self._segment_level and use_vllm:
+                raise ValueError(
+                    "value_head.segment_level=true is not compatible with vllm.enabled=true. "
+                    "Segment-level advantages require hidden states from the teacher-forced "
+                    "VLM forward pass, which is only available in the HuggingFace generation path. "
+                    "Disable vLLM or use scene-level (segment_level=false) value head."
+                )
+
+        # Expert CFM fine-tuning (optional)
+        self._expert_finetune_enabled = False
+        self._expert_optimizer = None
+        self._expert_rollout_data: list[dict] = []
+        self._expert_finetune_cfg: dict = {}
+
+        _ef_cfg = expert_finetune_cfg or {}
+        if _ef_cfg.get("enabled", False):
+            self._expert_finetune_enabled = True
+            self._expert_finetune_cfg = _ef_cfg
+
+            # Unfreeze expert + projection params
+            for name, param in full_model.named_parameters():
+                if any(
+                    name.startswith(prefix)
+                    for prefix in ("expert.", "action_in_proj.", "action_out_proj.")
+                ):
+                    param.requires_grad = True
+
+            expert_params = [
+                p
+                for n, p in full_model.named_parameters()
+                if any(
+                    n.startswith(pfx) for pfx in ("expert.", "action_in_proj.", "action_out_proj.")
+                )
+                and p.requires_grad
+            ]
+            self._expert_optimizer = torch.optim.AdamW(
+                expert_params,
+                lr=float(_ef_cfg.get("lr", 1e-4)),
+                weight_decay=float(_ef_cfg.get("weight_decay", 0.01)),
+            )
+
+            # Load pre-trained expert weights if provided
+            _ef_load = _ef_cfg.get("load_path", None) or None
+            if _ef_load is not None:
+                import os
+
+                if os.path.isfile(_ef_load):
+                    state = torch.load(_ef_load, map_location="cpu")
+                    if "expert" in state:
+                        full_model.expert.load_state_dict(state["expert"])
+                    if "action_in_proj" in state:
+                        full_model.action_in_proj.load_state_dict(state["action_in_proj"])
+                    if "action_out_proj" in state:
+                        full_model.action_out_proj.load_state_dict(state["action_out_proj"])
+                    logger.info("Loaded expert weights from %s", _ef_load)
+                else:
+                    logger.warning(
+                        "expert_finetune.load_path=%s not found — using defaults", _ef_load
+                    )
+
+            n_expert_params = sum(p.numel() for p in expert_params)
+            logger.info(
+                "Expert CFM fine-tuning enabled: lr=%.2e, %d trainable params, "
+                "rollouts_per_step=%d, every_n_steps=%d",
+                _ef_cfg.get("lr", 1e-4),
+                n_expert_params,
+                _ef_cfg.get("rollouts_per_step", 1),
+                _ef_cfg.get("every_n_steps", 1),
             )
 
         # Override EOS token so TRL metrics (clipped_ratio, terminated_length)
@@ -819,12 +963,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         super().log(logs, start_time)
 
     def _save(self, output_dir, state_dict=None):
-        """Extend default save to also persist value head weights.
+        """Extend default save to also persist value head and expert weights.
 
         Saves both a step-numbered checkpoint (e.g. ``value_head_step200.pt``)
-        and the fixed ``save_path`` as a "latest" pointer.  This allows
-        stage 0 pre-training to produce a checkpoint per save interval rather
-        than only the final one.
+        and the fixed ``save_path`` as a "latest" pointer.
         """
         super()._save(output_dir, state_dict=state_dict)
 
@@ -835,16 +977,71 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             save_dir = os.path.dirname(os.path.abspath(self._value_save_path))
             os.makedirs(save_dir, exist_ok=True)
 
-            # Always save the fixed "latest" path for backward compatibility
             torch.save(vh_state, self._value_save_path)
             logger.info("Saved SceneValueHead weights to %s", self._value_save_path)
 
-            # Also save a step-numbered checkpoint
             base, ext = os.path.splitext(self._value_save_path)
             step = self.state.global_step
             step_path = f"{base}_step{step}{ext}"
             torch.save(vh_state, step_path)
             logger.info("Saved SceneValueHead checkpoint to %s", step_path)
+
+        if self._expert_finetune_enabled:
+            import os
+
+            expert_save_path = self._expert_finetune_cfg.get("save_path", None) or None
+            # Always save expert checkpoint alongside the VLM checkpoint
+            expert_ckpt = {
+                "expert": self.full_model.expert.state_dict(),
+                "action_in_proj": self.full_model.action_in_proj.state_dict(),
+                "action_out_proj": self.full_model.action_out_proj.state_dict(),
+                "global_step": self.state.global_step,
+            }
+            ckpt_path = os.path.join(output_dir, "expert_checkpoint.pt")
+            torch.save(expert_ckpt, ckpt_path)
+            logger.info("Saved expert checkpoint to %s", ckpt_path)
+
+            if expert_save_path is not None:
+                save_dir = os.path.dirname(os.path.abspath(expert_save_path))
+                os.makedirs(save_dir, exist_ok=True)
+                torch.save(expert_ckpt, expert_save_path)
+                logger.info("Saved expert weights to %s", expert_save_path)
+
+    def _generate_and_score_completions(self, inputs):
+        """Override to inject segment-level (B, T) advantages.
+
+        Delegates to the parent for generation, reward computation, and scalar
+        advantage calculation. When segment_level is enabled and the value head
+        is active, replaces the scalar advantages with per-token segment-level
+        advantages computed via the three-level value head and GAE.
+        """
+        output = super()._generate_and_score_completions(inputs)
+
+        if self.value_head is not None and self._segment_level and self._segment_hidden_stash:
+            completion_mask = output.get("completion_mask")
+            if completion_mask is None:
+                return output
+
+            # Retrieve rewards_per_func from the most recent _calculate_rewards call
+            # (stashed as self._last_rewards_per_func by our override)
+            rewards_per_func = getattr(self, "_last_rewards_per_func", None)
+            if rewards_per_func is None:
+                return output
+
+            num_generations = (
+                self.num_generations if self.model.training else self.num_generations_eval
+            )
+            # Always compute segment advantages (which also trains the value head).
+            # During pretrain, the advantages are computed but NOT injected into the
+            # output — the policy receives the original GRPO advantages.
+            segment_advantages = self._compute_segment_advantages(
+                completion_mask, rewards_per_func, num_generations
+            )
+            is_pretrain = self._value_pretrain_remaining > 0
+            if segment_advantages is not None and self._advantage_enabled and not is_pretrain:
+                output["advantages"] = segment_advantages
+
+        return output
 
     def _generate_single_turn(self, prompts: list):
         """Generate CoC text + discrete trajectory tokens via VLM only.
@@ -864,6 +1061,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         if self.use_vllm:
             return super()._generate_single_turn(prompts)
 
+        # Clear expert rollout data at the start of each new rollout
+        if self._expert_finetune_enabled:
+            self._expert_rollout_data.clear()
+
         # Clear value head stashes at the start of each new rollout
         if self.value_head is not None:
             self._value_pending_groups.clear()
@@ -871,6 +1072,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             self._value_h0_stash.clear()
             self._value_targets_stash.clear()
             self._value_group_sizes_stash.clear()
+            self._segment_hidden_stash.clear()
+            self._segment_reward_stash.clear()
+            self._completion_segment_map.clear()
 
         device = self.accelerator.device
         num_generations = self.num_generations if self.model.training else self.num_generations_eval
@@ -1033,6 +1237,23 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         all_coc_texts.append(coc_text)
                         all_clip_ids.append(clip_id)
 
+                        # Stash rollout metadata for expert CFM training.
+                        # completion_prefix = tokens up to <|traj_future_start|>
+                        # (the expert only needs the reasoning trace as conditioning).
+                        if self._expert_finetune_enabled:
+                            traj_start_id = special_token_ids["traj_future_start"]
+                            try:
+                                prefix_end = raw_completion.index(traj_start_id) + 1
+                            except ValueError:
+                                prefix_end = len(raw_completion)
+                            self._expert_rollout_data.append(
+                                {
+                                    "clip_id": clip_id,
+                                    "t0_us": t0_us,
+                                    "completion_prefix": raw_completion[:prefix_end],
+                                }
+                            )
+
                         # Trajectory data for reward computation
                         pred_traj = pred_xyz_tensor[sample_idx].cpu().numpy().flatten().tolist()
                         gt_traj = ego_future_xyz[0, 0].numpy().flatten().tolist()
@@ -1040,7 +1261,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         all_gt_xyz.append(gt_traj)
 
                     # 7. Compute log-probs via teacher-forced VLM forward (batched)
-                    batch_logprobs = _compute_batch_logprobs(
+                    # When segment-level value head is enabled, piggyback on this
+                    # forward pass to extract hidden states at segment boundaries.
+                    need_hidden = self.value_head is not None and self._segment_level
+                    logprob_result = _compute_batch_logprobs(
                         self.full_model,
                         model_inputs,
                         prompt_input_ids,
@@ -1048,7 +1272,20 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         prompt_len,
                         device,
                         mini_batch_size=self.logprob_mini_batch_size,
+                        output_hidden_states=need_hidden,
                     )
+                    if need_hidden:
+                        batch_logprobs, batch_hidden = logprob_result
+                        # Extract segment-level hidden states for each completion
+                        recent_comp_ids = all_completion_ids[-local_gen_count:]
+                        for comp_idx in range(local_gen_count):
+                            self._extract_and_stash_segment_hidden(
+                                batch_hidden[comp_idx],
+                                recent_comp_ids[comp_idx],
+                                prompt_len,
+                            )
+                    else:
+                        batch_logprobs = logprob_result
                     all_logprobs.extend(batch_logprobs)
 
         extra_fields = {
@@ -1084,6 +1321,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             result = super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
             if self.value_head is not None:
                 self._stash_value_rewards(inputs, completions)
+            self._last_rewards_per_func = result
             return result
 
         # vLLM path: decode trajectory tokens from completion_ids
@@ -1165,7 +1403,394 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         result = super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
         if self.value_head is not None:
             self._stash_value_rewards(inputs, completions)
+        self._last_rewards_per_func = result
         return result
+
+    def _extract_and_stash_segment_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        completion_ids: list[int],
+        prompt_len: int,
+    ) -> None:
+        """Extract hidden states at segment boundaries from teacher-forced pass.
+
+        The hidden_states tensor is a slice of the last VLM layer's output,
+        shape (1, 1+comp_len, D). Index 0 corresponds to the last prompt
+        token (h_obs). Index 1+j corresponds to completion_ids[j] — the
+        j-th completion token (0-indexed).
+
+        Finds <cot_end> and trajectory token positions, extracts h_obs, h_coc,
+        h_traj, and stashes metadata about segment boundaries.
+
+        Args:
+            hidden_states: (1, 1+comp_len, D) CPU float32 tensor. Sliced from
+                full-sequence positions [prompt_len-1 .. prompt_len+comp_len-1].
+            completion_ids: List of completion token IDs.
+            prompt_len: Number of prompt tokens (unused, kept for API clarity).
+        """
+        special_ids = self.full_model.special_token_ids
+        cot_end_id = special_ids["cot_end"]
+        traj_future_start_id = special_ids["traj_future_start"]
+        traj_token_start_idx = self.full_model.future_token_start_idx
+        traj_vocab_size = self.full_model.config.traj_vocab_size
+
+        # hidden_states shape: (1, 1+comp_len, D)
+        # Index 0 = last prompt token = h_obs
+        h_obs = hidden_states[0, 0:1, :]  # (1, D)
+
+        # Find <cot_end> position in completion_ids
+        cot_end_offset = None
+        for idx, tid in enumerate(completion_ids):
+            if tid == cot_end_id:
+                cot_end_offset = idx
+                break
+
+        # h_coc: hidden state at <cot_end> position
+        # In hidden_states, completion position idx maps to hidden_states[0, idx+1]
+        if cot_end_offset is not None:
+            h_coc = hidden_states[0, cot_end_offset + 1 : cot_end_offset + 2, :]  # (1, D)
+        else:
+            h_coc = h_obs  # fallback: use h_obs if no CoC segment
+
+        # Find trajectory token positions
+        traj_positions = []
+        for idx, tid in enumerate(completion_ids):
+            if traj_token_start_idx <= tid < traj_token_start_idx + traj_vocab_size:
+                traj_positions.append(idx)
+
+        if traj_positions:
+            # h_traj: hidden states at each trajectory token position
+            traj_indices = [p + 1 for p in traj_positions]  # +1 for the h_obs offset
+            h_traj = hidden_states[0, traj_indices, :]  # (T_traj, D)
+        else:
+            h_traj = torch.zeros(0, hidden_states.shape[-1])
+
+        # Find traj_future_start position — CoC tokens are between start of completion
+        # and traj_future_start (exclusive of special tokens)
+        traj_start_offset = None
+        for idx, tid in enumerate(completion_ids):
+            if tid == traj_future_start_id:
+                traj_start_offset = idx
+                break
+
+        coc_len = traj_start_offset if traj_start_offset is not None else len(completion_ids)
+        traj_len = len(traj_positions)
+
+        self._segment_hidden_stash.append(
+            {
+                "h_obs": h_obs,  # (1, D)
+                "h_coc": h_coc,  # (1, D)
+                "h_traj": h_traj,  # (T_traj, D)
+            }
+        )
+        self._completion_segment_map.append(
+            {
+                "coc_len": coc_len,
+                "traj_len": traj_len,
+                "traj_positions": traj_positions,
+                "total_len": len(completion_ids),
+            }
+        )
+
+    def _compute_segment_advantages(
+        self,
+        completion_mask: torch.Tensor,
+        rewards_per_func: torch.Tensor,
+        num_generations: int,
+    ) -> torch.Tensor:
+        """Compute (B, T) segment-level advantages using the value head.
+
+        For each completion:
+        - CoC tokens get: A_coc = w_reason * R_reasoning + gamma * V(s_coc) - V(s_obs)
+        - Trajectory tokens get: A_traj_t via GAE(gamma, lambda) on per-timestep rewards
+        - Random masking of trajectory positions to balance gradient contribution
+
+        Also trains the value head on the three-level targets and logs metrics.
+
+        Args:
+            completion_mask: (B, T) binary mask for valid completion tokens.
+            rewards_per_func: (B, num_reward_funcs) per-function rewards.
+            num_generations: G generations per prompt.
+
+        Returns:
+            (B, T) advantage tensor on the same device as completion_mask.
+        """
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        device = completion_mask.device
+        B, T = completion_mask.shape
+        advantages = torch.zeros(B, T, device=device)
+
+        if not self._segment_hidden_stash or len(self._segment_hidden_stash) != B:
+            logger.warning(
+                "Segment hidden stash size %d != batch size %d — falling back to scalar advantage",
+                len(self._segment_hidden_stash),
+                B,
+            )
+            return None
+
+        # Reward function order must match train_grpo.py:
+        #   index 0 = trajectory_quality_reward
+        #   index 1 = reasoning_quality_reward
+        #   index 2 = consistency_reward
+        # The weights below are unpacked in the same order.
+        if rewards_per_func.shape[1] < 2:
+            logger.warning(
+                "rewards_per_func has %d columns, need at least 2 — falling back",
+                rewards_per_func.shape[1],
+            )
+            return None
+        w_traj, w_reason, w_consist = self._value_reward_weights
+        mode = "train" if self.model.training else "eval"
+        vh_device = next(self.value_head.parameters()).device
+
+        # Collect segment-level value targets and train the value head
+        all_v_obs = []
+        all_v_coc = []
+        all_v_traj = []  # list of (T_traj,) tensors
+        all_g_obs = []
+        all_g_coc = []
+        all_g_traj = []  # list of (T_traj,) tensors
+
+        for i in range(B):
+            seg = self._segment_hidden_stash[i]
+            seg_map = self._completion_segment_map[i]
+
+            h_obs = seg["h_obs"].to(vh_device)  # (1, D)
+            h_coc = seg["h_coc"].to(vh_device)  # (1, D)
+            h_traj = seg["h_traj"].to(vh_device)  # (T_traj, D)
+
+            # Value predictions (detached for advantage computation, will backprop in training)
+            with torch.no_grad():
+                v_obs = self.value_head(h_obs, level=SegmentValueHead.LEVEL_OBS)  # (1,)
+                v_coc = self.value_head(h_coc, level=SegmentValueHead.LEVEL_COC)  # (1,)
+                if h_traj.shape[0] > 0:
+                    v_traj = self.value_head(
+                        h_traj.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ
+                    ).squeeze(0)  # (T_traj,)
+                else:
+                    v_traj = torch.zeros(0, device=vh_device)
+
+            # Per-function rewards for this sample
+            r_traj_scalar = rewards_per_func[i, 0].item()  # trajectory
+            r_reason = rewards_per_func[i, 1].item()  # reasoning
+            r_consist = rewards_per_func[i, 2].item() if rewards_per_func.shape[1] > 2 else 0.0
+
+            # Compute per-timestep trajectory rewards if we have stashed data
+            T_traj = seg_map["traj_len"]
+            if T_traj > 0 and i < len(self._segment_reward_stash):
+                seg_rew = self._segment_reward_stash[i]
+                r_per_step = seg_rew.get("r_traj_per_step")
+                if r_per_step is not None and len(r_per_step) == T_traj:
+                    r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32, device=vh_device)
+                else:
+                    # Uniform fallback
+                    r_per_step_t = torch.full(
+                        (T_traj,), w_traj * r_traj_scalar / max(T_traj, 1), device=vh_device
+                    )
+                # Apply weight and add consistency as terminal reward
+                r_traj_weighted = w_traj * r_per_step_t
+                r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
+            elif T_traj > 0:
+                # No per-step stash — uniform
+                r_traj_weighted = torch.full(
+                    (T_traj,), w_traj * r_traj_scalar / max(T_traj, 1), device=vh_device
+                )
+                r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
+            else:
+                r_traj_weighted = torch.zeros(0, device=vh_device)
+
+            # --- Value targets (returns-to-go) ---
+            traj_total = r_traj_weighted.sum().item() if T_traj > 0 else 0.0
+            g_obs = w_reason * r_reason + traj_total  # total return
+            g_coc = traj_total  # remaining after CoC
+
+            all_g_obs.append(g_obs)
+            all_g_coc.append(g_coc)
+            all_v_obs.append(v_obs.item())
+            all_v_coc.append(v_coc.item())
+
+            # Per-timestep return-to-go for trajectory tokens
+            if T_traj > 0:
+                g_traj = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
+                all_g_traj.append(g_traj.cpu())
+                all_v_traj.append(v_traj.cpu())
+            else:
+                all_g_traj.append(torch.zeros(0))
+                all_v_traj.append(torch.zeros(0))
+
+            # --- Advantage computation ---
+            # CoC advantage: TD step spanning the entire reasoning segment
+            a_coc = w_reason * r_reason + self._gamma * v_coc.item() - v_obs.item()
+
+            # Trajectory advantages: GAE(gamma, lambda)
+            if T_traj > 0:
+                a_traj = _compute_gae(r_traj_weighted, v_traj, self._gamma, self._gae_lambda)
+
+                # Random masking of trajectory positions
+                if self._traj_mask_ratio > 0 and self.model.training:
+                    mask = torch.rand(T_traj, device=device) > self._traj_mask_ratio
+                    # Always keep at least one traj position
+                    if not mask.any():
+                        mask[0] = True
+                    a_traj_masked = a_traj.to(device) * mask.float()
+                else:
+                    a_traj_masked = a_traj.to(device)
+            else:
+                a_traj_masked = torch.zeros(0, device=device)
+
+            # Fill the (B, T) advantage tensor
+            coc_len = seg_map["coc_len"]
+            traj_positions = seg_map["traj_positions"]
+
+            # CoC tokens: positions 0..coc_len-1
+            if coc_len > 0 and coc_len <= T:
+                advantages[i, :coc_len] = a_coc
+
+            # Trajectory tokens: at their specific positions
+            for t_idx, pos in enumerate(traj_positions):
+                if pos < T and t_idx < len(a_traj_masked):
+                    advantages[i, pos] = a_traj_masked[t_idx]
+
+        # --- Train value head on all three levels ---
+        self._train_segment_value_head(
+            all_v_obs,
+            all_v_coc,
+            all_v_traj,
+            all_g_obs,
+            all_g_coc,
+            all_g_traj,
+        )
+
+        # --- Log metrics ---
+        n_stashed = len(self._segment_reward_stash)
+        if B > 0 and n_stashed >= B:
+            coc_advs = [
+                self._value_reward_weights[1] * self._segment_reward_stash[i].get("r_reason", 0)
+                + self._gamma * all_v_coc[i]
+                - all_v_obs[i]
+                for i in range(B)
+            ]
+            self._metrics[mode]["advantages/coc_mean"].append(float(np.mean(coc_advs)))
+        elif B > 0:
+            # Fallback: log from computed advantages directly
+            self._metrics[mode]["advantages/coc_mean"].append(0.0)
+        if any(m["traj_len"] > 0 for m in self._completion_segment_map):
+            traj_adv_vals = []
+            for i in range(B):
+                traj_pos = self._completion_segment_map[i]["traj_positions"]
+                for pos in traj_pos:
+                    if pos < T:
+                        traj_adv_vals.append(advantages[i, pos].item())
+            if traj_adv_vals:
+                self._metrics[mode]["advantages/traj_mean"].append(float(np.mean(traj_adv_vals)))
+
+        self._metrics[mode]["advantages/mean"].append(
+            advantages[completion_mask.bool()].mean().item() if completion_mask.any() else 0.0
+        )
+        self._metrics[mode]["advantages/std"].append(
+            advantages[completion_mask.bool()].std().item() if completion_mask.sum() > 1 else 0.0
+        )
+        self._metrics[mode]["advantages/v_baseline_mean"].append(float(np.mean(all_v_obs)))
+
+        return advantages
+
+    def _train_segment_value_head(
+        self,
+        all_v_obs: list[float],
+        all_v_coc: list[float],
+        all_v_traj: list[torch.Tensor],
+        all_g_obs: list[float],
+        all_g_coc: list[float],
+        all_g_traj: list[torch.Tensor],
+    ) -> None:
+        """Train the value head on all three levels jointly.
+
+        Uses per-completion targets for obs and coc levels, and sub-samples
+        trajectory tokens to prevent them from dominating the loss.
+        """
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        B = len(all_g_obs)
+        if B == 0:
+            return
+
+        vh_device = next(self.value_head.parameters()).device
+        mode = "train" if self.model.training else "eval"
+
+        # Obs-level loss: train on per-completion (h_obs, g_obs) pairs
+        obs_preds = []
+        obs_targets = []
+        for i in range(B):
+            h_obs = self._segment_hidden_stash[i]["h_obs"].to(vh_device)
+            v = self.value_head(h_obs, level=SegmentValueHead.LEVEL_OBS)
+            obs_preds.append(v)
+            obs_targets.append(all_g_obs[i])
+
+        obs_pred_t = torch.cat(obs_preds)
+        obs_target_t = torch.tensor(obs_targets, device=vh_device, dtype=torch.float32)
+        loss_obs = F.mse_loss(obs_pred_t, obs_target_t)
+
+        # CoC-level loss
+        coc_preds = []
+        coc_targets = []
+        for i in range(B):
+            h_coc = self._segment_hidden_stash[i]["h_coc"].to(vh_device)
+            v = self.value_head(h_coc, level=SegmentValueHead.LEVEL_COC)
+            coc_preds.append(v)
+            coc_targets.append(all_g_coc[i])
+
+        coc_pred_t = torch.cat(coc_preds)
+        coc_target_t = torch.tensor(coc_targets, device=vh_device, dtype=torch.float32)
+        loss_coc = F.mse_loss(coc_pred_t, coc_target_t)
+
+        # Traj-level loss: sub-sample to avoid dominating
+        traj_preds = []
+        traj_targets = []
+        max_traj_samples = max(B * 2, 16)  # limit traj samples relative to obs+coc
+        total_traj = 0
+
+        for i in range(B):
+            h_traj = self._segment_hidden_stash[i]["h_traj"]  # (T_traj, D)
+            g_traj = all_g_traj[i]  # (T_traj,)
+            if h_traj.shape[0] == 0:
+                continue
+            T_t = h_traj.shape[0]
+            # Sub-sample
+            n_keep = min(T_t, max(1, max_traj_samples - total_traj))
+            if n_keep < T_t:
+                indices = torch.randperm(T_t)[:n_keep]
+                h_sub = h_traj[indices].to(vh_device)
+                g_sub = g_traj[indices].to(vh_device)
+            else:
+                h_sub = h_traj.to(vh_device)
+                g_sub = g_traj.to(vh_device)
+            v = self.value_head(h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ).squeeze(0)
+            traj_preds.append(v)
+            traj_targets.append(g_sub)
+            total_traj += n_keep
+
+        if traj_preds:
+            traj_pred_t = torch.cat(traj_preds)
+            traj_target_t = torch.cat(traj_targets)
+            loss_traj = F.mse_loss(traj_pred_t, traj_target_t)
+        else:
+            loss_traj = torch.tensor(0.0, device=vh_device)
+
+        # Combined loss (equal weight for now)
+        total_loss = (loss_obs + loss_coc + loss_traj) / 3.0
+
+        self.value_optimizer.zero_grad()
+        total_loss.backward()
+        self.value_optimizer.step()
+
+        # Log per-level losses
+        self._metrics[mode]["value_head/loss"].append(total_loss.item())
+        self._metrics[mode]["value_head/loss_obs"].append(loss_obs.item())
+        self._metrics[mode]["value_head/loss_coc"].append(loss_coc.item())
+        self._metrics[mode]["value_head/loss_traj"].append(loss_traj.item())
+        self._metrics[mode]["value_head/pred_mean"].append(obs_pred_t.detach().mean().item())
+        self._metrics[mode]["value_head/target_mean"].append(obs_target_t.mean().item())
 
     def _stash_value_rewards(self, inputs: list[dict], completions: list[str]) -> None:
         """Compute composite rewards and stash them for value head training.
@@ -1175,6 +1800,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         into a Monte Carlo target ``V_mc = mean(rewards)`` and flushed to the
         ready stash as a single ``(h0, V_mc)`` pair.
 
+        When segment_level is enabled, also decomposes trajectory rewards into
+        per-timestep values and stashes them for segment-level advantage computation.
+
         Args:
             inputs: Per-sample input dicts (must have pred_xyz and gt_xyz populated).
             completions: CoC text strings, one per sample.
@@ -1182,6 +1810,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         from alpamayo_r1.training.rewards import (
             consistency_reward,
             reasoning_quality_reward,
+            trajectory_per_timestep_rewards,
             trajectory_quality_reward,
         )
 
@@ -1196,6 +1825,25 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         for rt, rr, rc in zip(r_traj, r_reason, r_consist):
             composite = w_traj * rt + w_reason * rr + w_consist * rc
             self._value_pending_rewards.append(composite)
+
+        # Stash per-timestep trajectory rewards for segment-level advantages
+        if self._segment_level:
+            for i in range(len(completions)):
+                pred_flat = pred_xyz_list[i]
+                gt_flat = gt_xyz_list[i]
+                r_per_step = None
+                if pred_flat is not None and gt_flat is not None:
+                    r_per_step_arr = trajectory_per_timestep_rewards(pred_flat, gt_flat)
+                    if r_per_step_arr is not None:
+                        r_per_step = r_per_step_arr.tolist()
+                self._segment_reward_stash.append(
+                    {
+                        "r_reason": r_reason[i],
+                        "r_consistency": r_consist[i],
+                        "r_traj_scalar": r_traj[i],
+                        "r_traj_per_step": r_per_step,
+                    }
+                )
 
         self._flush_value_pending()
 
@@ -1292,36 +1940,266 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             n,
         )
 
+    def _get_vlm_kv_cache_teacher_forced(
+        self,
+        model_inputs: dict,
+        completion_prefix: list[int],
+        device: torch.device,
+    ) -> tuple:
+        """Run a teacher-forced VLM forward on prompt + CoC reasoning to get KV cache.
+
+        Unlike ``get_vlm_kv_cache`` in train_expert.py which uses autoregressive
+        generation, this runs a single non-autoregressive forward pass on already-known
+        tokens — faster, FSDP-compatible, and uses the current LoRA state.
+
+        Args:
+            model_inputs: Dict from ClipDataCache with tokenized_data, ego_history_*.
+            completion_prefix: Token IDs of the generated CoC text (up to and including
+                ``<|traj_future_start|>``).
+            device: Compute device.
+
+        Returns:
+            (past_key_values, rope_deltas, prefill_seq_len, b_star, offset)
+        """
+        tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
+        input_ids = tokenized.pop("input_ids").to(device)
+
+        # Fuse history trajectory tokens
+        traj_data = {
+            "ego_history_xyz": model_inputs["ego_history_xyz"].to(device),
+            "ego_history_rot": model_inputs["ego_history_rot"].to(device),
+        }
+        input_ids = self.full_model.fuse_traj_tokens(input_ids, traj_data)
+
+        # Concatenate prompt + completion prefix tokens
+        prefix_tensor = torch.tensor(completion_prefix, dtype=torch.long, device=device).unsqueeze(
+            0
+        )
+        full_ids = torch.cat([input_ids, prefix_tensor], dim=1)  # (1, L_prompt + L_prefix)
+
+        # Build attention mask for the full sequence
+        for k, v in tokenized.items():
+            if isinstance(v, torch.Tensor):
+                tokenized[k] = v.to(device)
+
+        if "attention_mask" in tokenized:
+            orig_mask = tokenized["attention_mask"]
+            prefix_mask = torch.ones(
+                1, len(completion_prefix), device=device, dtype=orig_mask.dtype
+            )
+            tokenized["attention_mask"] = torch.cat([orig_mask, prefix_mask], dim=1)
+
+        # GradientCheckpointingLayer.__call__() overrides use_cache=False
+        # when BOTH `self.gradient_checkpointing` AND `self.training` are True.
+        # Switching to eval mode is the simplest way to bypass this — safe here
+        # because we run under torch.no_grad() and only need the KV cache.
+        vlm = self.full_model.vlm
+        was_training = vlm.training
+        vlm.eval()
+
+        try:
+            with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
+                outputs = vlm(
+                    input_ids=full_ids,
+                    use_cache=True,
+                    **tokenized,
+                )
+        finally:
+            if was_training:
+                vlm.train()
+
+        past_key_values = outputs.past_key_values
+        if past_key_values is None:
+            raise RuntimeError(
+                "VLM forward returned past_key_values=None. "
+                "Gradient checkpointing may not have been disabled properly."
+            )
+        rope_deltas = self.full_model.vlm.model.rope_deltas
+        prefill_seq_len = past_key_values.get_seq_length()
+        b_star = 1
+
+        # Offset: position after the last token (where expert tokens would begin)
+        offset = torch.tensor([full_ids.shape[1]], device=device)
+
+        return past_key_values, rope_deltas, prefill_seq_len, b_star, offset
+
+    def _expert_cfm_step(self, inputs: dict) -> None:
+        """One expert CFM training step using top-advantage rollouts.
+
+        Selects the highest-advantage rollouts from the current batch, runs a
+        teacher-forced VLM forward to get KV cache conditioning, converts GT
+        trajectory to action space, computes CFM loss, and updates expert params.
+        """
+        if not self._expert_rollout_data:
+            logger.debug("No expert rollout data — skipping expert CFM step")
+            return
+
+        cfg = self._expert_finetune_cfg
+        rollouts_per_step = int(cfg.get("rollouts_per_step", 1))
+        num_noisy_samples = int(cfg.get("num_noisy_samples", 4))
+        max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
+
+        device = self.accelerator.device
+
+        # Get advantages from the current batch and pick top-K
+        advantages = inputs.get("advantages", None)
+        if advantages is None:
+            logger.debug("No advantages in inputs — skipping expert CFM step")
+            return
+
+        # advantages is a tensor of shape (batch_size,)
+        if isinstance(advantages, torch.Tensor):
+            adv_values = advantages.detach().cpu().tolist()
+        else:
+            adv_values = list(advantages)
+
+        n_rollouts = min(len(adv_values), len(self._expert_rollout_data))
+        if n_rollouts == 0:
+            return
+
+        # Rank by advantage (descending) and pick top-K
+        sorted_indices = sorted(range(n_rollouts), key=lambda i: adv_values[i], reverse=True)
+        top_k = sorted_indices[:rollouts_per_step]
+
+        from alpamayo_r1.training.train_expert import compute_cfm_loss
+
+        # Move expert + projections to GPU
+        self.full_model.expert.to(device)
+        self.full_model.action_in_proj.to(device)
+        self.full_model.action_out_proj.to(device)
+        self.full_model.action_space.to(device)
+
+        total_loss = 0.0
+        n_valid = 0
+        self._expert_optimizer.zero_grad()
+
+        for idx in top_k:
+            rollout_info = self._expert_rollout_data[idx]
+            clip_id = rollout_info["clip_id"]
+            t0_us = rollout_info["t0_us"]
+            completion_prefix = rollout_info["completion_prefix"]
+
+            try:
+                # Load scene data from cache
+                model_inputs, ego_future_xyz = self._data_cache.get(clip_id, t0_us, device)
+                ego_future_rot = self._data_cache.get_ego_future_rot(clip_id, t0_us).to(device)
+
+                # Teacher-forced VLM forward → KV cache
+                kv_result = self._get_vlm_kv_cache_teacher_forced(
+                    model_inputs, completion_prefix, device
+                )
+                prompt_cache, rope_deltas, prefill_seq_len, b_star, offset = kv_result
+
+                # Convert GT trajectory to action space.
+                # ego_history_*: (1, N_cameras, T, ...) — take last camera
+                # ego_future_*: (1, 1, T, ...) from load_physical_aiavdataset
+                hist_xyz = model_inputs["ego_history_xyz"][:, -1].to(device)  # (1, T, 3)
+                hist_rot = model_inputs["ego_history_rot"][:, -1].to(device)  # (1, T, 3, 3)
+                fut_xyz = ego_future_xyz.to(device)[:, -1]  # (1, T, 3)
+                fut_rot = ego_future_rot[:, -1]  # (1, T, 3, 3), already on device
+
+                with torch.no_grad():
+                    gt_action = self.full_model.action_space.traj_to_action(
+                        hist_xyz, hist_rot, fut_xyz, fut_rot
+                    )  # (1, T_future, 2)
+
+                # Compute CFM loss
+                with torch.autocast(str(device), dtype=torch.bfloat16):
+                    loss = compute_cfm_loss(
+                        model=self.full_model,
+                        gt_action=gt_action,
+                        prompt_cache=prompt_cache,
+                        rope_deltas=rope_deltas,
+                        prefill_seq_len=prefill_seq_len,
+                        b_star=b_star,
+                        offset=offset,
+                        num_noisy_samples=num_noisy_samples,
+                        device=device,
+                    )
+                    loss = loss / rollouts_per_step  # average over top-K
+
+                loss.backward()
+                total_loss += loss.item()
+                n_valid += 1
+
+            except Exception as e:
+                logger.warning("Expert CFM step failed for %s: %s", clip_id, e)
+                continue
+
+        if n_valid > 0:
+            # Clip gradients and step
+            expert_params = [
+                p
+                for n, p in self.full_model.named_parameters()
+                if any(
+                    n.startswith(pfx) for pfx in ("expert.", "action_in_proj.", "action_out_proj.")
+                )
+                and p.requires_grad
+            ]
+            torch.nn.utils.clip_grad_norm_(expert_params, max_grad_norm)
+            self._expert_optimizer.step()
+
+            # Log metrics
+            mode = "train" if self.model.training else "eval"
+            self._metrics[mode]["expert_cfm/loss"].append(total_loss)
+            self._metrics[mode]["expert_cfm/valid_rollouts"].append(float(n_valid))
+            logger.debug(
+                "expert CFM step | loss=%.6f valid_rollouts=%d/%d",
+                total_loss,
+                n_valid,
+                rollouts_per_step,
+            )
+
+        # Move expert + projections back to CPU to save GPU memory
+        self.full_model.expert.cpu()
+        self.full_model.action_in_proj.cpu()
+        self.full_model.action_out_proj.cpu()
+        self.full_model.action_space.cpu()
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Override to train value head alongside (or instead of) the GRPO policy loss.
+        """Override to train value head and/or expert CFM alongside the GRPO policy loss.
 
-        **Stage 0** (``_value_pretrain_remaining > 0``): only the value head
+        **Value head stage 0** (``_value_pretrain_remaining > 0``): only the value head
         trains.  The policy loss is replaced by a zero scalar so the VLM
-        receives no gradient.  The expensive GRPO forward pass is skipped
-        entirely for efficiency.  The counter decrements each call.
+        receives no gradient.
 
-        **Stage 1** (``_value_pretrain_remaining == 0``): normal GRPO plus a
+        **Value head stage 1** (``_value_pretrain_remaining == 0``): normal GRPO plus a
         value head update from the stash.
 
-        When the value head is disabled, delegates to the parent unchanged.
+        **Expert CFM**: When enabled, runs ``_expert_cfm_step()`` every
+        ``every_n_steps`` training steps. This is independent of the GRPO loss —
+        the expert has its own optimizer and gradients are isolated.
         """
-        if self.value_head is None:
+        # Expert CFM step (runs before GRPO to not interfere with policy gradients)
+        if self._expert_finetune_enabled:
+            every_n = int(self._expert_finetune_cfg.get("every_n_steps", 1))
+            if self.state.global_step % every_n == 0:
+                try:
+                    self._expert_cfm_step(inputs)
+                except Exception as e:
+                    logger.warning(
+                        "Expert CFM step failed at step %d: %s", self.state.global_step, e
+                    )
+
+        if self.value_head is None and not self._expert_finetune_enabled:
             return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
 
-        batch_size = inputs["input_ids"].shape[0] if "input_ids" in inputs else 1
-        self._train_value_head_step(batch_size)
+        if self.value_head is not None:
+            # Segment-level training happens in _compute_segment_advantages,
+            # so only do scene-level _train_value_head_step when NOT in segment mode.
+            if not self._segment_level:
+                batch_size = inputs["input_ids"].shape[0] if "input_ids" in inputs else 1
+                self._train_value_head_step(batch_size)
 
-        # Stage 0: skip GRPO policy update
-        if self._value_pretrain_remaining > 0:
-            self._value_pretrain_remaining -= 1
-            # Build a zero-valued loss that still touches the DDP-wrapped model
-            # parameters, so DDP's allreduce backward hooks fire on every rank.
-            zero_loss = 0.0 * sum(p.sum() for p in model.parameters() if p.requires_grad)
-            if return_outputs:
-                return zero_loss, None
-            return zero_loss
+            # Stage 0: skip GRPO policy update
+            if self._value_pretrain_remaining > 0:
+                self._value_pretrain_remaining -= 1
+                zero_loss = 0.0 * sum(p.sum() for p in model.parameters() if p.requires_grad)
+                if return_outputs:
+                    return zero_loss, None
+                return zero_loss
 
-        # Stage 1: normal GRPO
+        # Normal GRPO policy loss
         return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
 
 
@@ -1333,12 +2211,16 @@ def _compute_batch_logprobs(
     prompt_len: int,
     device: torch.device,
     mini_batch_size: int = 4,
-) -> list[list[float]]:
+    output_hidden_states: bool = False,
+) -> list[list[float]] | tuple[list[list[float]], list[torch.Tensor]]:
     """Compute per-token log-probs for a batch of completions.
 
     Processes completions in groups of ``mini_batch_size`` to reduce the number
     of VLM forward passes (e.g. 2 passes for 8 completions with batch size 4,
     vs 8 serial passes in the original implementation).
+
+    When ``output_hidden_states=True``, also returns the last-layer hidden
+    states for each completion (extracted and moved to CPU immediately).
 
     Args:
         full_model: The full AlpamayoR1 model.
@@ -1348,11 +2230,19 @@ def _compute_batch_logprobs(
         prompt_len: Number of prompt tokens.
         device: CUDA device.
         mini_batch_size: Number of completions to process per forward pass.
+        output_hidden_states: If True, also return per-completion hidden states.
 
     Returns:
-        List of per-token log-prob lists, one per completion.
+        If output_hidden_states is False:
+            List of per-token log-prob lists, one per completion.
+        If output_hidden_states is True:
+            Tuple of (logprobs_list, hidden_states_list) where hidden_states_list
+            contains one (1, L_completion, D) CPU float32 tensor per completion
+            (with positions relative to the full [prompt + completion] sequence,
+            sliced to only the completion portion plus the last prompt token).
     """
     results: list[list[float]] = []
+    hidden_results: list[torch.Tensor] = []
     tokenized = model_inputs["tokenized_data"]
 
     for batch_start in range(0, len(completion_ids_list), mini_batch_size):
@@ -1398,7 +2288,11 @@ def _compute_batch_logprobs(
             forward_kwargs["image_grid_thw"] = igt.repeat(B, 1)
 
         with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
-            outputs = full_model.vlm(input_ids=full_ids, **forward_kwargs)
+            outputs = full_model.vlm(
+                input_ids=full_ids,
+                output_hidden_states=output_hidden_states,
+                **forward_kwargs,
+            )
 
         # Extract per-token log-probs for each completion in the mini-batch.
         # Logits at position t predict token t+1, so completion tokens at
@@ -1407,6 +2301,8 @@ def _compute_batch_logprobs(
         for i, (comp_ids, comp_len) in enumerate(zip(batch_comp_ids, comp_lens)):
             if not comp_ids:
                 results.append([])
+                if output_hidden_states:
+                    hidden_results.append(torch.zeros(1, 0, 1))
                 continue
             logits = outputs.logits[i, prompt_len - 1 : prompt_len - 1 + comp_len]
             log_probs = F.log_softmax(logits.float(), dim=-1)
@@ -1414,6 +2310,14 @@ def _compute_batch_logprobs(
             token_log_probs = log_probs.gather(1, comp_target.unsqueeze(-1)).squeeze(-1)
             results.append(token_log_probs.cpu().tolist())
 
+            if output_hidden_states:
+                # Extract last-layer hidden states: include last prompt token + completion
+                # positions [prompt_len-1 .. prompt_len-1+comp_len]
+                hs = outputs.hidden_states[-1][i, prompt_len - 1 : prompt_len + comp_len]
+                hidden_results.append(hs.float().cpu().unsqueeze(0))  # (1, 1+comp_len, D)
+
+    if output_hidden_states:
+        return results, hidden_results
     return results
 
 

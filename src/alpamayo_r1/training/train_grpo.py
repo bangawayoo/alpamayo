@@ -307,6 +307,7 @@ def main(cfg: DictConfig) -> None:
         logprob_mini_batch_size=int(rollout_cfg.get("logprob_mini_batch_size", 4)),
         data_cache_max_size=int(rollout_cfg.get("data_cache_max_size", 200)),
         value_head_cfg=dict(cfg.get("value_head", {})),
+        expert_finetune_cfg=dict(cfg.get("expert_finetune", {})),
     )
 
     # Rollout logging callback (CoC text + BEV trajectory plots to TensorBoard)
