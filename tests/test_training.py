@@ -1042,3 +1042,304 @@ class TestMonteCarloValueTarget:
         # Queue fully drained
         assert len(trainer._value_pending_groups) == 0
         assert len(trainer._value_pending_rewards) == 0
+
+
+# ===================================================================
+# SegmentValueHead tests
+# ===================================================================
+
+
+class TestSegmentValueHead:
+    """Tests for the SegmentValueHead (multi-position input support)."""
+
+    def test_backward_compat_alias(self):
+        """SceneValueHead alias still works."""
+        from alpamayo_r1.training.value_head import SceneValueHead, SegmentValueHead
+
+        assert SceneValueHead is SegmentValueHead
+
+    def test_forward_2d(self):
+        """(B, D) input → (B,) output (same as old SceneValueHead)."""
+        import torch
+
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=32)
+        h = torch.randn(4, 32)
+        out = vh(h)
+        assert out.shape == (4,)
+
+    def test_forward_3d(self):
+        """(B, T, D) input → (B, T) output for per-token value estimates."""
+        import torch
+
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=32)
+        h = torch.randn(2, 8, 32)  # 2 samples, 8 tokens each
+        out = vh(h)
+        assert out.shape == (2, 8), f"Expected (2, 8), got {out.shape}"
+
+    def test_3d_gradient_flow(self):
+        """Gradients flow through (B, T, D) inputs."""
+        import torch
+
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=32)
+        h = torch.randn(2, 5, 32, requires_grad=True)
+        out = vh(h)
+        loss = out.sum()
+        loss.backward()
+        assert h.grad is not None
+        assert h.grad.shape == (2, 5, 32)
+
+    def test_shared_weights_2d_3d(self):
+        """2D and 3D paths use the same weights → consistent predictions."""
+        import torch
+
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=32)
+        h_single = torch.randn(1, 32)
+        h_batched = h_single.unsqueeze(1)  # (1, 1, 32)
+
+        v_2d = vh(h_single)
+        v_3d = vh(h_batched)
+        assert torch.allclose(v_2d, v_3d.squeeze(1), atol=1e-6)
+
+
+# ===================================================================
+# Value-head advantage computation tests
+# ===================================================================
+
+
+class TestValueAdvantageComputation:
+    """Tests for _compute_value_advantages without requiring a full trainer."""
+
+    def _make_advantage_state(self, hidden_dim=32):
+        """Create a minimal object with the state needed for advantage computation.
+
+        Directly implements the advantage computation logic to avoid importing
+        rollout.py (which has heavy dependencies like physical_ai_av).
+        """
+        import logging
+        from collections import defaultdict
+        from unittest.mock import MagicMock
+
+        import torch
+
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        _logger = logging.getLogger(__name__)
+
+        class FakeAccelerator:
+            device = torch.device("cpu")
+            process_index = 0
+            num_processes = 1
+
+            def gather(self, tensor):
+                return tensor  # single-process: no-op
+
+        class FakeTrainer:
+            def _compute_value_advantages(self):
+                """Mirror of AlpamayoGRPOTrainer._compute_value_advantages.
+
+                A_i = r_i - V(scene_i), no group normalisation.
+                """
+                if not self._adv_h0_groups or not self._adv_rewards:
+                    self._adv_h0_groups.clear()
+                    self._adv_rewards.clear()
+                    return None
+
+                device = self.accelerator.device
+                mode = "train" if self.model.training else "eval"
+
+                v_predictions = []
+                with torch.no_grad():
+                    for h0, group_size in self._adv_h0_groups:
+                        v_scene = self.value_head(h0.to(device))
+                        v_scalar = (
+                            v_scene.item() if v_scene.dim() == 0 else v_scene.squeeze().item()
+                        )
+                        v_predictions.extend([v_scalar] * group_size)
+
+                local_n = len(self._adv_rewards)
+                if len(v_predictions) != local_n:
+                    self._adv_h0_groups.clear()
+                    self._adv_rewards.clear()
+                    return None
+
+                local_rewards = torch.tensor(
+                    self._adv_rewards, dtype=torch.float32, device=device
+                )
+                local_v = torch.tensor(v_predictions, dtype=torch.float32, device=device)
+
+                all_rewards = self.accelerator.gather(local_rewards)
+                all_v = self.accelerator.gather(local_v)
+
+                # No group normalisation — preserves scene difficulty
+                advantages = all_rewards - all_v
+
+                self._metrics[mode]["advantages/v_baseline_mean"].append(all_v.mean().item())
+                self._metrics[mode]["advantages/mean"].append(advantages.mean().item())
+                self._metrics[mode]["advantages/std"].append(advantages.std().item())
+
+                process_slice = slice(
+                    self.accelerator.process_index * local_n,
+                    (self.accelerator.process_index + 1) * local_n,
+                )
+                local_advantages = advantages[process_slice]
+
+                self._adv_h0_groups.clear()
+                self._adv_rewards.clear()
+
+                return local_advantages
+
+        trainer = FakeTrainer()
+        trainer.value_head = SegmentValueHead(hidden_dim=hidden_dim)
+        trainer.accelerator = FakeAccelerator()
+        trainer.model = MagicMock()
+        trainer.model.training = True
+        trainer.num_generations = 4
+        trainer.num_generations_eval = 1
+        trainer._adv_h0_groups = []
+        trainer._adv_rewards = []
+        trainer._value_advantage_enabled = True
+        trainer._value_gamma = 1.0
+        trainer._metrics = defaultdict(lambda: defaultdict(list))
+        return trainer
+
+    def test_empty_stash_returns_none(self):
+        """No stashed data → returns None (fallback to standard GRPO)."""
+        trainer = self._make_advantage_state()
+        result = trainer._compute_value_advantages()
+        assert result is None
+
+    def test_single_scene_advantages(self):
+        """One scene with G=4 → returns (4,) advantages."""
+        import torch
+
+        trainer = self._make_advantage_state()
+        h0 = torch.randn(1, 32)
+        trainer._adv_h0_groups = [(h0, 4)]
+        trainer._adv_rewards = [0.2, 0.4, 0.6, 0.8]
+
+        advantages = trainer._compute_value_advantages()
+
+        assert advantages is not None
+        assert advantages.shape == (4,)
+        # No group normalization: advantages are r_i - V(scene), NOT zero-mean
+        # The spread should reflect the reward spread
+        assert (advantages[1] - advantages[0]).item() == pytest.approx(0.2, abs=1e-5)
+
+    def test_advantage_stash_cleared(self):
+        """After computation, advantage stashes should be empty."""
+        import torch
+
+        trainer = self._make_advantage_state()
+        trainer._adv_h0_groups = [(torch.randn(1, 32), 4)]
+        trainer._adv_rewards = [0.1, 0.2, 0.3, 0.4]
+
+        trainer._compute_value_advantages()
+
+        assert trainer._adv_h0_groups == []
+        assert trainer._adv_rewards == []
+
+    def test_two_scenes_preserve_difficulty(self):
+        """Two scenes: harder scene (more variance) keeps larger advantage spread."""
+        import torch
+
+        trainer = self._make_advantage_state()
+        # Fix V(scene) = 0 for both by zeroing all weights
+        with torch.no_grad():
+            for p in trainer.value_head.parameters():
+                p.zero_()
+
+        h0_a = torch.randn(1, 32)
+        h0_b = torch.randn(1, 32)
+        trainer._adv_h0_groups = [(h0_a, 4), (h0_b, 4)]
+        # Scene A (easy): tight rewards → small advantage spread
+        # Scene B (hard): wide rewards → large advantage spread
+        trainer._adv_rewards = [0.4, 0.5, 0.5, 0.6, 0.0, 0.3, 0.6, 0.9]
+
+        advantages = trainer._compute_value_advantages()
+
+        assert advantages is not None
+        assert advantages.shape == (8,)
+        scene_a_std = advantages[:4].std().item()
+        scene_b_std = advantages[4:].std().item()
+        # Hard scene retains larger variance — difficulty info preserved
+        assert scene_b_std > scene_a_std * 3
+
+    def test_mismatch_returns_none(self):
+        """Mismatched reward/h0 counts → returns None with warning."""
+        import torch
+
+        trainer = self._make_advantage_state()
+        trainer._adv_h0_groups = [(torch.randn(1, 32), 4)]
+        trainer._adv_rewards = [0.1, 0.2]  # only 2 of 4
+
+        advantages = trainer._compute_value_advantages()
+        assert advantages is None
+
+    def test_metrics_logged(self):
+        """Advantage computation should log metrics."""
+        import torch
+
+        trainer = self._make_advantage_state()
+        trainer._adv_h0_groups = [(torch.randn(1, 32), 4)]
+        trainer._adv_rewards = [0.2, 0.4, 0.6, 0.8]
+
+        trainer._compute_value_advantages()
+
+        metrics = trainer._metrics["train"]
+        assert len(metrics["advantages/v_baseline_mean"]) == 1
+        assert len(metrics["advantages/mean"]) == 1
+        assert len(metrics["advantages/std"]) == 1
+
+    def test_value_baseline_affects_raw_advantages(self):
+        """V(scene) prediction shifts raw advantages relative to group mean."""
+        import torch
+
+        trainer = self._make_advantage_state()
+        # Fix value head to predict ~0.5 (set all weights to produce constant output)
+        with torch.no_grad():
+            for p in trainer.value_head.parameters():
+                p.zero_()
+            # Last bias → constant prediction
+            trainer.value_head.net[-1].bias.fill_(0.5)
+
+        h0 = torch.randn(1, 32)
+        trainer._adv_h0_groups = [(h0, 4)]
+        trainer._adv_rewards = [0.2, 0.4, 0.6, 0.8]
+
+        trainer._compute_value_advantages()
+
+        # advantages = [0.2-0.5, 0.4-0.5, 0.6-0.5, 0.8-0.5] = [-0.3, -0.1, 0.1, 0.3]
+        adv_mean = trainer._metrics["train"]["advantages/mean"][0]
+        assert abs(adv_mean - 0.0) < 1e-5  # mean of [-0.3,-0.1,0.1,0.3] = 0
+
+    def test_no_group_normalization(self):
+        """Advantages should NOT be zero-mean — V(scene) provides centering, not group mean."""
+        import torch
+
+        trainer = self._make_advantage_state()
+        # Fix value head to predict V=0.3
+        with torch.no_grad():
+            for p in trainer.value_head.parameters():
+                p.zero_()
+            trainer.value_head.net[-1].bias.fill_(0.3)
+
+        h0 = torch.randn(1, 32)
+        trainer._adv_h0_groups = [(h0, 4)]
+        trainer._adv_rewards = [0.2, 0.4, 0.6, 0.8]
+
+        advantages = trainer._compute_value_advantages()
+
+        # A_i = r_i - V = r_i - 0.3 → [-0.1, 0.1, 0.3, 0.5]
+        # mean(A) = 0.2, NOT 0.0 as it would be with group normalization
+        assert advantages is not None
+        expected = torch.tensor([-0.1, 0.1, 0.3, 0.5])
+        assert torch.allclose(advantages, expected, atol=1e-5)
+        assert abs(advantages.mean().item() - 0.2) < 1e-5

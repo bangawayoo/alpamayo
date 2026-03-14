@@ -694,19 +694,32 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self._value_pretrain_remaining: int = 0
         self._value_save_path: str | None = None
 
+        # Advantage computation stashes (separate from training stash).
+        # Populated during generation + reward calculation, consumed once per
+        # _generate_and_score_completions call to replace GRPO's group-mean baseline
+        # with the learned V(scene) baseline.
+        self._adv_h0_groups: list[tuple[torch.Tensor, int]] = []  # (h0, group_size) per scene
+        self._adv_rewards: list[float] = []  # per-sample composite rewards
+        self._value_advantage_enabled: bool = False  # set True when advantage replacement is active
+        self._value_gamma: float = 1.0
+        self._value_gae_lambda: float = 0.95
+
         _vh_cfg = value_head_cfg or {}
         if _vh_cfg.get("enabled", False):
-            from alpamayo_r1.training.value_head import SceneValueHead
+            from alpamayo_r1.training.value_head import SegmentValueHead
 
             _hidden_dim = int(_vh_cfg.get("hidden_dim", 4096))
             _vh_device = self.accelerator.device
-            self.value_head = SceneValueHead(_hidden_dim).to(_vh_device)
+            self.value_head = SegmentValueHead(_hidden_dim).to(_vh_device)
             self.value_optimizer = torch.optim.Adam(
                 self.value_head.parameters(),
                 lr=float(_vh_cfg.get("lr", 1e-4)),
             )
             self._value_pretrain_remaining = int(_vh_cfg.get("pretrain_steps", 0))
             self._value_save_path = _vh_cfg.get("save_path", None) or None
+            self._value_advantage_enabled = _vh_cfg.get("advantage_enabled", True)
+            self._value_gamma = float(_vh_cfg.get("gamma", 1.0))
+            self._value_gae_lambda = float(_vh_cfg.get("gae_lambda", 0.95))
 
             # Load pre-trained weights if a checkpoint path is provided
             _load_path = _vh_cfg.get("load_path", None) or None
@@ -716,7 +729,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 if os.path.isfile(_load_path):
                     state = torch.load(_load_path, map_location=_vh_device)
                     self.value_head.load_state_dict(state)
-                    logger.info("Loaded SceneValueHead weights from %s", _load_path)
+                    logger.info("Loaded SegmentValueHead weights from %s", _load_path)
                 else:
                     logger.warning(
                         "value_head.load_path=%s not found — starting from random init",
@@ -724,10 +737,13 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     )
 
             logger.info(
-                "SceneValueHead enabled: hidden_dim=%d, lr=%.2e, pretrain_steps=%d, device=%s",
+                "SegmentValueHead enabled: hidden_dim=%d, lr=%.2e, pretrain_steps=%d, "
+                "advantage=%s, gamma=%.2f, device=%s",
                 _hidden_dim,
                 _vh_cfg.get("lr", 1e-4),
                 self._value_pretrain_remaining,
+                self._value_advantage_enabled,
+                self._value_gamma,
                 _vh_device,
             )
 
@@ -946,6 +962,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     if self.value_head is not None:
                         scene_h0 = self._compute_scene_h0(prompt_input_ids, model_inputs, device)
                         self._value_pending_groups.append((scene_h0, local_gen_count))
+                        # Mirror for advantage computation (separate from training stash)
+                        self._adv_h0_groups.append((scene_h0, local_gen_count))
 
                     # 3. VLM-only generation (no ExpertLogitsProcessor)
                     # Generate only as many sequences as this GPU needs for this
@@ -1196,6 +1214,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         for rt, rr, rc in zip(r_traj, r_reason, r_consist):
             composite = w_traj * rt + w_reason * rr + w_consist * rc
             self._value_pending_rewards.append(composite)
+            # Mirror for advantage computation
+            self._adv_rewards.append(composite)
 
         self._flush_value_pending()
 
@@ -1291,6 +1311,128 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             targets_tensor.mean().item(),
             n,
         )
+
+    # ------------------------------------------------------------------
+    # Value-head advantage computation
+    # ------------------------------------------------------------------
+
+    def _generate_and_score_completions(
+        self, inputs: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Override to replace GRPO's group-mean baseline with the learned V(scene).
+
+        Calls the parent to get standard GRPO output (including scalar advantages),
+        then — when value-head advantage is enabled — recomputes advantages as::
+
+            A_i = r_i - V(scene_i)
+
+        followed by group normalization.  This provides a learned baseline that
+        generalises across scenes, rather than the noisy sample mean of G completions.
+
+        The ``(B,)`` advantage tensor is a drop-in replacement; TRL's ``_compute_loss``
+        unsqueezes it to ``(B, 1)`` and broadcasts across tokens.  Future segment-level
+        advantages will return ``(B, T)`` directly.
+        """
+        output = super()._generate_and_score_completions(inputs)
+
+        if not self._value_advantage_enabled or self.value_head is None:
+            # Clear advantage buffers even if not used, to prevent stale data
+            self._adv_h0_groups.clear()
+            self._adv_rewards.clear()
+            return output
+
+        # During stage-0 pretraining, skip advantage replacement (policy is frozen)
+        if self._value_pretrain_remaining > 0:
+            self._adv_h0_groups.clear()
+            self._adv_rewards.clear()
+            return output
+
+        advantages = self._compute_value_advantages()
+        if advantages is not None:
+            output["advantages"] = advantages
+
+        return output
+
+    def _compute_value_advantages(self) -> torch.Tensor | None:
+        """Compute advantages using V(scene) as baseline: ``A_i = r_i - V(scene_i)``.
+
+        No group normalisation — the learned baseline preserves cross-scene
+        difficulty information.  Harder scenes (higher reward variance across
+        the G completions) naturally produce larger-magnitude advantages,
+        giving them proportionally more gradient signal.  The G samples per
+        prompt still reduce gradient variance through batching and provide
+        low-variance MC targets for training the value head.
+
+        Consumes ``_adv_h0_groups`` and ``_adv_rewards`` populated during
+        the current rollout.  Returns ``(local_N,)`` for the local process,
+        or ``None`` if the stash is empty.
+        """
+        if not self._adv_h0_groups or not self._adv_rewards:
+            self._adv_h0_groups.clear()
+            self._adv_rewards.clear()
+            return None
+
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+
+        # 1. Build per-sample V(scene) predictions by expanding h0 per group
+        v_predictions = []
+        with torch.no_grad():
+            for h0, group_size in self._adv_h0_groups:
+                v_scene = self.value_head(h0.to(device))  # (1,) or scalar
+                v_scalar = v_scene.item() if v_scene.dim() == 0 else v_scene.squeeze().item()
+                v_predictions.extend([v_scalar] * group_size)
+
+        # 2. Build local reward and value tensors
+        local_n = len(self._adv_rewards)
+        if len(v_predictions) != local_n:
+            logger.warning(
+                "Value advantage stash mismatch: %d rewards vs %d V predictions — "
+                "falling back to standard GRPO advantages",
+                local_n,
+                len(v_predictions),
+            )
+            self._adv_h0_groups.clear()
+            self._adv_rewards.clear()
+            return None
+
+        local_rewards = torch.tensor(self._adv_rewards, dtype=torch.float32, device=device)
+        local_v = torch.tensor(v_predictions, dtype=torch.float32, device=device)
+
+        # 3. Gather across processes for consistent distributed training
+        all_rewards = self.accelerator.gather(local_rewards)
+        all_v = self.accelerator.gather(local_v)
+
+        # 4. Advantages: A_i = r_i - V(scene_i)
+        # No group normalisation — V(scene) provides centering, and preserving
+        # per-scene variance gives harder scenes proportionally more gradient signal.
+        advantages = all_rewards - all_v
+
+        # 5. Log metrics
+        self._metrics[mode]["advantages/v_baseline_mean"].append(all_v.mean().item())
+        self._metrics[mode]["advantages/mean"].append(advantages.mean().item())
+        self._metrics[mode]["advantages/std"].append(advantages.std().item())
+
+        # 6. Slice to local process (same logic as TRL)
+        process_slice = slice(
+            self.accelerator.process_index * local_n,
+            (self.accelerator.process_index + 1) * local_n,
+        )
+        local_advantages = advantages[process_slice]
+
+        logger.debug(
+            "value advantages | V_mean=%.3f A_mean=%.3f A_std=%.3f samples=%d",
+            all_v.mean().item(),
+            advantages.mean().item(),
+            advantages.std().item(),
+            local_n,
+        )
+
+        # 7. Clear stash for next rollout
+        self._adv_h0_groups.clear()
+        self._adv_rewards.clear()
+
+        return local_advantages
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """Override to train value head alongside (or instead of) the GRPO policy loss.

@@ -1,22 +1,10 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""Segment-level value head for GRPO baseline estimation.
 
-"""Scene-level value head for GRPO baseline estimation.
-
-SceneValueHead maps the VLM's last-prompt hidden state to a scalar
-expected reward, providing a learned baseline for advantage computation.
+SegmentValueHead maps VLM hidden states at sequence positions to scalar
+expected-reward estimates, providing a learned baseline for advantage
+computation.  Currently used at the scene level (h_obs); designed to
+accept batched token-level hidden states for future segment-level
+advantages (CoC, per-trajectory-token).
 """
 
 from __future__ import annotations
@@ -25,11 +13,12 @@ import torch
 import torch.nn as nn
 
 
-class SceneValueHead(nn.Module):
-    """3-layer MLP: h_0 → E[composite_reward | scene].
+class SegmentValueHead(nn.Module):
+    """Shared MLP: h → V(s) at any sequence position.
 
-    Input h_0 is the VLM's last hidden state at the final prompt token,
-    encoding the model's scene understanding before generation begins.
+    Accepts both single-position hidden states ``(B, D)`` and
+    multi-position hidden states ``(B, T, D)``, returning ``(B,)``
+    or ``(B, T)`` respectively.
 
     Args:
         hidden_dim: VLM hidden state dimension (4096 for Qwen3-VL-7B/10B).
@@ -45,13 +34,17 @@ class SceneValueHead(nn.Module):
             nn.Linear(128, 1),
         )
 
-    def forward(self, h0: torch.Tensor) -> torch.Tensor:
-        """Predict scene value.
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """Predict value at one or more sequence positions.
 
         Args:
-            h0: Hidden state tensor, shape (B, hidden_dim).
+            h: Hidden state tensor, shape ``(B, D)`` or ``(B, T, D)``.
 
         Returns:
-            Scalar value estimates, shape (B,).
+            Value estimates, shape ``(B,)`` or ``(B, T)``.
         """
-        return self.net(h0).squeeze(-1)
+        return self.net(h).squeeze(-1)
+
+
+# Backward-compatible alias
+SceneValueHead = SegmentValueHead
