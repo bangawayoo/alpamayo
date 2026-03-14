@@ -1206,7 +1206,6 @@ class TestValueAdvantageComputation:
         trainer._adv_h0_groups = []
         trainer._adv_rewards = []
         trainer._value_advantage_enabled = True
-        trainer._value_gamma = 1.0
         trainer._metrics = defaultdict(lambda: defaultdict(list))
         return trainer
 

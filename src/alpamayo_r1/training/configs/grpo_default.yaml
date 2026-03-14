@@ -135,5 +135,3 @@ value_head:
   # Advantage computation using learned V(scene) baseline
   advantage_enabled: true   # replace GRPO group-mean baseline with V(scene)
                             # set false for auxiliary-only mode (logging, no policy effect)
-  gamma: 1.0               # discount factor (1.0 for short episode sequences)
-  gae_lambda: 0.95          # GAE trace decay (used when segment_level is enabled)

@@ -701,8 +701,6 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self._adv_h0_groups: list[tuple[torch.Tensor, int]] = []  # (h0, group_size) per scene
         self._adv_rewards: list[float] = []  # per-sample composite rewards
         self._value_advantage_enabled: bool = False  # set True when advantage replacement is active
-        self._value_gamma: float = 1.0
-        self._value_gae_lambda: float = 0.95
 
         _vh_cfg = value_head_cfg or {}
         if _vh_cfg.get("enabled", False):
@@ -718,8 +716,6 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             self._value_pretrain_remaining = int(_vh_cfg.get("pretrain_steps", 0))
             self._value_save_path = _vh_cfg.get("save_path", None) or None
             self._value_advantage_enabled = _vh_cfg.get("advantage_enabled", True)
-            self._value_gamma = float(_vh_cfg.get("gamma", 1.0))
-            self._value_gae_lambda = float(_vh_cfg.get("gae_lambda", 0.95))
 
             # Load pre-trained weights if a checkpoint path is provided
             _load_path = _vh_cfg.get("load_path", None) or None
@@ -738,12 +734,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
             logger.info(
                 "SegmentValueHead enabled: hidden_dim=%d, lr=%.2e, pretrain_steps=%d, "
-                "advantage=%s, gamma=%.2f, device=%s",
+                "advantage=%s, device=%s",
                 _hidden_dim,
                 _vh_cfg.get("lr", 1e-4),
                 self._value_pretrain_remaining,
                 self._value_advantage_enabled,
-                self._value_gamma,
                 _vh_device,
             )
 
@@ -1326,8 +1321,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
             A_i = r_i - V(scene_i)
 
-        followed by group normalization.  This provides a learned baseline that
-        generalises across scenes, rather than the noisy sample mean of G completions.
+        No group normalization — the learned baseline preserves cross-scene
+        difficulty information rather than flattening all scenes to unit variance.
 
         The ``(B,)`` advantage tensor is a drop-in replacement; TRL's ``_compute_loss``
         unsqueezes it to ``(B, 1)`` and broadcasts across tokens.  Future segment-level
