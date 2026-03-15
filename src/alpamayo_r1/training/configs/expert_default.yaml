@@ -71,6 +71,19 @@ lora:
     - v_proj
     - o_proj
 
+# LoRA for Expert Transformer (reduces VRAM by training only low-rank adapters)
+# action_in_proj and action_out_proj remain full-parameter (small layers).
+expert_lora:
+  enabled: true
+  r: 4
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+
 # Evaluation
 eval:
   enabled: true

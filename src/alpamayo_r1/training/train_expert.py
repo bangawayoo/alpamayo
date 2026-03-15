@@ -262,11 +262,10 @@ def compute_cfm_loss(
     if model.config.expert_non_causal_attention:
         forward_kwargs["is_causal"] = False
 
-    # Reshape timestep for action_in_proj: (num_noisy_samples, 1, 1)
-    t_flat = t.squeeze(-1)  # (num_noisy_samples, 1)
-
     # Forward pass through expert
-    future_token_embeds = model.action_in_proj(x_t, t_flat)
+    # Pass t as-is (num_noisy_samples, 1, 1) — action_in_proj expects ≥3D timesteps
+    # so that timesteps[..., -1] remains 2D and Fourier output is 3D for repeat/cat.
+    future_token_embeds = model.action_in_proj(x_t, t)
     if future_token_embeds.dim() == 2:
         future_token_embeds = future_token_embeds.view(num_noisy_samples, n_diffusion_tokens, -1)
 
@@ -443,37 +442,55 @@ def main(cfg: DictConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ---------------------------------------------------------------
-    # 2. Freeze VLM, unfreeze expert + projections
+    # 2. Freeze everything, then selectively unfreeze expert + projections
     # ---------------------------------------------------------------
-    frozen_count = 0
-    trainable_count = 0
-    for name, param in model.named_parameters():
-        if (
-            name.startswith("vlm.")
-            or name.startswith("traj_tokenizer.")
-            or name.startswith("hist_traj_tokenizer.")
-        ):
-            param.requires_grad = False
-            frozen_count += 1
-        elif any(
-            name.startswith(prefix) for prefix in ("expert.", "action_in_proj.", "action_out_proj.")
-        ):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Apply LoRA to expert if configured
+    expert_lora_cfg = cfg.get("expert_lora", {})
+    use_expert_lora = bool(expert_lora_cfg.get("enabled", False))
+
+    if use_expert_lora:
+        from peft import LoraConfig as PeftLoraConfig
+        from peft import inject_adapter_in_model
+
+        expert_lora_config = PeftLoraConfig(
+            r=int(expert_lora_cfg.get("r", 16)),
+            lora_alpha=int(expert_lora_cfg.get("alpha", 32)),
+            lora_dropout=float(expert_lora_cfg.get("dropout", 0.05)),
+            target_modules=list(
+                expert_lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
+            ),
+        )
+        inject_adapter_in_model(model.expert, expert_lora_config, adapter_name="expert_lora")
+        # Only LoRA params are trainable in the expert
+        for name, param in model.expert.named_parameters():
+            param.requires_grad = "lora_" in name
+        logger.info(
+            "Expert LoRA enabled: r=%d, alpha=%d, targets=%s",
+            expert_lora_config.r,
+            expert_lora_config.lora_alpha,
+            expert_lora_config.target_modules,
+        )
+    else:
+        # Full-parameter expert training
+        for param in model.expert.parameters():
             param.requires_grad = True
-            trainable_count += 1
-        else:
-            # Freeze everything else (action_space, diffusion has no learnable params)
-            param.requires_grad = False
-            frozen_count += 1
+
+    # action_in_proj and action_out_proj are always fully trainable (small layers)
+    for param in model.action_in_proj.parameters():
+        param.requires_grad = True
+    for param in model.action_out_proj.parameters():
+        param.requires_grad = True
 
     total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(
-        "Parameters: %d total, %d trainable (%.1f%%), %d frozen groups, %d trainable groups",
+        "Parameters: %d total, %d trainable (%.1f%%)",
         total_params,
         total_trainable_params,
         100.0 * total_trainable_params / total_params,
-        frozen_count,
-        trainable_count,
     )
 
     model.to(device)
@@ -660,9 +677,18 @@ def main(cfg: DictConfig) -> None:
                 if global_step % save_steps == 0:
                     ckpt_dir = output_dir / f"checkpoint-{global_step}"
                     ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    # Save only the trainable modules
+                    # Save only trainable weights
+                    if use_expert_lora:
+                        expert_sd = {
+                            k: v
+                            for k, v in model.expert.state_dict().items()
+                            if "lora_" in k
+                        }
+                    else:
+                        expert_sd = model.expert.state_dict()
                     expert_state = {
-                        "expert": model.expert.state_dict(),
+                        "expert": expert_sd,
+                        "expert_lora": use_expert_lora,
                         "action_in_proj": model.action_in_proj.state_dict(),
                         "action_out_proj": model.action_out_proj.state_dict(),
                         "optimizer": optimizer.state_dict(),
@@ -704,8 +730,15 @@ def main(cfg: DictConfig) -> None:
     # ---------------------------------------------------------------
     final_dir = output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
+    if use_expert_lora:
+        expert_sd = {
+            k: v for k, v in model.expert.state_dict().items() if "lora_" in k
+        }
+    else:
+        expert_sd = model.expert.state_dict()
     expert_state = {
-        "expert": model.expert.state_dict(),
+        "expert": expert_sd,
+        "expert_lora": use_expert_lora,
         "action_in_proj": model.action_in_proj.state_dict(),
         "action_out_proj": model.action_out_proj.state_dict(),
         "global_step": global_step,

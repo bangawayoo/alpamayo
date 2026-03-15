@@ -818,17 +818,54 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self._expert_optimizer = None
         self._expert_rollout_data: list[dict] = []
         self._expert_finetune_cfg: dict = {}
+        self._expert_pending_advantages = None
 
         _ef_cfg = expert_finetune_cfg or {}
+        self._use_expert_lora = False
         if _ef_cfg.get("enabled", False):
             self._expert_finetune_enabled = True
             self._expert_finetune_cfg = _ef_cfg
 
-            # Unfreeze expert + projection params
+            # Apply LoRA to expert if configured
+            _expert_lora_cfg = _ef_cfg.get("expert_lora", {})
+            if _expert_lora_cfg.get("enabled", False):
+                from peft import LoraConfig as PeftLoraConfig
+                from peft import inject_adapter_in_model
+
+                expert_lora_config = PeftLoraConfig(
+                    r=int(_expert_lora_cfg.get("r", 16)),
+                    lora_alpha=int(_expert_lora_cfg.get("alpha", 32)),
+                    lora_dropout=float(_expert_lora_cfg.get("dropout", 0.05)),
+                    target_modules=list(
+                        _expert_lora_cfg.get(
+                            "target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]
+                        )
+                    ),
+                )
+                inject_adapter_in_model(
+                    full_model.expert, expert_lora_config, adapter_name="expert_lora"
+                )
+                self._use_expert_lora = True
+                # Only LoRA params trainable in expert; base weights frozen
+                for name, param in full_model.expert.named_parameters():
+                    param.requires_grad = "lora_" in name
+                logger.info(
+                    "Expert LoRA enabled: r=%d, alpha=%d, targets=%s",
+                    expert_lora_config.r,
+                    expert_lora_config.lora_alpha,
+                    expert_lora_config.target_modules,
+                )
+            else:
+                # Full-parameter expert training
+                for name, param in full_model.named_parameters():
+                    if name.startswith("expert."):
+                        param.requires_grad = True
+
+            # action_in_proj and action_out_proj are always fully trainable
             for name, param in full_model.named_parameters():
                 if any(
                     name.startswith(prefix)
-                    for prefix in ("expert.", "action_in_proj.", "action_out_proj.")
+                    for prefix in ("action_in_proj.", "action_out_proj.")
                 ):
                     param.requires_grad = True
 
@@ -854,7 +891,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 if os.path.isfile(_ef_load):
                     state = torch.load(_ef_load, map_location="cpu")
                     if "expert" in state:
-                        full_model.expert.load_state_dict(state["expert"])
+                        # Use strict=False for LoRA checkpoints (partial state dict)
+                        strict = not state.get("expert_lora", False)
+                        full_model.expert.load_state_dict(state["expert"], strict=strict)
                     if "action_in_proj" in state:
                         full_model.action_in_proj.load_state_dict(state["action_in_proj"])
                     if "action_out_proj" in state:
@@ -867,10 +906,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
             n_expert_params = sum(p.numel() for p in expert_params)
             logger.info(
-                "Expert CFM fine-tuning enabled: lr=%.2e, %d trainable params, "
+                "Expert CFM fine-tuning enabled: lr=%.2e, %d trainable params%s, "
                 "rollouts_per_step=%d, every_n_steps=%d",
                 _ef_cfg.get("lr", 1e-4),
                 n_expert_params,
+                " (LoRA)" if self._use_expert_lora else " (full)",
                 _ef_cfg.get("rollouts_per_step", 1),
                 _ef_cfg.get("every_n_steps", 1),
             )
@@ -990,9 +1030,18 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             import os
 
             expert_save_path = self._expert_finetune_cfg.get("save_path", None) or None
-            # Always save expert checkpoint alongside the VLM checkpoint
+            # Save only LoRA weights when expert LoRA is active
+            if self._use_expert_lora:
+                expert_sd = {
+                    k: v
+                    for k, v in self.full_model.expert.state_dict().items()
+                    if "lora_" in k
+                }
+            else:
+                expert_sd = self.full_model.expert.state_dict()
             expert_ckpt = {
-                "expert": self.full_model.expert.state_dict(),
+                "expert": expert_sd,
+                "expert_lora": self._use_expert_lora,
                 "action_in_proj": self.full_model.action_in_proj.state_dict(),
                 "action_out_proj": self.full_model.action_out_proj.state_dict(),
                 "global_step": self.state.global_step,
@@ -2023,7 +2072,12 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
         return past_key_values, rope_deltas, prefill_seq_len, b_star, offset
 
-    def _expert_cfm_step(self, inputs: dict) -> None:
+    def _expert_cfm_step_deferred(self) -> None:
+        """Run expert CFM step using stashed advantages (called after GRPO backward)."""
+        self._expert_cfm_step(inputs=None)
+        self._expert_pending_advantages = None
+
+    def _expert_cfm_step(self, inputs: dict | None = None) -> None:
         """One expert CFM training step using top-advantage rollouts.
 
         Selects the highest-advantage rollouts from the current batch, runs a
@@ -2041,10 +2095,12 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
         device = self.accelerator.device
 
-        # Get advantages from the current batch and pick top-K
-        advantages = inputs.get("advantages", None)
+        # Get advantages — either from inputs (legacy) or from stashed pending advantages
+        advantages = inputs.get("advantages", None) if inputs is not None else None
         if advantages is None:
-            logger.debug("No advantages in inputs — skipping expert CFM step")
+            advantages = self._expert_pending_advantages
+        if advantages is None:
+            logger.debug("No advantages available — skipping expert CFM step")
             return
 
         # advantages is a tensor of shape (batch_size,)
@@ -2062,6 +2118,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         top_k = sorted_indices[:rollouts_per_step]
 
         from alpamayo_r1.training.train_expert import compute_cfm_loss
+
+        # Free cached GPU memory before loading expert
+        torch.cuda.empty_cache()
 
         # Move expert + projections to GPU
         self.full_model.expert.to(device)
@@ -2103,6 +2162,27 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         hist_xyz, hist_rot, fut_xyz, fut_rot
                     )  # (1, T_future, 2)
 
+                # Expand KV cache from batch=1 to batch=num_noisy_samples.
+                # The VLM forward produces cache with batch=1 (single scene),
+                # but compute_cfm_loss creates num_noisy_samples inputs.
+                if num_noisy_samples > 1:
+                    prompt_cache.batch_repeat_interleave(num_noisy_samples)
+
+                # Debug: verify cache expansion worked
+                _layer0 = prompt_cache.layers[0]
+                logger.info(
+                    "expert CFM cache debug | layers=%d seq_len=%d "
+                    "layer0_keys=%s rope_deltas=%s offset=%s "
+                    "gt_action=%s num_noisy=%d",
+                    len(prompt_cache.layers),
+                    prompt_cache.get_seq_length(),
+                    tuple(_layer0.keys.shape),
+                    tuple(rope_deltas.shape),
+                    tuple(offset.shape),
+                    tuple(gt_action.shape),
+                    num_noisy_samples,
+                )
+
                 # Compute CFM loss
                 with torch.autocast(str(device), dtype=torch.bfloat16):
                     loss = compute_cfm_loss(
@@ -2123,7 +2203,14 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 n_valid += 1
 
             except Exception as e:
-                logger.warning("Expert CFM step failed for %s: %s", clip_id, e)
+                import traceback
+
+                logger.warning(
+                    "Expert CFM step failed for %s: %s\n%s",
+                    clip_id,
+                    e,
+                    traceback.format_exc(),
+                )
                 continue
 
         if n_valid > 0:
@@ -2150,14 +2237,51 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 rollouts_per_step,
             )
 
-        # Move expert + projections back to CPU to save GPU memory
+        # Move expert + projections back to CPU to free GPU memory
         self.full_model.expert.cpu()
         self.full_model.action_in_proj.cpu()
         self.full_model.action_out_proj.cpu()
         self.full_model.action_space.cpu()
+        torch.cuda.empty_cache()
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override to run expert CFM step AFTER GRPO backward frees activations.
+
+        This ensures GRPO and expert never compete for GPU memory simultaneously.
+        The GRPO forward+backward runs first (full GPU budget), then activations
+        are freed, and the expert step gets the reclaimed memory.
+        """
+        # Stash advantages for expert before GRPO training_step consumes inputs
+        if self._expert_finetune_enabled:
+            self._expert_pending_advantages = inputs.get("advantages", None)
+
+        # Normal GRPO training step: compute_loss → backward (frees activation graph)
+        output = super().training_step(model, inputs, num_items_in_batch)
+
+        # Run expert CFM after GRPO backward — activations freed, expert gets full GPU
+        if self._expert_finetune_enabled:
+            every_n = int(self._expert_finetune_cfg.get("every_n_steps", 1))
+            # Use TRL's _step counter (incremented in super) to run once per global step
+            is_acc_boundary = (self._step % self.current_gradient_accumulation_steps == 0)
+            if is_acc_boundary and self.state.global_step % every_n == 0:
+                import gc
+
+                gc.collect()
+                torch.cuda.empty_cache()
+                try:
+                    self._expert_cfm_step_deferred()
+                except Exception as e:
+                    logger.warning(
+                        "Expert CFM step failed at step %d: %s", self.state.global_step, e
+                    )
+                finally:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+        return output
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Override to train value head and/or expert CFM alongside the GRPO policy loss.
+        """Override to train value head alongside the GRPO policy loss.
 
         **Value head stage 0** (``_value_pretrain_remaining > 0``): only the value head
         trains.  The policy loss is replaced by a zero scalar so the VLM
@@ -2165,23 +2289,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
 
         **Value head stage 1** (``_value_pretrain_remaining == 0``): normal GRPO plus a
         value head update from the stash.
-
-        **Expert CFM**: When enabled, runs ``_expert_cfm_step()`` every
-        ``every_n_steps`` training steps. This is independent of the GRPO loss —
-        the expert has its own optimizer and gradients are isolated.
         """
-        # Expert CFM step (runs before GRPO to not interfere with policy gradients)
-        if self._expert_finetune_enabled:
-            every_n = int(self._expert_finetune_cfg.get("every_n_steps", 1))
-            if self.state.global_step % every_n == 0:
-                try:
-                    self._expert_cfm_step(inputs)
-                except Exception as e:
-                    logger.warning(
-                        "Expert CFM step failed at step %d: %s", self.state.global_step, e
-                    )
-
-        if self.value_head is None and not self._expert_finetune_enabled:
+        if self.value_head is None:
             return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
 
         if self.value_head is not None:
