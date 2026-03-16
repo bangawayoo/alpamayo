@@ -123,48 +123,72 @@ The observation-level token captures **scene difficulty**. A scene with `obs_neg
 
 ### Using the Existing Segment Value Head
 
-The segment value head (already implemented in `value_head.py`) provides value estimates at three levels:
+The segment value head (already implemented in `value_head.py`) provides value estimates at three levels of information:
 
 ```
-V_obs  = SegmentValueHead(h_obs,  level=0)    # expected total return
-V_coc  = SegmentValueHead(h_coc,  level=1)    # expected remaining return after reasoning
-V_traj = SegmentValueHead(h_traj, level=2)    # expected return-to-go per trajectory token
+V(s_obs)    = SegmentValueHead(h_obs,  level=0)    # E[total return | observation]
+V(s_coc)    = SegmentValueHead(h_coc,  level=1)    # E[remaining return | observation + CoC]
+V(s_traj_j) = SegmentValueHead(h_traj, level=2)    # E[remaining return | obs + CoC + traj up to j]
+```
+
+Each V predicts the **expected remaining return** from that information state. As more of the completion is observed, the value estimate becomes more precise.
+
+### Temporal Structure
+
+Rewards are earned at different points in the generation sequence:
+
+```
+s_obs ──[generate CoC]──► s_coc ──[generate traj_1]──► s_traj_1 ──► ... ──► s_traj_T ──► terminal
+                           ↑            ↑                                        ↑
+                     R_reasoning    r_traj_1, ..., r_traj_T              R_consistency
+                     earned here    earned per step                      earned here
+```
+
+- **R_reasoning**: scored once the full CoC text is generated (at s_coc)
+- **r_traj_t**: per-timestep trajectory quality (e.g., displacement error at step t)
+- **R_consistency**: requires both CoC and full trajectory, scored at terminal
+
+### Returns-to-Go at Each State
+
+The actual return from each state is the sum of all future rewards from that point:
+
+```
+G(s_obs)    = w_reason · R_reasoning + w_traj · Σ_t r_t + w_consist · R_consistency
+G(s_coc)    = w_traj · Σ_t r_t + w_consist · R_consistency         (R_reasoning already collected)
+G(s_traj_j) = w_traj · Σ_{t=j}^{T} r_t + w_consist · R_consistency  (remaining trajectory return)
 ```
 
 ### Per-Segment Advantage Definitions
 
-**Observation-level advantage** (scene difficulty signal):
+Advantages are computed as **actual return minus value baseline** at each information level. This is the return-minus-baseline formulation: how much better (or worse) was the actual outcome compared to what the value head predicted at that state?
+
+**Observation-level advantage** (completion quality relative to scene baseline):
 
 ```
-A_obs = G(s_obs) - E[G(s_obs)]
+A_obs = G(s_obs) - V(s_obs)
 ```
 
-Where `G(s_obs)` is the total return (MC average over G completions for this scene) and the expectation is over a running mean of all scenes. This captures whether the scene was "easier than average" — a form of scene-level advantage.
+Measures: given only the observation, was this entire completion (CoC + trajectory) better or worse than expected? Captures both scene difficulty and overall completion quality. A positive A_obs means this completion outperformed the value head's prediction for this scene.
 
-In practice, we maintain an exponential moving average of scene returns:
-
-```python
-ema_return = α * ema_return + (1 - α) * G(s_obs)    # α ≈ 0.99
-A_obs = G(s_obs) - ema_return
-```
-
-**CoC-level advantage** (reasoning quality, given this scene):
+**CoC-level advantage** (trajectory quality relative to CoC-conditioned baseline):
 
 ```
-A_coc = w_reason · R_reasoning + γ · V(s_coc) - V(s_obs)
+A_coc = G(s_coc) - V(s_coc)
+      = (w_traj · R_traj + w_consist · R_consistency) - V(s_coc)
 ```
 
-This is the same CoC segment advantage from the value head design. It measures: did this particular reasoning text improve expected trajectory outcome relative to what the scene alone predicted?
+Measures: given the observation AND this specific CoC reasoning, was the trajectory outcome better or worse than expected? A positive A_coc means the CoC set up conditions for a trajectory that exceeded expectations — it indirectly reflects CoC quality because good reasoning causally enables good trajectories.
 
-**Trajectory-level advantage** (trajectory quality, given this reasoning):
+**Trajectory-level advantage** (remaining trajectory quality at step j):
 
 ```
-A_traj = Σ_t r_t + w_consist · R_consistency - V(s_coc)
+A_traj_j = G(s_traj_j) - V(s_traj_j)
+         = (w_traj · Σ_{t=j}^{T} r_t + w_consist · R_consistency) - V(s_traj_j)
 ```
 
-This is the total trajectory return minus the expected trajectory return after reasoning. It measures: did the trajectory over/under-perform relative to what the reasoning predicted?
+Measures: at step j of trajectory generation, was the remaining trajectory better or worse than expected? For the conditioning token, we use the aggregate (mean over j) since the token is a single binary indicator for the entire trajectory segment.
 
-> **Note:** We use the aggregate trajectory advantage (not per-token GAE) for the conditioning token, since the token is a single binary indicator for the entire trajectory segment. Per-token GAE is still available if combining with policy gradient methods.
+> **Note on alternative formulations:** The value-head design doc (`docs/value-head.md`) also describes a TD bootstrapping formulation and per-token GAE for trajectory advantages. Those formulations trade-off bias for variance. For advantage conditioning — where advantages are binarized into discrete labels — the return-minus-baseline formulation is preferred to avoid bias from bootstrapping through a potentially inaccurate value head. See `docs/value-head.md` for a full comparison of both approaches.
 
 ### Binarization
 
@@ -414,7 +438,7 @@ G(s_traj_t) = Σ_{k=t}^{T} r_k                         # return-to-go per trajec
 │                    Existing (value-head branch)                   │
 │  SegmentValueHead ─── computes V(obs), V(coc), V(traj)          │
 │  Reward functions ─── R_reasoning, R_trajectory, R_consistency   │
-│  Advantage math   ─── A_coc (TD), A_traj (GAE), binarization    │
+│  Advantage math   ─── return-minus-baseline, binarization        │
 ├──────────────────────────────────────────────────────────────────┤
 │                    New (advantage conditioning)                   │
 │  Special tokens   ─── 6 new tokens in tokenizer                 │

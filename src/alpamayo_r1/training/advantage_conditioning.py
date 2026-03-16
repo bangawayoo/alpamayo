@@ -21,7 +21,6 @@ import torch
 from torch.utils.data import Dataset
 
 from alpamayo_r1.models.base_model import IGNORE_INDEX, SPECIAL_TOKENS
-from alpamayo_r1.training.rollout_utils import compute_gae
 
 logger = logging.getLogger(__name__)
 
@@ -200,13 +199,12 @@ def compute_segment_advantages_from_rollouts(
     completion_segment_map: list[dict],
     value_head: torch.nn.Module,
     reward_weights: tuple[float, float, float] = (0.5, 0.25, 0.25),
-    gamma: float = 1.0,
-    gae_lambda: float = 1.0,
 ) -> list[dict]:
-    """Compute per-completion segment-level advantages.
+    """Compute per-completion segment-level advantages (return minus baseline).
 
-    Generalized from AlpamayoGRPOTrainer._compute_segment_advantages().
-    Returns structured per-completion advantages instead of a (B,T) tensor.
+    Uses the return-minus-baseline formulation: at each information level,
+    the advantage is the actual return from that state minus the value head's
+    prediction. See docs/value-head.md "Approach A" for details.
 
     Args:
         segment_hidden_stash: List of {h_obs, h_coc, h_traj} per completion.
@@ -217,15 +215,13 @@ def compute_segment_advantages_from_rollouts(
             per completion.
         value_head: SegmentValueHead instance.
         reward_weights: (w_traj, w_reason, w_consist).
-        gamma: Discount factor.
-        gae_lambda: GAE trace decay.
 
     Returns:
         List of dicts per completion: {a_obs, a_coc, a_traj, a_traj_per_step}.
-        a_obs: scene-level advantage (float)
-        a_coc: CoC-level advantage (float)
-        a_traj: mean trajectory advantage (float)
-        a_traj_per_step: per-timestep trajectory advantages (list[float])
+        a_obs: observation-level advantage — G(s_obs) - V(s_obs)
+        a_coc: CoC-level advantage — G(s_coc) - V(s_coc)
+        a_traj: mean trajectory advantage (over timesteps)
+        a_traj_per_step: per-timestep trajectory advantages
     """
     from alpamayo_r1.training.value_head import SegmentValueHead
 
@@ -273,23 +269,28 @@ def compute_segment_advantages_from_rollouts(
         else:
             r_traj_weighted = torch.zeros(0, device=vh_device)
 
-        # Value targets (returns-to-go)
+        # Returns-to-go at each state
         traj_total = r_traj_weighted.sum().item() if T_traj > 0 else 0.0
-        g_obs = w_reason * r_reason + traj_total
+        g_obs = w_reason * r_reason + traj_total  # total return from s_obs
+        g_coc = traj_total  # remaining return from s_coc (R_reasoning already collected)
 
-        # Advantages
-        a_coc = w_reason * r_reason + gamma * v_coc - v_obs
+        # Advantages: actual return minus value baseline at each information level
+        # A_obs: completion quality relative to scene baseline
+        a_obs = g_obs - v_obs
 
+        # A_coc: trajectory quality relative to CoC-conditioned baseline
+        a_coc = g_coc - v_coc
+
+        # A_traj_j: remaining trajectory quality at each step
         if T_traj > 0:
-            a_traj_per_step = compute_gae(r_traj_weighted, v_traj, gamma, gae_lambda)
+            # G(s_traj_j) = w_traj * Σ_{t=j}^{T} r_t + w_consist * R_consistency
+            g_traj = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
+            a_traj_per_step = g_traj - v_traj
             a_traj_mean = a_traj_per_step.mean().item()
             a_traj_list = a_traj_per_step.cpu().tolist()
         else:
             a_traj_mean = 0.0
             a_traj_list = []
-
-        # Observation-level advantage: total return minus baseline
-        a_obs = g_obs - v_obs
 
         results.append(
             {

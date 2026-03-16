@@ -189,32 +189,67 @@ V(s_obs) uses MC averaging because all G completions share the same h_obs — th
 
 ## Advantage Computation
 
-### Semi-MDP Formulation
+### Temporal Structure
 
-The generation process forms a semi-MDP with two segment types:
-
-```
-s_obs ──[CoC tokens]──→ s_coc ──[traj_1]──→ s_1 ──[traj_2]──→ ... ──→ s_T ──→ terminal
-         segment 1                          segment 2 (per-token)
-```
-
-### CoC Segment (Shared Advantage)
-
-All CoC tokens receive the same advantage — a single TD step spanning the entire reasoning segment:
+The generation process unfolds as a sequence of states with rewards earned at specific points:
 
 ```
-A_coc = w_reason · R_reasoning + γ · V(s_coc) - V(s_obs)
+s_obs ──[generate CoC]──► s_coc ──[traj_1]──► s_1 ──► ... ──► s_T ──► terminal
+                           ↑          ↑                           ↑
+                     R_reasoning  r_traj_1..T               R_consistency
+```
+
+- **R_reasoning**: scored once the full CoC text is generated (at s_coc, not during generation)
+- **r_traj_t**: per-timestep trajectory quality
+- **R_consistency**: requires both CoC and full trajectory, scored at terminal
+
+Returns-to-go at each state:
+
+```
+G(s_obs)    = w_reason · R_reasoning + w_traj · Σ_t r_t + w_consist · R_consistency
+G(s_coc)    = w_traj · Σ_t r_t + w_consist · R_consistency         (R_reasoning already collected)
+G(s_traj_j) = w_traj · Σ_{t=j}^{T} r_t + w_consist · R_consistency  (remaining trajectory)
+```
+
+### Two Advantage Formulations
+
+Two approaches for computing per-segment advantages from these value estimates. The choice depends on the downstream use case.
+
+#### Approach A: Return-Minus-Baseline
+
+Advantages are simply the actual return minus the value head's prediction at each information level:
+
+```
+A_obs    = G(s_obs)    - V(s_obs)       # completion quality vs scene baseline
+A_coc    = G(s_coc)    - V(s_coc)       # trajectory quality vs CoC-conditioned baseline
+A_traj_j = G(s_traj_j) - V(s_traj_j)   # remaining traj quality vs mid-trajectory baseline
+```
+
+**Properties:**
+- Zero bias (uses actual returns, no bootstrapping through V)
+- Higher variance (single-sample Monte Carlo returns)
+- No hyperparameters beyond the value head itself (no γ, λ)
+- Semantics: each A measures "how much better was the actual outcome than predicted at this state?"
+
+**Best suited for:** Advantage conditioning (SFT), where advantages are binarized into discrete labels. The binarization step absorbs variance, and zero bias avoids systematic mislabeling.
+
+#### Approach B: TD Bootstrapping / GAE
+
+Models generation as a semi-MDP and computes advantages using temporal-difference residuals:
+
+**Obs. segment** — single TD step for observation:
+
+```
+A_obs = w_reason · R_reasoning + γ · V(s_coc) - V(s_obs)
 ```
 
 This captures two signals:
-1. `w_reason · R_reasoning` — did the reasoning text satisfy the heuristic quality checks? (noisy)
-2. `γ · V(s_coc) - V(s_obs)` — did this CoC text shift expected trajectory outcome up or down? (learned, potentially more reliable)
+1. `w_reason · R_reasoning` — did the reasoning text satisfy quality checks? (noisy)
+2. `γ · V(s_coc) - V(s_obs)` — did this CoC text shift expected trajectory outcome up or down? (learned)
 
-Even with a noisy `R_reasoning`, the `V(s_coc) - V(s_obs)` term provides useful credit assignment: a CoC that produces confident, correct reasoning will yield `V(s_coc) > V(s_obs)` because the model expects better trajectory quality, regardless of whether the heuristic catches it.
+Even with a noisy `R_reasoning`, the `V(s_coc) - V(s_obs)` term provides useful credit assignment: a CoC that produces confident, correct reasoning will yield `V(s_coc) > V(s_obs)` because the model expects better trajectory quality.
 
-### Trajectory Tokens (Per-Token GAE)
-
-Each trajectory token gets its own advantage via Generalized Advantage Estimation:
+**Trajectory tokens** — per-token GAE:
 
 ```
 δ_t = r_t + γ · V(s_{t+1}) - V(s_t)       for t = 1..T-1
@@ -223,12 +258,38 @@ Each trajectory token gets its own advantage via Generalized Advantage Estimatio
 A_t = Σ_{k=0}^{T-t-1} (γλ)^k · δ_{t+k}    GAE with discount γ, trace decay λ
 ```
 
-With sequences of ~64 trajectory tokens, `γ = 1.0` (or 0.99) and `λ = 1.0` are reasonable starting points.
-We use `λ = 1.0` to reduce bias.
+**Properties:**
+- Lower variance (bootstraps through V, smoothing single-sample noise)
+- Introduces bias (accuracy depends on V quality)
+- λ controls the bias-variance tradeoff: λ=1 recovers Approach A for trajectory tokens; λ=0 is pure one-step TD
+- Semantics: A_coc measures "was the CoC generation action valuable?" (quality of the transition from s_obs to s_coc)
 
-### Resulting Advantage Tensor
+**Best suited for:** GRPO policy gradients, where advantages multiply log-probs and high variance can destabilize training. The reduced variance from bootstrapping is more valuable when the advantages directly scale gradient magnitudes.
 
-The output is a `(B, T_completion)` tensor where `T_completion` is the full completion length:
+> **Note:** With `γ = 1.0` and `λ = 1.0` (our default config), GAE for trajectory tokens is mathematically equivalent to Approach A's `G(s_traj_j) - V(s_traj_j)`. The difference between the two approaches is primarily in A_coc: TD bootstrapping vs. direct return-minus-baseline.
+
+#### Comparison
+
+| | Return-minus-baseline (A) | TD / GAE (B) |
+|---|---|---|
+| **A_coc formula** | `G(s_coc) - V(s_coc)` | `w_reason · R_reasoning + γ · V(s_coc) - V(s_obs)` |
+| **A_coc measures** | "was traj better than expected given CoC?" | "was the CoC action valuable?" |
+| **A_traj formula** | `G(s_traj_j) - V(s_traj_j)` | GAE(γ, λ) on per-step TD residuals |
+| **A_traj at γ=1, λ=1** | Same | Same (GAE reduces to MC - baseline) |
+| **Bias** | Zero | Proportional to V error |
+| **Variance** | Higher (MC) | Lower (bootstrapping) |
+| **Hyperparameters** | None | γ, λ |
+| **Primary use case** | Advantage conditioning (binarized labels) | Policy gradients (continuous weights) |
+
+### Current Implementation
+
+The codebase supports both approaches:
+- **GRPO path** (`rollout.py`): Uses Approach B (TD/GAE) for `(B, T)` per-token advantages in the policy gradient loss.
+- **SFT path** (`advantage_conditioning.py`): Uses Approach A (return-minus-baseline) for per-segment advantages that are binarized into conditioning labels.
+
+### Resulting Advantage Tensor (GRPO)
+
+The GRPO path outputs a `(B, T_completion)` tensor:
 
 ```
 advantages[b, :] = [A_coc, A_coc, ..., A_coc, A_traj_1, A_traj_2, ..., A_traj_T]
@@ -236,7 +297,7 @@ advantages[b, :] = [A_coc, A_coc, ..., A_coc, A_traj_1, A_traj_2, ..., A_traj_T]
 ```
 
 TRL's `_compute_loss` already supports `(B, T)` advantages (see the `if advantages.dim() == 1: advantages = advantages.unsqueeze(1)` guard in the base GRPOTrainer).
-For  trajectory tokens, we mask out some of the tokens randomly so that the loss is not dominated by them.
+For trajectory tokens, we mask out some of the tokens randomly so that the loss is not dominated by them.
 
 ### Group Normalization — Deliberately Omitted
 

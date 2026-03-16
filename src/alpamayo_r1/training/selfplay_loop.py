@@ -154,8 +154,6 @@ class RolloutReplayBuffer:
         completion_segment_map: list[dict] | None = None,
         value_head: torch.nn.Module | None = None,
         reward_weights: tuple[float, float, float] = (0.5, 0.25, 0.25),
-        gamma: float = 1.0,
-        gae_lambda: float = 1.0,
     ) -> None:
         """Recompute advantage labels for all buffer entries using current value head.
 
@@ -166,15 +164,13 @@ class RolloutReplayBuffer:
             logger.debug("No value head or hidden stash — skipping label recomputation")
             return
 
-        # Recompute advantages
+        # Recompute advantages (return minus baseline)
         new_advantages = compute_segment_advantages_from_rollouts(
             segment_hidden_stash=segment_hidden_stash,
             segment_reward_stash=segment_reward_stash,
             completion_segment_map=completion_segment_map,
             value_head=value_head,
             reward_weights=reward_weights,
-            gamma=gamma,
-            gae_lambda=gae_lambda,
         )
 
         # Update labels in buffer
@@ -359,11 +355,8 @@ class SelfPlayLoop:
                 rollout_results
             )
 
-            # 3. Compute per-segment advantages
+            # 3. Compute per-segment advantages (return minus baseline)
             reward_weights = self._get_reward_weights()
-            gamma = float(vh_cfg.get("gamma", 1.0))
-            gae_lambda = float(vh_cfg.get("gae_lambda", 1.0))
-
             value_head = self._get_or_create_value_head()
             advantages = compute_segment_advantages_from_rollouts(
                 segment_hidden_stash=segment_hidden_stash,
@@ -371,8 +364,6 @@ class SelfPlayLoop:
                 completion_segment_map=completion_segment_map,
                 value_head=value_head,
                 reward_weights=reward_weights,
-                gamma=gamma,
-                gae_lambda=gae_lambda,
             )
         else:
             # Fallback: use composite reward as a_obs, no segment-level detail
