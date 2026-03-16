@@ -71,6 +71,13 @@ SPECIAL_TOKENS_KEYS = [
     "question_end",
     "answer_start",
     "answer_end",
+    # Advantage conditioning tokens (SFT pipeline)
+    "adv_obs_pos",
+    "adv_obs_neg",
+    "adv_coc_pos",
+    "adv_coc_neg",
+    "adv_traj_pos",
+    "adv_traj_neg",
 ]
 SPECIAL_TOKENS = {k: "<|" + k + "|>" for k in SPECIAL_TOKENS_KEYS}
 
