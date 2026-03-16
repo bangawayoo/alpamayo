@@ -1,0 +1,114 @@
+# Advantage-Conditioned Iterative SFT Configuration for Alpamayo-R1
+#
+# Run with:
+#   python -m alpamayo_r1.training.train_sft --config-name sft_default
+#
+# Override any value via CLI:
+#   python -m alpamayo_r1.training.train_sft advantage_conditioning.num_iterations=3 data.max_samples=100
+
+# Hydra logging — disable Hydra's extra handlers to prevent duplicate log lines
+defaults:
+  - _self_
+  - override hydra/hydra_logging: none
+  - override hydra/job_logging: none
+
+# General
+seed: 42
+model_name: nvidia/Alpamayo-R1-10B
+base_model_name: nvidia/Alpamayo-R1-10B
+
+# VLM LoRA configuration (applied fresh each iteration on pi_0)
+lora:
+  enabled: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+
+# SFT training parameters (HF TrainingArguments, per-iteration inner loop)
+training:
+  output_dir: outputs/sft_advcond
+  num_train_epochs: 1           # epochs per iteration
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 5e-6
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 1
+  save_steps: 200
+  save_total_limit: 3
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  report_to: tensorboard
+
+# Advantage conditioning parameters (outer self-play loop)
+advantage_conditioning:
+  num_iterations: 5             # self-play outer loop iterations
+  completions_per_scene: 8      # G completions per scene during rollout
+  p_drop: 0.3                   # conditioning dropout probability for CFG
+  alpha: 1.0                    # conditional loss weight (unconditional = 1.0)
+  k_obs: 30                     # percentile threshold for obs-level binarization
+  k_coc: 30                     # percentile threshold for coc-level binarization
+  k_traj: 30                    # percentile threshold for traj-level binarization
+  ema_alpha: 0.99               # EMA decay for obs-level baseline
+  replay_ratio: 0.3             # fraction of training data from historical replay buffer
+  replay_buffer_max_size: 50000
+
+# Value head (required for segment-level advantage computation)
+value_head:
+  enabled: true
+  hidden_dim: 4096              # must match VLM hidden size
+  lr: 1e-5
+  load_path: null               # pre-trained value head checkpoint
+  segment_level: true
+  gamma: 1.0
+  gae_lambda: 1.0
+
+# Action expert finetuning (CFM / flow matching)
+# Uses deferred GPU scheduling: expert step runs after VLM SFT backward
+expert_finetune:
+  enabled: true
+  lr: 1e-4
+  weight_decay: 0.01
+  num_noisy_samples: 4          # noise samples per GT action for CFM loss
+  every_n_steps: 1              # run expert CFM step every N VLM SFT steps
+  max_grad_norm: 1.0
+  save_path: null               # where to save expert checkpoints
+  load_path: null               # pre-trained expert weights to load
+  expert_lora:
+    enabled: true
+    r: 4
+    alpha: 32
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+
+# Dataset configuration
+data:
+  split: train
+  t0_us: 5100000                # 5.1 seconds into each clip
+  max_samples: 3000             # total scenes, partitioned across iterations
+  clip_ids_file: null
+  exclude_clip_ids_file: notebooks/clip_ids.parquet
+  dataset_revision: 05e158af89ba
+
+# Reward function weights (must sum to 1.0)
+rewards:
+  trajectory_weight: 0.50
+  reasoning_weight: 0.25
+  consistency_weight: 0.25
+
+# Rollout generation parameters
+rollout:
+  temperature: 1.2              # higher than GRPO (0.6) for exploration
+  top_p: 0.98
+  max_generation_length: 256
+  logprob_mini_batch_size: 2
+  data_cache_max_size: 200      # LRU cache entries (~130 MB each with PIL images)
+  vllm_server_url: null         # optional: URL for vLLM server mode (null = use HF generate)
