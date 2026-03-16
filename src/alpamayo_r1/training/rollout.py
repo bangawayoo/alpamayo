@@ -502,7 +502,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self._advantage_enabled: bool = True
         # Segment-level stashes: per-completion hidden states and decomposed rewards
         self._segment_hidden_stash: list[dict] = []  # {h_obs, h_coc, h_traj, ...}
-        self._segment_reward_stash: list[dict] = []  # {r_coc, r_traj_per_step, r_consistency}
+        self._segment_reward_stash: list[dict] = []  # {r_reason, r_consist, r_traj, r_traj_per_step}
         # Per-completion metadata for building (B, T) advantages after scoring
         self._completion_segment_map: list[dict] = []  # {coc_len, traj_len, ...}
 
@@ -1251,8 +1251,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
     ) -> torch.Tensor:
         """Compute (B, T) segment-level advantages using the value head.
 
-        For each completion:
-        - CoC tokens get: A_coc = w_reason * R_reasoning + gamma * V(s_coc) - V(s_obs)
+        For each completion (return-minus-baseline at each level):
+        - CoC tokens get: A_coc = G(s_coc) - V(s_coc)
         - Trajectory tokens get: A_traj_t via GAE(gamma, lambda) on per-timestep rewards
         - Random masking of trajectory positions to balance gradient contribution
 
@@ -1371,8 +1371,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 all_v_traj.append(torch.zeros(0))
 
             # --- Advantage computation ---
-            # CoC advantage: TD step spanning the entire reasoning segment
-            a_coc = w_reason * r_reason + self._gamma * v_coc.item() - v_obs.item()
+            # CoC advantage: return-minus-baseline at the CoC information level.
+            # G(s_coc) = traj_total (R_reasoning already collected at s_coc).
+            # A_coc = G(s_coc) - V(s_coc)
+            a_coc = g_coc - v_coc.item()
 
             # Trajectory advantages: GAE(gamma, lambda)
             if T_traj > 0:
@@ -1414,18 +1416,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         )
 
         # --- Log metrics ---
-        n_stashed = len(self._segment_reward_stash)
-        if B > 0 and n_stashed >= B:
-            coc_advs = [
-                self._value_reward_weights[1] * self._segment_reward_stash[i].get("r_reason", 0)
-                + self._gamma * all_v_coc[i]
-                - all_v_obs[i]
-                for i in range(B)
-            ]
+        if B > 0:
+            coc_advs = [all_g_coc[i] - all_v_coc[i] for i in range(B)]
             self._metrics[mode]["advantages/coc_mean"].append(float(np.mean(coc_advs)))
-        elif B > 0:
-            # Fallback: log from computed advantages directly
-            self._metrics[mode]["advantages/coc_mean"].append(0.0)
         if any(m["traj_len"] > 0 for m in self._completion_segment_map):
             traj_adv_vals = []
             for i in range(B):
@@ -1590,8 +1583,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 self._segment_reward_stash.append(
                     {
                         "r_reason": r_reason[i],
-                        "r_consistency": r_consist[i],
-                        "r_traj_scalar": r_traj[i],
+                        "r_consist": r_consist[i],
+                        "r_traj": r_traj[i],
                         "r_traj_per_step": r_per_step,
                     }
                 )
