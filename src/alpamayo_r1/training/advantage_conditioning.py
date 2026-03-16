@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from alpamayo_r1.models.base_model import ADV_CONDITIONING_TOKENS, IGNORE_INDEX
@@ -296,6 +297,193 @@ def compute_segment_advantages_from_rollouts(
         )
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# 3c-bis. Value head training
+# ---------------------------------------------------------------------------
+
+
+def compute_value_targets(
+    segment_reward_stash: list[dict],
+    completion_segment_map: list[dict],
+    reward_weights: tuple[float, float, float] = (0.5, 0.25, 0.25),
+) -> tuple[list[float], list[float], list[torch.Tensor]]:
+    """Compute returns-to-go targets for value head training at all three levels.
+
+    Uses the same reward decomposition as compute_segment_advantages_from_rollouts,
+    but returns the raw targets (not advantages) for MSE training.
+
+    Args:
+        segment_reward_stash: Per-completion {r_traj, r_reason, r_consist, r_traj_per_step}.
+        completion_segment_map: Per-completion {coc_len, traj_len, traj_positions}.
+        reward_weights: (w_traj, w_reason, w_consist).
+
+    Returns:
+        (g_obs_list, g_coc_list, g_traj_list):
+        - g_obs_list: per-completion total return G(s_obs)
+        - g_coc_list: per-completion remaining return G(s_coc)
+        - g_traj_list: per-completion return-to-go tensors G(s_traj_j), shape (T_traj,) each
+    """
+    w_traj, w_reason, w_consist = reward_weights
+    g_obs_list = []
+    g_coc_list = []
+    g_traj_list = []
+
+    for i in range(len(segment_reward_stash)):
+        seg_rew = segment_reward_stash[i]
+        seg_map = completion_segment_map[i]
+
+        r_traj_scalar = seg_rew.get("r_traj", 0.0)
+        r_reason = seg_rew.get("r_reason", 0.0)
+        r_consist = seg_rew.get("r_consist", 0.0)
+
+        T_traj = seg_map["traj_len"]
+        if T_traj > 0:
+            r_per_step = seg_rew.get("r_traj_per_step")
+            if r_per_step is not None and len(r_per_step) == T_traj:
+                r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
+            else:
+                r_per_step_t = torch.full((T_traj,), r_traj_scalar / max(T_traj, 1))
+            r_traj_weighted = w_traj * r_per_step_t
+            r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
+        else:
+            r_traj_weighted = torch.zeros(0)
+
+        traj_total = r_traj_weighted.sum().item() if T_traj > 0 else 0.0
+        g_obs = w_reason * r_reason + traj_total
+        g_coc = traj_total
+
+        g_obs_list.append(g_obs)
+        g_coc_list.append(g_coc)
+
+        if T_traj > 0:
+            g_traj = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
+            g_traj_list.append(g_traj)
+        else:
+            g_traj_list.append(torch.zeros(0))
+
+    return g_obs_list, g_coc_list, g_traj_list
+
+
+def train_segment_value_head(
+    value_head: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    segment_hidden_stash: list[dict],
+    g_obs_list: list[float],
+    g_coc_list: list[float],
+    g_traj_list: list[torch.Tensor],
+    num_epochs: int = 10,
+    max_traj_samples_per_completion: int = 8,
+) -> dict[str, float]:
+    """Train the three-level value head on returns-to-go targets.
+
+    Runs multiple epochs over the provided data to train V toward convergence
+    before advantages are computed (per the design doc's "separate loop" schedule).
+
+    Args:
+        value_head: SegmentValueHead instance.
+        optimizer: Optimizer for the value head parameters.
+        segment_hidden_stash: Per-completion {h_obs, h_coc, h_traj}.
+        g_obs_list: Per-completion G(s_obs) targets.
+        g_coc_list: Per-completion G(s_coc) targets.
+        g_traj_list: Per-completion G(s_traj_j) tensors.
+        num_epochs: Number of training epochs over the data.
+        max_traj_samples_per_completion: Sub-sample trajectory tokens to prevent
+            them from dominating the loss.
+
+    Returns:
+        Dict of final-epoch metrics: {loss, loss_obs, loss_coc, loss_traj,
+        pred_obs_mean, target_obs_mean}.
+    """
+    from alpamayo_r1.training.value_head import SegmentValueHead
+
+    B = len(g_obs_list)
+    if B == 0:
+        return {"loss": 0.0}
+
+    vh_device = next(value_head.parameters()).device
+    metrics = {}
+
+    for epoch in range(num_epochs):
+        # --- Obs-level loss ---
+        obs_preds = []
+        for i in range(B):
+            h_obs = segment_hidden_stash[i]["h_obs"].to(vh_device)
+            v = value_head(h_obs, level=SegmentValueHead.LEVEL_OBS)
+            obs_preds.append(v)
+        obs_pred_t = torch.cat(obs_preds)
+        obs_target_t = torch.tensor(g_obs_list, device=vh_device, dtype=torch.float32)
+        loss_obs = F.mse_loss(obs_pred_t, obs_target_t)
+
+        # --- CoC-level loss ---
+        coc_preds = []
+        for i in range(B):
+            h_coc = segment_hidden_stash[i]["h_coc"].to(vh_device)
+            v = value_head(h_coc, level=SegmentValueHead.LEVEL_COC)
+            coc_preds.append(v)
+        coc_pred_t = torch.cat(coc_preds)
+        coc_target_t = torch.tensor(g_coc_list, device=vh_device, dtype=torch.float32)
+        loss_coc = F.mse_loss(coc_pred_t, coc_target_t)
+
+        # --- Traj-level loss (sub-sampled) ---
+        traj_preds = []
+        traj_targets = []
+        for i in range(B):
+            h_traj = segment_hidden_stash[i]["h_traj"]
+            g_traj = g_traj_list[i]
+            if h_traj.shape[0] == 0:
+                continue
+            T_t = h_traj.shape[0]
+            n_keep = min(T_t, max_traj_samples_per_completion)
+            if n_keep < T_t:
+                indices = torch.randperm(T_t)[:n_keep]
+                h_sub = h_traj[indices].to(vh_device)
+                g_sub = g_traj[indices].to(vh_device)
+            else:
+                h_sub = h_traj.to(vh_device)
+                g_sub = g_traj.to(vh_device)
+            v = value_head(h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ).squeeze(0)
+            traj_preds.append(v)
+            traj_targets.append(g_sub)
+
+        if traj_preds:
+            traj_pred_t = torch.cat(traj_preds)
+            traj_target_t = torch.cat(traj_targets)
+            loss_traj = F.mse_loss(traj_pred_t, traj_target_t)
+        else:
+            loss_traj = torch.tensor(0.0, device=vh_device)
+
+        # --- Combined loss ---
+        total_loss = (loss_obs + loss_coc + loss_traj) / 3.0
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        metrics = {
+            "loss": total_loss.item(),
+            "loss_obs": loss_obs.item(),
+            "loss_coc": loss_coc.item(),
+            "loss_traj": loss_traj.item(),
+            "pred_obs_mean": obs_pred_t.detach().mean().item(),
+            "target_obs_mean": obs_target_t.mean().item(),
+        }
+
+    logger.info(
+        "Value head training: %d epochs, %d samples | "
+        "loss=%.4f (obs=%.4f, coc=%.4f, traj=%.4f) | "
+        "pred_obs=%.3f target_obs=%.3f",
+        num_epochs,
+        B,
+        metrics["loss"],
+        metrics["loss_obs"],
+        metrics["loss_coc"],
+        metrics["loss_traj"],
+        metrics["pred_obs_mean"],
+        metrics["target_obs_mean"],
+    )
+    return metrics
 
 
 # ---------------------------------------------------------------------------

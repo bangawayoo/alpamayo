@@ -1,6 +1,7 @@
 """Unit tests for advantage conditioning and self-play loop modules."""
 
 import pytest
+import torch
 
 from alpamayo_r1.models.base_model import IGNORE_INDEX
 from alpamayo_r1.training.advantage_conditioning import (
@@ -9,6 +10,8 @@ from alpamayo_r1.training.advantage_conditioning import (
     AdvantageBuffer,
     AdvCondDataset,
     build_conditioned_sequence,
+    compute_value_targets,
+    train_segment_value_head,
 )
 from alpamayo_r1.training.selfplay_loop import RolloutReplayBuffer, ScenePartitioner
 
@@ -240,3 +243,83 @@ class TestRolloutReplayBuffer:
         r, l = buf.sample(5)
         assert r == []
         assert l == []
+
+
+class TestValueHeadTraining:
+    """Test value head training functions with a mock SegmentValueHead."""
+
+    def _make_mock_data(self, n=4, T_traj=8, D=32):
+        """Create synthetic segment hidden states and reward stash."""
+        segment_hidden_stash = []
+        segment_reward_stash = []
+        completion_segment_map = []
+
+        for i in range(n):
+            segment_hidden_stash.append({
+                "h_obs": torch.randn(1, D),
+                "h_coc": torch.randn(1, D),
+                "h_traj": torch.randn(T_traj, D),
+            })
+            segment_reward_stash.append({
+                "r_traj": 0.5 + 0.3 * i,
+                "r_reason": 0.4 + 0.1 * i,
+                "r_consist": 0.3,
+                "r_traj_per_step": [0.5 / T_traj] * T_traj,
+            })
+            completion_segment_map.append({
+                "coc_len": 20,
+                "traj_len": T_traj,
+                "traj_positions": list(range(T_traj)),
+                "total_len": 20 + T_traj,
+            })
+
+        return segment_hidden_stash, segment_reward_stash, completion_segment_map
+
+    def test_compute_value_targets(self):
+        """Verify returns-to-go are computed correctly."""
+        _, reward_stash, seg_map = self._make_mock_data(n=2, T_traj=4)
+        g_obs, g_coc, g_traj = compute_value_targets(
+            reward_stash, seg_map, reward_weights=(0.5, 0.25, 0.25)
+        )
+        assert len(g_obs) == 2
+        assert len(g_coc) == 2
+        assert len(g_traj) == 2
+
+        # G(s_obs) = w_reason * r_reason + traj_total
+        # G(s_coc) = traj_total (excludes reasoning reward)
+        assert g_obs[0] > g_coc[0]  # obs includes reasoning reward
+
+        # G(s_traj) should be decreasing (return-to-go shrinks)
+        assert g_traj[0][0].item() >= g_traj[0][-1].item()
+
+    def test_train_reduces_loss(self):
+        """Verify that training for multiple epochs reduces the loss."""
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        D = 32
+        vh = SegmentValueHead(hidden_dim=D)
+        optimizer = torch.optim.Adam(vh.parameters(), lr=1e-3)
+
+        hidden_stash, reward_stash, seg_map = self._make_mock_data(n=8, T_traj=4, D=D)
+        g_obs, g_coc, g_traj = compute_value_targets(
+            reward_stash, seg_map, reward_weights=(0.5, 0.25, 0.25)
+        )
+
+        # Train for 1 epoch to get initial loss
+        m1 = train_segment_value_head(
+            vh, optimizer, hidden_stash, g_obs, g_coc, g_traj, num_epochs=1
+        )
+        # Train for 50 more epochs
+        m2 = train_segment_value_head(
+            vh, optimizer, hidden_stash, g_obs, g_coc, g_traj, num_epochs=50
+        )
+        assert m2["loss"] < m1["loss"], f"Loss should decrease: {m1['loss']} -> {m2['loss']}"
+
+    def test_train_empty_data(self):
+        """Training with no data should return zero loss."""
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=32)
+        optimizer = torch.optim.Adam(vh.parameters(), lr=1e-3)
+        metrics = train_segment_value_head(vh, optimizer, [], [], [], [], num_epochs=5)
+        assert metrics["loss"] == 0.0

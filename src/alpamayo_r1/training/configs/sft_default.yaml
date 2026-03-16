@@ -63,10 +63,11 @@ value_head:
   enabled: true
   hidden_dim: 4096              # must match VLM hidden size
   lr: 1e-5
-  load_path: null               # pre-trained value head checkpoint
+  load_path: null               # pre-trained value head checkpoint (skips pre-training if provided)
   segment_level: true
-  gamma: 1.0
-  gae_lambda: 1.0
+  train_epochs: 10              # epochs to train value head per iteration (before advantage computation)
+  pretrain_scenes: 50           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)
+  pretrain_epochs: 50           # epochs for Stage 0 pre-training
 
 # Action expert finetuning (CFM / flow matching)
 # Uses deferred GPU scheduling: expert step runs after VLM SFT backward

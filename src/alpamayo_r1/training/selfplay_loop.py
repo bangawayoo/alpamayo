@@ -27,7 +27,9 @@ from alpamayo_r1.training.advantage_conditioning import (
     AdvantageBuffer,
     AdvCondDataset,
     compute_segment_advantages_from_rollouts,
+    compute_value_targets,
     register_advantage_tokens,
+    train_segment_value_head,
 )
 
 logger = logging.getLogger(__name__)
@@ -245,12 +247,118 @@ class SelfPlayLoop:
         self.replay_ratio = float(adv_cfg.get("replay_ratio", 0.3))
 
     def run(self) -> None:
-        """Run all iterations of the self-play loop."""
+        """Run all iterations of the self-play loop.
+
+        If value head pre-training is configured, runs Stage 0 first to
+        bootstrap the value head with sensible predictions before the first
+        iteration computes advantages.
+        """
+        vh_cfg = self.cfg.get("value_head", {})
+        pretrain_scenes = int(vh_cfg.get("pretrain_scenes", 0))
+        if pretrain_scenes > 0 and vh_cfg.get("enabled", False):
+            self.pretrain_value_head(num_scenes=pretrain_scenes)
+
         for i in range(self.num_iterations):
             logger.info("=" * 60)
             logger.info("SELF-PLAY ITERATION %d / %d", i + 1, self.num_iterations)
             logger.info("=" * 60)
             self.run_iteration(i)
+
+    def pretrain_value_head(
+        self,
+        num_scenes: int = 50,
+        num_epochs: int | None = None,
+    ) -> None:
+        """Stage 0: Pre-train the value head on rollouts from pi_0.
+
+        Generates rollouts from the base policy, extracts segment hidden
+        states, and trains the value head for many epochs so that the first
+        SFT iteration starts with a sensible baseline instead of random
+        predictions.
+
+        This can be called standalone (before run()) or is called automatically
+        when value_head.pretrain_scenes > 0 in the config.
+
+        Args:
+            num_scenes: Number of scenes to generate rollouts for.
+            num_epochs: Training epochs (default: value_head.pretrain_epochs
+                from config, or 50).
+        """
+        from alpamayo_r1.training.sft_rollout import RolloutEngine
+
+        logger.info("=" * 60)
+        logger.info("STAGE 0: VALUE HEAD PRE-TRAINING (%d scenes)", num_scenes)
+        logger.info("=" * 60)
+
+        vh_cfg = self.cfg.get("value_head", {})
+        if num_epochs is None:
+            num_epochs = int(vh_cfg.get("pretrain_epochs", 50))
+
+        adv_cfg = self.cfg.get("advantage_conditioning", {})
+        rollout_cfg = self.cfg.get("rollout", {})
+        G = int(adv_cfg.get("completions_per_scene", 8))
+        t0_us = int(self.cfg.get("data", {}).get("t0_us", 5_100_000))
+
+        # Use scenes from the first partition (they'll still be fresh for iter 0)
+        # Plus any extra scenes beyond the partitions if available
+        all_scenes = []
+        for i in range(self.num_iterations):
+            all_scenes.extend(self.partitioner.get_fresh_scenes(i))
+            if len(all_scenes) >= num_scenes:
+                break
+        pretrain_scenes = all_scenes[:num_scenes]
+
+        # Generate rollouts from current model (pi_0)
+        data_cache = self._get_data_cache()
+        engine = RolloutEngine(
+            full_model=self.full_model,
+            processor=self.processor,
+            data_cache=data_cache,
+            rollout_cfg=rollout_cfg,
+        )
+
+        logger.info("Generating rollouts from %d scenes (G=%d)...", len(pretrain_scenes), G)
+        rollout_results = engine.generate_completions(pretrain_scenes, t0_us, G)
+        logger.info("Generated %d completions", len(rollout_results))
+
+        if not rollout_results:
+            logger.warning("No rollouts generated — skipping value head pre-training")
+            return
+
+        # Compute rewards
+        reward_stash = engine.compute_rewards(rollout_results)
+
+        # Extract segment hidden states
+        segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
+            rollout_results
+        )
+
+        # Compute value targets
+        reward_weights = self._get_reward_weights()
+        g_obs, g_coc, g_traj = compute_value_targets(
+            segment_reward_stash=reward_stash,
+            completion_segment_map=completion_segment_map,
+            reward_weights=reward_weights,
+        )
+
+        # Train value head
+        value_head = self._get_or_create_value_head()
+        metrics = train_segment_value_head(
+            value_head=value_head,
+            optimizer=self._value_head_optimizer,
+            segment_hidden_stash=segment_hidden_stash,
+            g_obs_list=g_obs,
+            g_coc_list=g_coc,
+            g_traj_list=g_traj,
+            num_epochs=num_epochs,
+        )
+
+        # Save pre-trained value head
+        output_dir = Path(self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
+        vh_path = output_dir / "value_head_pretrained.pt"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(value_head.state_dict(), vh_path)
+        logger.info("Saved pre-trained value head to %s (loss=%.4f)", vh_path, metrics["loss"])
 
     def run_iteration(self, iteration: int) -> None:
         """Run a single iteration of the self-play loop.
@@ -355,9 +463,27 @@ class SelfPlayLoop:
                 rollout_results
             )
 
-            # 3. Compute per-segment advantages (return minus baseline)
+            # 3. Train value head to convergence on rollout data
             reward_weights = self._get_reward_weights()
             value_head = self._get_or_create_value_head()
+            g_obs, g_coc, g_traj = compute_value_targets(
+                segment_reward_stash=reward_stash,
+                completion_segment_map=completion_segment_map,
+                reward_weights=reward_weights,
+            )
+            vh_cfg = self.cfg.get("value_head", {})
+            vh_train_epochs = int(vh_cfg.get("train_epochs", 10))
+            train_segment_value_head(
+                value_head=value_head,
+                optimizer=self._value_head_optimizer,
+                segment_hidden_stash=segment_hidden_stash,
+                g_obs_list=g_obs,
+                g_coc_list=g_coc,
+                g_traj_list=g_traj,
+                num_epochs=vh_train_epochs,
+            )
+
+            # 4. Compute per-segment advantages using converged value head
             advantages = compute_segment_advantages_from_rollouts(
                 segment_hidden_stash=segment_hidden_stash,
                 segment_reward_stash=reward_stash,
@@ -378,13 +504,13 @@ class SelfPlayLoop:
                 )
                 advantages.append({"a_obs": composite, "a_coc": composite, "a_traj": composite})
 
-        # 4. Update advantage buffer
+        # 5. Update advantage buffer
         a_obs_list = [a["a_obs"] for a in advantages]
         a_coc_list = [a["a_coc"] for a in advantages]
         a_traj_list = [a["a_traj"] for a in advantages]
         self.advantage_buffer.update(a_obs_list, a_coc_list, a_traj_list)
 
-        # 5. Binarize
+        # 6. Binarize
         adv_labels = []
         for adv in advantages:
             i_obs, i_coc, i_traj = self.advantage_buffer.binarize(
