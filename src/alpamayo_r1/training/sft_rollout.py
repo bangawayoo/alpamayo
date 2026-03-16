@@ -89,12 +89,8 @@ class RolloutEngine:
         device = self.device
         results = []
 
-        # Ensure VLM and trajectory tokenizers are on the target device
+        # Ensure VLM is on the target device for generation
         self.full_model.vlm.to(device)
-        if self.traj_tokenizer is not None:
-            self.traj_tokenizer.to(device)
-        if hasattr(self.full_model, "hist_traj_tokenizer") and self.full_model.hist_traj_tokenizer is not None:
-            self.full_model.hist_traj_tokenizer.to(device)
         self.full_model.vlm.eval()
         with torch.no_grad():
             for clip_id in clip_ids:
