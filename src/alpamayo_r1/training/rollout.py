@@ -2122,11 +2122,17 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         # Free cached GPU memory before loading expert
         torch.cuda.empty_cache()
 
+        def _mem(label):
+            a = torch.cuda.memory_allocated() / 1024**3
+            r = torch.cuda.memory_reserved() / 1024**3
+            logger.warning("  [expert-mem] %s: %.2f GiB alloc, %.2f GiB reserved", label, a, r)
+
         # Move expert + projections to GPU
         self.full_model.expert.to(device)
         self.full_model.action_in_proj.to(device)
         self.full_model.action_out_proj.to(device)
         self.full_model.action_space.to(device)
+        _mem("after expert→GPU")
 
         total_loss = 0.0
         n_valid = 0
@@ -2142,12 +2148,14 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 # Load scene data from cache
                 model_inputs, ego_future_xyz = self._data_cache.get(clip_id, t0_us, device)
                 ego_future_rot = self._data_cache.get_ego_future_rot(clip_id, t0_us).to(device)
+                _mem("after load scene data")
 
                 # Teacher-forced VLM forward → KV cache
                 kv_result = self._get_vlm_kv_cache_teacher_forced(
                     model_inputs, completion_prefix, device
                 )
                 prompt_cache, rope_deltas, prefill_seq_len, b_star, offset = kv_result
+                _mem("after VLM KV cache")
 
                 # Convert GT trajectory to action space.
                 # ego_history_*: (1, N_cameras, T, ...) — take last camera
@@ -2167,21 +2175,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 # but compute_cfm_loss creates num_noisy_samples inputs.
                 if num_noisy_samples > 1:
                     prompt_cache.batch_repeat_interleave(num_noisy_samples)
-
-                # Debug: verify cache expansion worked
-                _layer0 = prompt_cache.layers[0]
-                logger.info(
-                    "expert CFM cache debug | layers=%d seq_len=%d "
-                    "layer0_keys=%s rope_deltas=%s offset=%s "
-                    "gt_action=%s num_noisy=%d",
-                    len(prompt_cache.layers),
-                    prompt_cache.get_seq_length(),
-                    tuple(_layer0.keys.shape),
-                    tuple(rope_deltas.shape),
-                    tuple(offset.shape),
-                    tuple(gt_action.shape),
-                    num_noisy_samples,
-                )
+                _mem("after KV cache expand")
 
                 # Compute CFM loss
                 with torch.autocast(str(device), dtype=torch.bfloat16):
@@ -2197,6 +2191,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         device=device,
                     )
                     loss = loss / rollouts_per_step  # average over top-K
+                _mem("after compute_cfm_loss")
 
                 loss.backward()
                 total_loss += loss.item()
@@ -2251,11 +2246,8 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         The GRPO forward+backward runs first (full GPU budget), then activations
         are freed, and the expert step gets the reclaimed memory.
         """
-        # Stash advantages for expert before GRPO training_step consumes inputs
-        if self._expert_finetune_enabled:
-            self._expert_pending_advantages = inputs.get("advantages", None)
-
         # Normal GRPO training step: compute_loss → backward (frees activation graph)
+        # (advantages are stashed inside compute_loss where inputs is already a dict)
         output = super().training_step(model, inputs, num_items_in_batch)
 
         # Run expert CFM after GRPO backward — activations freed, expert gets full GPU
@@ -2266,8 +2258,49 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             if is_acc_boundary and self.state.global_step % every_n == 0:
                 import gc
 
+                # Log before cleanup
+                alloc_before = torch.cuda.memory_allocated() / 1024**3
+                reserved_before = torch.cuda.memory_reserved() / 1024**3
+                logger.warning(
+                    "Pre-cleanup GPU: %.2f GiB allocated, %.2f GiB reserved (step %d)",
+                    alloc_before,
+                    reserved_before,
+                    self.state.global_step,
+                )
+
+                # Free GRPO batch tensors (pixel_values, input_ids, logprobs, etc.)
+                # that are still on GPU. The `inputs` variable in the caller's
+                # _inner_training_loop scope keeps them alive, so we offload here.
+                n_offloaded = 0
+                if isinstance(inputs, dict):
+                    for k, v in inputs.items():
+                        if isinstance(v, torch.Tensor) and v.is_cuda:
+                            inputs[k] = v.cpu()
+                            n_offloaded += 1
+                elif isinstance(inputs, (list, tuple)):
+                    for item in inputs:
+                        if isinstance(item, dict):
+                            for k, v in item.items():
+                                if isinstance(v, torch.Tensor) and v.is_cuda:
+                                    item[k] = v.cpu()
+                                    n_offloaded += 1
+
                 gc.collect()
                 torch.cuda.empty_cache()
+
+                alloc_after = torch.cuda.memory_allocated() / 1024**3
+                reserved_after = torch.cuda.memory_reserved() / 1024**3
+                total_gib = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                logger.warning(
+                    "Post-cleanup GPU: %.2f GiB allocated, %.2f GiB reserved, "
+                    "~%.2f GiB free, offloaded %d tensors (step %d)",
+                    alloc_after,
+                    reserved_after,
+                    total_gib - reserved_after,
+                    n_offloaded,
+                    self.state.global_step,
+                )
+
                 try:
                     self._expert_cfm_step_deferred()
                 except Exception as e:
@@ -2290,6 +2323,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         **Value head stage 1** (``_value_pretrain_remaining == 0``): normal GRPO plus a
         value head update from the stash.
         """
+        # Stash advantages for deferred expert step (inputs is a dict here)
+        if self._expert_finetune_enabled and isinstance(inputs, dict):
+            self._expert_pending_advantages = inputs.get("advantages", None)
+
         if self.value_head is None:
             return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
 
