@@ -86,24 +86,33 @@ These are added to the tokenizer vocabulary and their embeddings are trained fro
 
 > **Why not a CoC-level token?** The CoC advantage would be computed at state s_coc — after the full reasoning trace is generated but before the first trajectory token. Since V(s_coc) and V(s_traj_0) see nearly identical information (observation + complete CoC text), A_coc and A_traj at j=0 would be redundant. The trajectory-level advantage already captures whether the CoC set up good conditions for the trajectory — a positive A_traj implicitly reflects good reasoning.
 
-### Placement in the Prompt
+### Placement in the Sequence
 
-The conditioning tokens are prepended to the completion, immediately after the prompt and before generation begins:
+Each conditioning token is placed immediately before the segment it conditions, matching the causal scope of the advantage it represents:
 
 ```
 [system prompt] [image tokens] [history trajectory] [task instruction]
-  ↓ advantage conditioning block (only during training)
-[<|adv_obs_pos|> <|adv_traj_neg|>]
-  ↓ generation
+  ↓ adv_obs: conditions entire completion (CoC + trajectory)
+[<|adv_obs_pos|>]
+  ↓ CoC generation
 [<|cot_start|> ... reasoning text ... <|cot_end|>]
+  ↓ adv_traj: conditions only trajectory (placed after CoC, before trajectory)
+[<|adv_traj_neg|>]
+  ↓ trajectory generation
 [<|traj_future_start|> <i0> ... <i63> <|traj_future_end|>]
 ```
 
-At inference, we set both tokens to their positive variants:
+**Why this placement?** With autoregressive attention, each token can only attend to preceding tokens. Placing `adv_traj` after the CoC ensures it only influences trajectory generation — not reasoning. This matches the causal structure: A_traj is computed after the CoC is already generated, so it should not leak trajectory quality information into CoC token predictions. Placing it before the CoC would let the model generate different reasoning depending on whether the trajectory label is positive or negative, which is causally backwards.
+
+`adv_obs` is placed before the CoC because A_obs evaluates the entire completion (CoC + trajectory), so it appropriately conditions both segments.
+
+At inference, both tokens are set to positive:
 
 ```
-[prompt] [<|adv_obs_pos|> <|adv_traj_pos|>] → generate
+[prompt] [<|adv_obs_pos|>] [CoC generation ...] [<|adv_traj_pos|>] [trajectory generation ...]
 ```
+
+During generation, `adv_traj_pos` is inserted after the model generates `<|cot_end|>` (or `<|traj_future_start|>`) and before trajectory token sampling begins.
 
 ### Why Two Levels, Not One
 
@@ -235,10 +244,10 @@ is_all_positive = (I_obs == 1) and (I_traj == 1)
 
 if is_all_positive and random() < p_drop:
     # Unconditional: no advantage tokens (only for positive completions)
-    input = [prompt] + [completion]
+    input = [prompt] + [coc_tokens] + [traj_tokens]
 else:
-    # Conditional: advantage tokens prepended (all completions)
-    input = [prompt] + [I_obs, I_traj] + [completion]
+    # Conditional: advantage tokens inserted at their causal positions
+    input = [prompt] + [I_obs] + [coc_tokens] + [I_traj] + [traj_tokens]
 ```
 
 With this scheme, the effective unconditional training fraction is `p_drop × frac_all_positive`. If ~40% of completions are all-positive and `p_drop = 0.3`, about 12% of training examples train the unconditional path — enough for CFG but not so much that it dominates.
