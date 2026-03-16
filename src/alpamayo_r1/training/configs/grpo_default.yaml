@@ -132,3 +132,8 @@ value_head:
   save_path: null      # save value head weights here (null = don't save)
                        # step-numbered checkpoints (e.g. *_step200.pt) are also saved at each interval
   load_path: null      # load pre-trained value head weights at init (null = random init)
+  advantage_enabled: true  # replace GRPO group-mean baseline with value-head advantages
+  segment_level: false     # true = three-level (obs/coc/traj) advantages; false = scene-level only
+  gamma: 1.0              # discount factor for TD/GAE (1.0 for short sequences)
+  gae_lambda: 1.0         # GAE trace decay (1.0 = unbiased MC return minus baseline)
+  traj_mask_ratio: 0.5    # fraction of trajectory token positions to randomly mask in policy loss

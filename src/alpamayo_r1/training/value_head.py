@@ -1,22 +1,8 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""Segment-level value head for GRPO baseline estimation.
 
-"""Scene-level value head for GRPO baseline estimation.
-
-SceneValueHead maps the VLM's last-prompt hidden state to a scalar
-expected reward, providing a learned baseline for advantage computation.
+SegmentValueHead maps VLM hidden states to scalar value estimates at three
+semantic levels: observation (scene), CoC reasoning, and trajectory tokens.
+A shared MLP with additive level embeddings predicts V(s) at each level.
 """
 
 from __future__ import annotations
@@ -25,18 +11,29 @@ import torch
 import torch.nn as nn
 
 
-class SceneValueHead(nn.Module):
-    """3-layer MLP: h_0 → E[composite_reward | scene].
+class SegmentValueHead(nn.Module):
+    """Shared MLP with level embedding: (h, level) -> V(s).
 
-    Input h_0 is the VLM's last hidden state at the final prompt token,
-    encoding the model's scene understanding before generation begins.
+    Three levels correspond to the three semantic segments of a VLA generation:
+      - Level 0 (obs): last prompt token — scene understanding before generation
+      - Level 1 (coc): <cot_end> token — scene + quality of reasoning produced
+      - Level 2 (traj): each trajectory token — scene + reasoning + trajectory-so-far
+
+    The level embedding is additive: h' = h + level_embed[level], giving the
+    MLP an explicit signal about which stage of generation it's evaluating.
 
     Args:
         hidden_dim: VLM hidden state dimension (4096 for Qwen3-VL-7B/10B).
+        num_levels: Number of distinct levels (default 3).
     """
 
-    def __init__(self, hidden_dim: int = 4096) -> None:
+    LEVEL_OBS = 0
+    LEVEL_COC = 1
+    LEVEL_TRAJ = 2
+
+    def __init__(self, hidden_dim: int = 4096, num_levels: int = 3) -> None:
         super().__init__()
+        self.level_embed = nn.Embedding(num_levels, hidden_dim)
         self.net = nn.Sequential(
             nn.Linear(hidden_dim, 512),
             nn.GELU(),
@@ -45,13 +42,19 @@ class SceneValueHead(nn.Module):
             nn.Linear(128, 1),
         )
 
-    def forward(self, h0: torch.Tensor) -> torch.Tensor:
-        """Predict scene value.
+    def forward(self, h: torch.Tensor, level: int = 0) -> torch.Tensor:
+        """Predict value at one or more sequence positions.
 
         Args:
-            h0: Hidden state tensor, shape (B, hidden_dim).
+            h: Hidden state, shape (B, D) or (B, T, D).
+            level: 0=obs, 1=coc, 2=traj. Additive embedding.
 
         Returns:
-            Scalar value estimates, shape (B,).
+            Value estimates, shape (B,) or (B, T).
         """
-        return self.net(h0).squeeze(-1)
+        h = h + self.level_embed.weight[level]
+        return self.net(h).squeeze(-1)
+
+
+# Backward compatibility alias
+SceneValueHead = SegmentValueHead

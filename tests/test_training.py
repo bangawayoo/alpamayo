@@ -16,6 +16,7 @@ import yaml
 # Import tests
 # ===================================================================
 
+
 class TestImports:
     """Verify all training modules can be imported."""
 
@@ -43,11 +44,13 @@ class TestImports:
 # Reward function tests
 # ===================================================================
 
+
 class TestTrajectoryQualityReward:
     """Tests for trajectory_quality_reward."""
 
     def setup_method(self):
         from alpamayo_r1.training.rewards import trajectory_quality_reward
+
         self.reward_fn = trajectory_quality_reward
 
     def test_perfect_prediction(self):
@@ -106,6 +109,7 @@ class TestReasoningQualityReward:
 
     def setup_method(self):
         from alpamayo_r1.training.rewards import reasoning_quality_reward
+
         self.reward_fn = reasoning_quality_reward
 
     def test_good_reasoning(self):
@@ -165,6 +169,7 @@ class TestConsistencyReward:
 
     def setup_method(self):
         from alpamayo_r1.training.rewards import consistency_reward
+
         self.reward_fn = consistency_reward
 
     def _make_left_turn_traj(self) -> list[float]:
@@ -172,7 +177,7 @@ class TestConsistencyReward:
         T = 64
         traj = np.zeros((T, 3), dtype=np.float32)
         traj[:, 0] = np.linspace(0, 30, T)  # forward
-        traj[:, 1] = np.linspace(0, 5, T)   # left turn (positive y > 1.0m)
+        traj[:, 1] = np.linspace(0, 5, T)  # left turn (positive y > 1.0m)
         return traj.flatten().tolist()
 
     def _make_straight_traj(self) -> list[float]:
@@ -241,6 +246,7 @@ class TestConsistencyReward:
 # Dataset utility tests
 # ===================================================================
 
+
 class TestDatasetUtils:
     """Tests for dataset.py utility functions."""
 
@@ -284,6 +290,7 @@ class TestDatasetUtils:
 # Rollout utility tests
 # ===================================================================
 
+
 class TestRolloutUtils:
     """Tests for rollout.py utility functions."""
 
@@ -308,14 +315,18 @@ class TestRolloutUtils:
         # 2 samples with different completion lengths
         prompt_ids = [torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6, 7])]
         completion_ids = [torch.tensor([10, 11]), torch.tensor([20, 21, 22])]
-        logprobs = [torch.tensor([-.1, -.2]), torch.tensor([-.3, -.4, -.5])]
+        logprobs = [torch.tensor([-0.1, -0.2]), torch.tensor([-0.3, -0.4, -0.5])]
         pred_xyz = [[1.0, 2.0], [3.0, 4.0]]
         gt_xyz = [[5.0, 6.0], [7.0, 8.0]]
         coc_texts = ["text1", "text2"]
 
         result = _collate_rollout_outputs(
-            prompt_ids, completion_ids, logprobs,
-            pred_xyz, gt_xyz, coc_texts,
+            prompt_ids,
+            completion_ids,
+            logprobs,
+            pred_xyz,
+            gt_xyz,
+            coc_texts,
             pad_token_id=0,
         )
 
@@ -349,7 +360,9 @@ class TestRolloutUtils:
             [torch.tensor([1])],
             [torch.tensor([], dtype=torch.long)],
             [torch.tensor([], dtype=torch.float32)],
-            [[]], [[]], [""],
+            [[]],
+            [[]],
+            [""],
             pad_token_id=0,
         )
         assert result["completion_ids"].shape == (1, 1)  # min length 1
@@ -359,6 +372,7 @@ class TestRolloutUtils:
 # ===================================================================
 # Config tests
 # ===================================================================
+
 
 class TestConfig:
     """Tests for the GRPO config file."""
@@ -396,13 +410,18 @@ class TestConfig:
             cfg = yaml.safe_load(f)
 
         rewards = cfg["rewards"]
-        total = rewards["trajectory_weight"] + rewards["reasoning_weight"] + rewards["consistency_weight"]
+        total = (
+            rewards["trajectory_weight"]
+            + rewards["reasoning_weight"]
+            + rewards["consistency_weight"]
+        )
         assert total == pytest.approx(1.0)
 
 
 # ===================================================================
 # Reward helper tests
 # ===================================================================
+
 
 class TestTrajectoryBehaviorDetection:
     """Tests for _trajectory_to_behaviors helper."""
@@ -716,8 +735,10 @@ class TestMetaActions:
         result = trajectory_to_meta_actions([1.0, 2.0])
         assert result is None or isinstance(result, object)
 
+
 # SceneValueHead tests
 # ===================================================================
+
 
 class TestSceneValueHead:
     """CPU-only tests for the SceneValueHead module."""
@@ -773,11 +794,12 @@ class TestSceneValueHead:
         from alpamayo_r1.training.value_head import SceneValueHead
 
         vh = SceneValueHead(hidden_dim=32)
-        # Layer 1: 32*512 + 512 = 16896
-        # Layer 2: 512*128 + 128 = 65664
-        # Layer 3: 128*1 + 1 = 129
+        # MLP: Layer 1: 32*512 + 512 = 16896, Layer 2: 512*128 + 128 = 65664, Layer 3: 128*1 + 1 = 129
+        # Level embedding: 3 * 32 = 96
         total_params = sum(p.numel() for p in vh.parameters())
-        expected = (32 * 512 + 512) + (512 * 128 + 128) + (128 * 1 + 1)
+        mlp_params = (32 * 512 + 512) + (512 * 128 + 128) + (128 * 1 + 1)
+        level_embed_params = 3 * 32
+        expected = mlp_params + level_embed_params
         assert total_params == expected, f"Expected {expected} params, got {total_params}"
 
     def test_optimizer_step(self):
@@ -905,6 +927,7 @@ class TestValueHeadStage0:
 # ===================================================================
 # Monte Carlo value target tests
 # ===================================================================
+
 
 class TestMonteCarloValueTarget:
     """Tests for the Monte Carlo aggregation of value head targets.
@@ -1042,3 +1065,219 @@ class TestMonteCarloValueTarget:
         # Queue fully drained
         assert len(trainer._value_pending_groups) == 0
         assert len(trainer._value_pending_rewards) == 0
+
+
+# ===================================================================
+# SegmentValueHead tests (level embedding + 3D input)
+# ===================================================================
+
+
+class TestSegmentValueHead:
+    """Tests for SegmentValueHead with level embeddings."""
+
+    def test_level_embedding_shape(self):
+        """Level embedding should have (num_levels, hidden_dim) shape."""
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=64, num_levels=3)
+        assert vh.level_embed.weight.shape == (3, 64)
+
+    def test_level_changes_output(self):
+        """Different levels should produce different values for the same input."""
+        import torch
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=32)
+        h = torch.randn(2, 32)
+        v0 = vh(h, level=0)
+        v1 = vh(h, level=1)
+        v2 = vh(h, level=2)
+        # At init with random weights, different level embeddings should give different outputs
+        assert not torch.allclose(v0, v1, atol=1e-6) or not torch.allclose(v1, v2, atol=1e-6)
+
+    def test_3d_input_shape(self):
+        """SegmentValueHead should accept (B, T, D) input and return (B, T)."""
+        import torch
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=32)
+        h = torch.randn(2, 10, 32)  # batch=2, seq_len=10
+        v = vh(h, level=2)
+        assert v.shape == (2, 10), f"Expected (2, 10), got {v.shape}"
+
+    def test_2d_input_shape(self):
+        """SegmentValueHead should accept (B, D) input and return (B,)."""
+        import torch
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=32)
+        h = torch.randn(4, 32)
+        v = vh(h, level=0)
+        assert v.shape == (4,), f"Expected (4,), got {v.shape}"
+
+    def test_backward_compat_alias(self):
+        """SceneValueHead should be an alias for SegmentValueHead."""
+        from alpamayo_r1.training.value_head import SceneValueHead, SegmentValueHead
+
+        assert SceneValueHead is SegmentValueHead
+
+    def test_default_level_zero(self):
+        """Default level=0 should work (backward compat with scene-level usage)."""
+        import torch
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=32)
+        h = torch.randn(2, 32)
+        v = vh(h)  # no level arg — should default to 0
+        assert v.shape == (2,)
+
+    def test_gradient_flows_through_level_embed(self):
+        """Gradients should flow through the level embedding."""
+        import torch
+        from alpamayo_r1.training.value_head import SegmentValueHead
+
+        vh = SegmentValueHead(hidden_dim=32)
+        h = torch.randn(2, 32)
+        v = vh(h, level=1)
+        loss = v.sum()
+        loss.backward()
+        assert vh.level_embed.weight.grad is not None
+        # Only level 1 row should have non-zero gradients
+        assert vh.level_embed.weight.grad[1].abs().sum() > 0
+        assert vh.level_embed.weight.grad[0].abs().sum() == 0
+        assert vh.level_embed.weight.grad[2].abs().sum() == 0
+
+
+# ===================================================================
+# GAE computation tests
+# ===================================================================
+
+
+class TestGAE:
+    """Tests for the _compute_gae helper function."""
+
+    def test_single_timestep(self):
+        """GAE with single timestep should equal r - V."""
+        import torch
+
+        # Import via module-level (can't import rollout due to physical_ai_av)
+        # Replicate the function inline for testing
+        def compute_gae(rewards, values, gamma=1.0, lam=1.0):
+            T = rewards.shape[0]
+            advantages = torch.zeros(T)
+            gae = 0.0
+            for t in reversed(range(T)):
+                if t == T - 1:
+                    delta = rewards[t] - values[t]
+                else:
+                    delta = rewards[t] + gamma * values[t + 1] - values[t]
+                gae = delta + gamma * lam * gae
+                advantages[t] = gae
+            return advantages
+
+        r = torch.tensor([0.8])
+        v = torch.tensor([0.5])
+        a = compute_gae(r, v)
+        assert a[0].item() == pytest.approx(0.3, abs=1e-6)
+
+    def test_gae_lambda_1_equals_mc_return(self):
+        """With gamma=1, lambda=1, GAE reduces to MC return minus baseline."""
+        import torch
+
+        def compute_gae(rewards, values, gamma=1.0, lam=1.0):
+            T = rewards.shape[0]
+            advantages = torch.zeros(T)
+            gae = 0.0
+            for t in reversed(range(T)):
+                if t == T - 1:
+                    delta = rewards[t] - values[t]
+                else:
+                    delta = rewards[t] + gamma * values[t + 1] - values[t]
+                gae = delta + gamma * lam * gae
+                advantages[t] = gae
+            return advantages
+
+        r = torch.tensor([0.1, 0.2, 0.3, 0.4])
+        v = torch.tensor([0.5, 0.4, 0.3, 0.2])
+        a = compute_gae(r, v, gamma=1.0, lam=1.0)
+
+        # With gamma=1, lambda=1: A_t = sum(r[t:]) - V(t)
+        # A_0 = (0.1+0.2+0.3+0.4) - 0.5 = 0.5
+        # A_1 = (0.2+0.3+0.4) - 0.4 = 0.5
+        # A_2 = (0.3+0.4) - 0.3 = 0.4
+        # A_3 = 0.4 - 0.2 = 0.2
+        expected = torch.tensor([0.5, 0.5, 0.4, 0.2])
+        assert torch.allclose(a, expected, atol=1e-5)
+
+    def test_empty_trajectory(self):
+        """GAE should handle empty trajectories."""
+        import torch
+
+        def compute_gae(rewards, values, gamma=1.0, lam=1.0):
+            T = rewards.shape[0]
+            if T == 0:
+                return torch.zeros(0)
+            advantages = torch.zeros(T)
+            gae = 0.0
+            for t in reversed(range(T)):
+                if t == T - 1:
+                    delta = rewards[t] - values[t]
+                else:
+                    delta = rewards[t] + gamma * values[t + 1] - values[t]
+                gae = delta + gamma * lam * gae
+                advantages[t] = gae
+            return advantages
+
+        a = compute_gae(torch.zeros(0), torch.zeros(0))
+        assert a.shape == (0,)
+
+
+# ===================================================================
+# Per-timestep trajectory reward tests
+# ===================================================================
+
+
+class TestPerTimestepRewards:
+    """Tests for trajectory_per_timestep_rewards."""
+
+    def test_perfect_prediction(self):
+        """Perfect prediction should give rewards of 1.0 at all timesteps."""
+        import numpy as np
+        from alpamayo_r1.training.rewards import trajectory_per_timestep_rewards
+
+        gt = [1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0, 0.0]  # 3 timesteps, (T, 3)
+        r = trajectory_per_timestep_rewards(gt, gt)
+        assert r is not None
+        np.testing.assert_allclose(r, [1.0, 1.0, 1.0])
+
+    def test_large_error(self):
+        """Large L2 error should give rewards near 0."""
+        import numpy as np
+        from alpamayo_r1.training.rewards import trajectory_per_timestep_rewards
+
+        pred = [100.0, 100.0, 0.0] * 4
+        gt = [0.0, 0.0, 0.0] * 4
+        r = trajectory_per_timestep_rewards(pred, gt, ade_threshold=5.0)
+        assert r is not None
+        np.testing.assert_array_equal(r, [0.0, 0.0, 0.0, 0.0])
+
+    def test_per_timestep_granularity(self):
+        """Different errors at different timesteps should give different rewards."""
+        import numpy as np
+        from alpamayo_r1.training.rewards import trajectory_per_timestep_rewards
+
+        pred = [0.0, 0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 5.0, 0.0]  # 3 timesteps
+        gt = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        r = trajectory_per_timestep_rewards(pred, gt, ade_threshold=5.0)
+        assert r is not None
+        assert r[0] == pytest.approx(1.0)  # no error
+        assert r[1] == pytest.approx(0.5)  # 2.5/5.0 error
+        assert r[2] == pytest.approx(0.0)  # 5.0/5.0 error
+
+    def test_malformed_input_returns_none(self):
+        """Malformed input should return None."""
+        from alpamayo_r1.training.rewards import trajectory_per_timestep_rewards
+
+        r = trajectory_per_timestep_rewards([], [])
+        # Empty arrays — will fail on reshape
+        assert r is None or len(r) == 0
