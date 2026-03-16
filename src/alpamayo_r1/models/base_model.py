@@ -71,7 +71,14 @@ SPECIAL_TOKENS_KEYS = [
     "question_end",
     "answer_start",
     "answer_end",
-    # Advantage conditioning tokens (SFT pipeline)
+]
+SPECIAL_TOKENS = {k: "<|" + k + "|>" for k in SPECIAL_TOKENS_KEYS}
+
+# Advantage conditioning tokens — NOT included in SPECIAL_TOKENS_KEYS because
+# they must not be registered by _build_processor (which would change vocab_size
+# and break checkpoint loading). Instead, the SFT pipeline registers them
+# explicitly via advantage_conditioning.register_advantage_tokens().
+ADV_CONDITIONING_TOKEN_KEYS = [
     "adv_obs_pos",
     "adv_obs_neg",
     "adv_coc_pos",
@@ -79,7 +86,7 @@ SPECIAL_TOKENS_KEYS = [
     "adv_traj_pos",
     "adv_traj_neg",
 ]
-SPECIAL_TOKENS = {k: "<|" + k + "|>" for k in SPECIAL_TOKENS_KEYS}
+ADV_CONDITIONING_TOKENS = {k: "<|" + k + "|>" for k in ADV_CONDITIONING_TOKEN_KEYS}
 
 
 def _recursive_setattr(obj: Any, attr: str, value: Any) -> None:

@@ -20,21 +20,15 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from alpamayo_r1.models.base_model import IGNORE_INDEX, SPECIAL_TOKENS
+from alpamayo_r1.models.base_model import ADV_CONDITIONING_TOKENS, IGNORE_INDEX
 
 logger = logging.getLogger(__name__)
 
-# The 6 advantage token string representations, derived from SPECIAL_TOKENS_KEYS
-# in base_model.py. The keys must match those added in Step 2.
-ADV_TOKEN_NAMES = [
-    "adv_obs_pos",
-    "adv_obs_neg",
-    "adv_coc_pos",
-    "adv_coc_neg",
-    "adv_traj_pos",
-    "adv_traj_neg",
-]
-ADV_TOKEN_STRINGS = {name: SPECIAL_TOKENS[name] for name in ADV_TOKEN_NAMES}
+# The 6 advantage token string representations, from ADV_CONDITIONING_TOKENS
+# in base_model.py. These are separate from SPECIAL_TOKENS to avoid changing
+# vocab_size during model loading (which would break checkpoint compatibility).
+ADV_TOKEN_NAMES = list(ADV_CONDITIONING_TOKENS.keys())
+ADV_TOKEN_STRINGS = dict(ADV_CONDITIONING_TOKENS)
 
 
 # ---------------------------------------------------------------------------
