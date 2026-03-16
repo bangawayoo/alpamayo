@@ -30,7 +30,7 @@ The key insight: advantage conditioning converts the RL problem into a **conditi
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-|  Phase 0: Value-head training (already implemented)                 |
+|  Phase 0: Value-head training                                       |
 │  Phase 1: ROLLOUT                                                   │
 │  ────────────────                                                   │
 │  Rollout on unseen dataset 
@@ -59,7 +59,7 @@ The key insight: advantage conditioning converts the RL problem into a **conditi
 
 | RECAP (Physical Intelligence) | Ours |
 |---|---|
-| Single binary advantage token | Three segment-level tokens (obs, coc, traj) |
+| Single binary advantage token | Two segment-level tokens (obs, traj) |
 | Expert demonstrations + interventions | Self-play only (policy rollouts) |
 | Flow-matching action head | Autoregressive VLM (text + discrete trajectory tokens) |
 | Distributional value function (201 bins) | Segment value head (MSE, three levels) |
@@ -75,15 +75,16 @@ The key insight: advantage conditioning converts the RL problem into a **conditi
 
 ### Token Design
 
-We introduce six new special tokens, two per segment level:
+We introduce four new special tokens, two per segment level:
 
 ```
-<|adv_obs_pos|>    <|adv_obs_neg|>     # Scene-level: was this a promising scene encoding?
-<|adv_coc_pos|>    <|adv_coc_neg|>     # CoC-level: was the reasoning high quality?
-<|adv_traj_pos|>   <|adv_traj_neg|>    # Traj-level: was the trajectory accurate?
+<|adv_obs_pos|>    <|adv_obs_neg|>     # Scene-level: was this completion good given the scene?
+<|adv_traj_pos|>   <|adv_traj_neg|>    # Traj-level: was the trajectory accurate given the reasoning?
 ```
 
 These are added to the tokenizer vocabulary and their embeddings are trained from scratch during SFT.
+
+> **Why not a CoC-level token?** The CoC advantage would be computed at state s_coc — after the full reasoning trace is generated but before the first trajectory token. Since V(s_coc) and V(s_traj_0) see nearly identical information (observation + complete CoC text), A_coc and A_traj at j=0 would be redundant. The trajectory-level advantage already captures whether the CoC set up good conditions for the trajectory — a positive A_traj implicitly reflects good reasoning.
 
 ### Placement in the Prompt
 
@@ -92,28 +93,28 @@ The conditioning tokens are prepended to the completion, immediately after the p
 ```
 [system prompt] [image tokens] [history trajectory] [task instruction]
   ↓ advantage conditioning block (only during training)
-[<|adv_obs_pos|> <|adv_coc_neg|> <|adv_traj_pos|>]
+[<|adv_obs_pos|> <|adv_traj_neg|>]
   ↓ generation
 [<|cot_start|> ... reasoning text ... <|cot_end|>]
 [<|traj_future_start|> <i0> ... <i63> <|traj_future_end|>]
 ```
 
-At inference, we set all three tokens to their positive variants:
+At inference, we set both tokens to their positive variants:
 
 ```
-[prompt] [<|adv_obs_pos|> <|adv_coc_pos|> <|adv_traj_pos|>] → generate
+[prompt] [<|adv_obs_pos|> <|adv_traj_pos|>] → generate
 ```
 
-### Why Three Levels, Not One
+### Why Two Levels, Not One
 
-A single binary token conflates three independent quality axes. Consider these cases:
+A single binary token conflates two independent quality axes. Consider these cases:
 
-| Scenario | Single token | Three tokens |
+| Scenario | Single token | Two tokens |
 |---|---|---|
-| Good reasoning, bad trajectory | Ambiguous (net advantage ~0) | `coc_pos, traj_neg` — model learns what good reasoning looks like even when trajectory fails |
-| Bad reasoning, good trajectory | Ambiguous | `coc_neg, traj_pos` — model learns trajectory quality is independent of reasoning quality |
-| Everything good | `pos` | `obs_pos, coc_pos, traj_pos` — model conditions on full success |
-| Hard scene, decent attempt | `neg` (low absolute return) | `obs_neg, coc_pos, traj_pos` — model learns this was a good attempt despite scene difficulty |
+| Good completion on easy scene | `pos` | `obs_pos, traj_pos` — model conditions on full success |
+| Good completion on hard scene | `neg` (low absolute return) | `obs_neg, traj_pos` — model learns this was a good attempt despite scene difficulty |
+| Bad trajectory despite good scene | `neg` | `obs_pos, traj_neg` — model learns what bad trajectories look like on scenes that should be easy |
+| Everything bad | `neg` | `obs_neg, traj_neg` — hard scene, bad execution |
 
 The observation-level token captures **scene difficulty**. A scene with `obs_neg` tells the model "this is a hard scene" — at inference, conditioning on `obs_pos` steers the model toward behaviors it associates with easier-to-solve scenes (more cautious planning, simpler maneuvers), which may generalize as "do the best you can."
 
@@ -123,15 +124,14 @@ The observation-level token captures **scene difficulty**. A scene with `obs_neg
 
 ### Using the Existing Segment Value Head
 
-The segment value head (already implemented in `value_head.py`) provides value estimates at three levels of information:
+The segment value head (already implemented in `value_head.py`) provides value estimates at two levels:
 
 ```
 V(s_obs)    = SegmentValueHead(h_obs,  level=0)    # E[total return | observation]
-V(s_coc)    = SegmentValueHead(h_coc,  level=1)    # E[remaining return | observation + CoC]
 V(s_traj_j) = SegmentValueHead(h_traj, level=2)    # E[remaining return | obs + CoC + traj up to j]
 ```
 
-Each V predicts the **expected remaining return** from that information state. As more of the completion is observed, the value estimate becomes more precise.
+Each V predicts the **expected remaining return** from that information state. V(s_obs) sees only the scene; V(s_traj_j) sees the scene, full CoC reasoning, and trajectory up to step j.
 
 ### Temporal Structure
 
@@ -154,13 +154,12 @@ The actual return from each state is the sum of all future rewards from that poi
 
 ```
 G(s_obs)    = w_reason · R_reasoning + w_traj · Σ_t r_t + w_consist · R_consistency
-G(s_coc)    = w_traj · Σ_t r_t + w_consist · R_consistency         (R_reasoning already collected)
 G(s_traj_j) = w_traj · Σ_{t=j}^{T} r_t + w_consist · R_consistency  (remaining trajectory return)
 ```
 
 ### Per-Segment Advantage Definitions
 
-Advantages are computed as **actual return minus value baseline** at each information level. This is the return-minus-baseline formulation: how much better (or worse) was the actual outcome compared to what the value head predicted at that state?
+Advantages are computed as **actual return minus value baseline** at each information level.
 
 **Observation-level advantage** (completion quality relative to scene baseline):
 
@@ -168,27 +167,20 @@ Advantages are computed as **actual return minus value baseline** at each inform
 A_obs = G(s_obs) - V(s_obs)
 ```
 
-Measures: given only the observation, was this entire completion (CoC + trajectory) better or worse than expected? Captures both scene difficulty and overall completion quality. A positive A_obs means this completion outperformed the value head's prediction for this scene.
+Measures: given only the observation, was this entire completion (CoC + trajectory) better or worse than expected? Captures both scene difficulty and overall completion quality.
 
-**CoC-level advantage** (trajectory quality relative to CoC-conditioned baseline):
-
-```
-A_coc = G(s_coc) - V(s_coc)
-      = (w_traj · R_traj + w_consist · R_consistency) - V(s_coc)
-```
-
-Measures: given the observation AND this specific CoC reasoning, was the trajectory outcome better or worse than expected? A positive A_coc means the CoC set up conditions for a trajectory that exceeded expectations — it indirectly reflects CoC quality because good reasoning causally enables good trajectories.
-
-**Trajectory-level advantage** (remaining trajectory quality at step j):
+**Trajectory-level advantage** (remaining trajectory quality, mean over timesteps):
 
 ```
 A_traj_j = G(s_traj_j) - V(s_traj_j)
          = (w_traj · Σ_{t=j}^{T} r_t + w_consist · R_consistency) - V(s_traj_j)
+
+A_traj   = mean_j(A_traj_j)
 ```
 
-Measures: at step j of trajectory generation, was the remaining trajectory better or worse than expected? For the conditioning token, we use the aggregate (mean over j) since the token is a single binary indicator for the entire trajectory segment.
+Measures: at step j of trajectory generation, was the remaining trajectory better or worse than expected given the observation, CoC reasoning, and trajectory so far? Since the conditioning token is a single binary indicator for the entire trajectory segment, we use the mean over all timesteps.
 
-> **Note on alternative formulations:** The value-head design doc (`docs/value-head.md`) also describes a TD bootstrapping formulation and per-token GAE for trajectory advantages. Those formulations trade-off bias for variance. For advantage conditioning — where advantages are binarized into discrete labels — the return-minus-baseline formulation is preferred to avoid bias from bootstrapping through a potentially inaccurate value head. See `docs/value-head.md` for a full comparison of both approaches.
+> **Note on alternative formulations:** The value-head design doc (`docs/value-head.md`) also describes a TD bootstrapping formulation and per-token GAE for trajectory advantages. Those formulations trade off bias for variance. For advantage conditioning — where advantages are binarized into discrete labels — the return-minus-baseline formulation is preferred. See `docs/value-head.md` for a full comparison.
 
 ### Binarization
 
@@ -196,7 +188,6 @@ Each advantage is binarized using a per-level threshold:
 
 ```
 I_obs  = 1  if A_obs  > ε_obs   else 0
-I_coc  = 1  if A_coc  > ε_coc   else 0
 I_traj = 1  if A_traj > ε_traj  else 0
 ```
 
@@ -207,7 +198,6 @@ A higher k (e.g., 50) is more selective but risks training on too few positive e
 ```python
 # Computed over a buffer of recent advantages
 ε_obs  = np.percentile(recent_A_obs,  k_obs)
-ε_coc  = np.percentile(recent_A_coc,  k_coc)
 ε_traj = np.percentile(recent_A_traj, k_traj)
 ```
 
@@ -222,11 +212,11 @@ Following RECAP's formulation, the training loss combines a conditional and an u
 **Key adaptation: restrict the unconditional path to positive-advantage completions only.**
 
 ```
-If completion has all-positive advantages (I_obs=1 ∧ I_coc=1 ∧ I_traj=1):
+If completion has all-positive advantages (I_obs=1 ∧ I_traj=1):
     L = -log π_θ(x | prompt) - α · log π_θ(x | I_pos, prompt)     # both paths
 
 Otherwise:
-    L = -α · log π_θ(x | I_obs, I_coc, I_traj, prompt)            # conditional only
+    L = -α · log π_θ(x | I_obs, I_traj, prompt)                    # conditional only
 ```
 
 The rationale:
@@ -241,14 +231,14 @@ The rationale:
 During training, randomly drop the conditioning tokens with probability `p_drop` (e.g., 0.3). Combined with the positive-only unconditional rule:
 
 ```python
-is_all_positive = (I_obs == 1) and (I_coc == 1) and (I_traj == 1)
+is_all_positive = (I_obs == 1) and (I_traj == 1)
 
 if is_all_positive and random() < p_drop:
     # Unconditional: no advantage tokens (only for positive completions)
     input = [prompt] + [completion]
 else:
     # Conditional: advantage tokens prepended (all completions)
-    input = [prompt] + [I_obs, I_coc, I_traj] + [completion]
+    input = [prompt] + [I_obs, I_traj] + [completion]
 ```
 
 With this scheme, the effective unconditional training fraction is `p_drop × frac_all_positive`. If ~40% of completions are all-positive and `p_drop = 0.3`, about 12% of training examples train the unconditional path — enough for CFG but not so much that it dominates.
@@ -259,7 +249,6 @@ For finer control, each level's token can be independently dropped:
 
 ```python
 include_obs  = random() > p_drop_obs
-include_coc  = random() > p_drop_coc
 include_traj = random() > p_drop_traj
 ```
 
@@ -287,11 +276,10 @@ With independent per-level dropout, we can apply CFG per level:
 ```
 logits = logits_uncond
        + β_obs  · (logits_{obs=pos}  - logits_uncond)
-       + β_coc  · (logits_{coc=pos}  - logits_uncond)
        + β_traj · (logits_{traj=pos} - logits_uncond)
 ```
 
-This requires 4 forward passes (1 unconditional + 3 per-level), so it's expensive. In practice, the single-block CFG (all three tokens present or absent) is likely sufficient.
+This requires 3 forward passes (1 unconditional + 2 per-level). In practice, the single-block CFG (both tokens present or absent) is likely sufficient.
 
 ---
 
@@ -366,7 +354,6 @@ Same as the existing value head design:
 
 ```
 G(s_obs)    = w_reason · R_reasoning + Σ_t r_t        # total return
-G(s_coc)    = Σ_t r_t                                  # remaining trajectory return
 G(s_traj_t) = Σ_{k=t}^{T} r_k                         # return-to-go per trajectory token
 ```
 
@@ -377,7 +364,7 @@ G(s_traj_t) = Σ_{k=t}^{T} r_k                         # return-to-go per trajec
 ### Phase 1: Token and Data Infrastructure
 
 1. **Add special tokens** to the tokenizer:
-   - `<|adv_obs_pos|>`, `<|adv_obs_neg|>`, `<|adv_coc_pos|>`, `<|adv_coc_neg|>`, `<|adv_traj_pos|>`, `<|adv_traj_neg|>`
+   - `<|adv_obs_pos|>`, `<|adv_obs_neg|>`, `<|adv_traj_pos|>`, `<|adv_traj_neg|>`
    - Resize model embeddings accordingly
 
 2. **Rollout data structure**: Extend the rollout output to include per-segment advantage labels alongside existing rewards and log-probs.
@@ -441,7 +428,7 @@ G(s_traj_t) = Σ_{k=t}^{T} r_k                         # return-to-go per trajec
 │  Advantage math   ─── return-minus-baseline, binarization        │
 ├──────────────────────────────────────────────────────────────────┤
 │                    New (advantage conditioning)                   │
-│  Special tokens   ─── 6 new tokens in tokenizer                 │
+│  Special tokens   ─── 4 new tokens in tokenizer                 │
 │  Prompt builder   ─── prepend conditioning tokens to completion  │
 │  Training loop    ─── dual SFT loss with conditioning dropout    │
 │  Inference        ─── CFG with all-positive conditioning         │
