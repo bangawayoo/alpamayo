@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 from physical_ai_av import PhysicalAIAVDatasetInterface
+from transformers import TrainingArguments
 
 from alpamayo_r1.training.advantage_conditioning import (
     AdvantageBuffer,
@@ -291,36 +292,123 @@ class SelfPlayLoop:
     def _rollout_phase(self, fresh_scenes: list[str], iteration: int) -> list[dict]:
         """Generate G completions per fresh scene from current policy.
 
-        This is a placeholder that should be implemented by the concrete
-        subclass or by passing a RolloutEngine. The generation logic is adapted
-        from _generate_single_turn() in rollout.py but decoupled from
-        GRPOTrainer.
+        Uses the RolloutEngine to generate completions. On the first iteration,
+        uses the base model (pi_0). On subsequent iterations, loads pi_n.
 
         Returns:
             List of dicts per completion with:
             {prompt_ids, completion_ids, pred_xyz, gt_xyz, coc_text,
              clip_id, t0_us, completion_prefix}
         """
-        raise NotImplementedError(
-            "Rollout phase not implemented. Override this method or use a RolloutEngine."
+        from alpamayo_r1.training.sft_rollout import RolloutEngine
+
+        adv_cfg = self.cfg.get("advantage_conditioning", {})
+        rollout_cfg = self.cfg.get("rollout", {})
+        G = int(adv_cfg.get("completions_per_scene", 8))
+        t0_us = int(self.cfg.get("data", {}).get("t0_us", 5_100_000))
+
+        # Build the rollout engine with the current model
+        data_cache = self._get_data_cache()
+        engine = RolloutEngine(
+            full_model=self.full_model,
+            processor=self.processor,
+            data_cache=data_cache,
+            rollout_cfg=rollout_cfg,
         )
+
+        # Generate completions
+        results = engine.generate_completions(fresh_scenes, t0_us, G)
+        logger.info(
+            "Rollout phase complete: %d completions from %d scenes",
+            len(results),
+            len(fresh_scenes),
+        )
+        return results
 
     def _evaluate_phase(self, rollout_results: list[dict]) -> list[dict]:
         """Score completions and binarize advantages.
 
-        This is a placeholder that computes rewards and advantages. A concrete
-        implementation should:
-        1. Compute rewards using trajectory_quality_reward, reasoning_quality_reward,
-           consistency_reward
+        1. Compute rewards using reward functions
         2. Extract segment hidden states via teacher-forced VLM forward
-        3. Compute per-segment advantages
+        3. Compute per-segment advantages using value head
         4. Update the advantage buffer
-        5. Binarize advantages
+        5. Binarize advantages into conditioning labels
 
         Returns:
             List of dicts per completion: {i_obs, i_coc, i_traj}
         """
-        raise NotImplementedError("Evaluate phase not implemented. Override this method.")
+        from alpamayo_r1.training.sft_rollout import RolloutEngine
+
+        rollout_cfg = self.cfg.get("rollout", {})
+        data_cache = self._get_data_cache()
+        engine = RolloutEngine(
+            full_model=self.full_model,
+            processor=self.processor,
+            data_cache=data_cache,
+            rollout_cfg=rollout_cfg,
+        )
+
+        # 1. Compute rewards
+        reward_stash = engine.compute_rewards(rollout_results)
+        logger.info("Computed rewards for %d completions", len(reward_stash))
+
+        # 2. Extract segment hidden states
+        vh_cfg = self.cfg.get("value_head", {})
+        if vh_cfg.get("enabled", False) and vh_cfg.get("segment_level", False):
+            segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
+                rollout_results
+            )
+
+            # 3. Compute per-segment advantages
+            reward_weights = self._get_reward_weights()
+            gamma = float(vh_cfg.get("gamma", 1.0))
+            gae_lambda = float(vh_cfg.get("gae_lambda", 1.0))
+
+            value_head = self._get_or_create_value_head()
+            advantages = compute_segment_advantages_from_rollouts(
+                segment_hidden_stash=segment_hidden_stash,
+                segment_reward_stash=reward_stash,
+                completion_segment_map=completion_segment_map,
+                value_head=value_head,
+                reward_weights=reward_weights,
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+            )
+        else:
+            # Fallback: use composite reward as a_obs, no segment-level detail
+            advantages = []
+            reward_weights = self._get_reward_weights()
+            w_traj, w_reason, w_consist = reward_weights
+            for rew in reward_stash:
+                composite = (
+                    w_traj * rew["r_traj"]
+                    + w_reason * rew["r_reason"]
+                    + w_consist * rew["r_consist"]
+                )
+                advantages.append({"a_obs": composite, "a_coc": composite, "a_traj": composite})
+
+        # 4. Update advantage buffer
+        a_obs_list = [a["a_obs"] for a in advantages]
+        a_coc_list = [a["a_coc"] for a in advantages]
+        a_traj_list = [a["a_traj"] for a in advantages]
+        self.advantage_buffer.update(a_obs_list, a_coc_list, a_traj_list)
+
+        # 5. Binarize
+        adv_labels = []
+        for adv in advantages:
+            i_obs, i_coc, i_traj = self.advantage_buffer.binarize(
+                adv["a_obs"], adv["a_coc"], adv["a_traj"]
+            )
+            adv_labels.append({"i_obs": i_obs, "i_coc": i_coc, "i_traj": i_traj})
+
+        n_pos = sum(1 for lab in adv_labels if lab["i_obs"] and lab["i_coc"] and lab["i_traj"])
+        logger.info(
+            "Evaluate phase: %d/%d all-positive, thresholds=%s",
+            n_pos,
+            len(adv_labels),
+            self.advantage_buffer.compute_thresholds(),
+        )
+        return adv_labels
 
     def _train_phase(
         self,
@@ -330,16 +418,102 @@ class SelfPlayLoop:
     ) -> None:
         """Reset to pi_0, build dataset, train SFT + expert.
 
-        This is a placeholder. A concrete implementation should:
-        1. Load pi_0 (base checkpoint)
-        2. Register advantage tokens, resize embeddings
-        3. Apply LoRA
-        4. Build AdvCondDataset from fresh + historical rollouts
-        5. Create AdvCondSFTTrainer
-        6. Train
-        7. Save as pi_{n+1}
+        1. Load pi_0 (base checkpoint) — reset-to-checkpoint per RECAP
+        2. Apply LoRA to VLM
+        3. Build AdvCondDataset from fresh + historical rollouts
+        4. Create AdvCondSFTTrainer (handles VLM SFT + expert CFM)
+        5. Train for configured epochs
+        6. Save as pi_{n+1}
         """
-        raise NotImplementedError("Train phase not implemented. Override this method.")
+        from peft import LoraConfig
+
+        from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+        from alpamayo_r1.training.rollout_utils import prepare_vlm_for_training
+        from alpamayo_r1.training.sft_trainer import AdvCondSFTTrainer
+
+        train_cfg = self.cfg.get("training", {})
+        lora_cfg = self.cfg.get("lora", {})
+        expert_cfg = self.cfg.get("expert_finetune", {})
+
+        # 1. Reset to pi_0 (reload base model for a fresh start)
+        logger.info("Loading base model from %s (reset-to-checkpoint)", self.base_model_path)
+        full_model = AlpamayoR1.from_pretrained(self.base_model_path, dtype=torch.bfloat16)
+
+        # Register advantage tokens and resize embeddings
+        register_advantage_tokens(self.processor.tokenizer)
+        full_model.vlm.resize_token_embeddings(len(self.processor.tokenizer))
+        prepare_vlm_for_training(full_model)
+
+        # Freeze non-VLM params
+        for name, param in full_model.named_parameters():
+            if not name.startswith("vlm."):
+                param.requires_grad = False
+
+        # 2. Apply LoRA
+        lora_config = None
+        if lora_cfg.get("enabled", True):
+            lora_config = LoraConfig(
+                r=int(lora_cfg.get("r", 16)),
+                lora_alpha=int(lora_cfg.get("alpha", 32)),
+                lora_dropout=float(lora_cfg.get("dropout", 0.05)),
+                target_modules=list(
+                    lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
+                ),
+                task_type="CAUSAL_LM",
+            )
+            from peft import get_peft_model
+
+            full_model.vlm = get_peft_model(full_model.vlm, lora_config)
+            logger.info("Applied LoRA: r=%d, alpha=%d", lora_config.r, lora_config.lora_alpha)
+
+        # 3. Build training dataset (fresh + historical replay)
+        train_dataset = self._build_training_dataset(rollout_results, adv_labels)
+
+        # 4. Create training args
+        output_dir = Path(train_cfg.get("output_dir", "outputs/sft_advcond")) / f"iter_{iteration}"
+        training_args = TrainingArguments(
+            output_dir=str(output_dir),
+            num_train_epochs=int(train_cfg.get("num_train_epochs", 1)),
+            per_device_train_batch_size=int(train_cfg.get("per_device_train_batch_size", 4)),
+            gradient_accumulation_steps=int(train_cfg.get("gradient_accumulation_steps", 4)),
+            learning_rate=float(train_cfg.get("learning_rate", 5e-6)),
+            bf16=bool(train_cfg.get("bf16", True)),
+            gradient_checkpointing=bool(train_cfg.get("gradient_checkpointing", True)),
+            logging_steps=int(train_cfg.get("logging_steps", 1)),
+            save_steps=int(train_cfg.get("save_steps", 200)),
+            save_total_limit=int(train_cfg.get("save_total_limit", 3)),
+            warmup_ratio=float(train_cfg.get("warmup_ratio", 0.05)),
+            max_grad_norm=float(train_cfg.get("max_grad_norm", 1.0)),
+            report_to=train_cfg.get("report_to", "tensorboard"),
+            remove_unused_columns=False,
+        )
+
+        # 5. Create trainer
+        data_cache = self._get_data_cache()
+        adv_cfg = self.cfg.get("advantage_conditioning", {})
+        trainer = AdvCondSFTTrainer(
+            model=full_model.vlm,
+            args=training_args,
+            train_dataset=train_dataset,
+            processing_class=self.processor,
+            full_model=full_model,
+            adv_token_ids=self.adv_token_ids,
+            alpha=float(adv_cfg.get("alpha", 1.0)),
+            expert_cfg=expert_cfg,
+            data_cache=data_cache,
+        )
+
+        # 6. Train
+        logger.info("Starting SFT iteration %d: %d samples", iteration, len(train_dataset))
+        trainer.train()
+
+        # 7. Save
+        trainer.save_model(str(output_dir / "final"))
+        self.current_policy_path = str(output_dir / "final")
+        logger.info("Saved pi_%d to %s", iteration + 1, self.current_policy_path)
+
+        # Update the full_model reference for next iteration's rollouts
+        self.full_model = full_model
 
     def _build_training_dataset(
         self,
@@ -380,6 +554,50 @@ class SelfPlayLoop:
             p_drop=float(adv_cfg.get("p_drop", 0.3)),
         )
 
+    def _get_data_cache(self):
+        """Get or create a ClipDataCache for the current run."""
+        if not hasattr(self, "_data_cache"):
+            from alpamayo_r1.training.rollout_utils import ClipDataCache
+
+            rollout_cfg = self.cfg.get("rollout", {})
+            self._data_cache = ClipDataCache(
+                avdi=self.avdi,
+                processor=self.processor,
+                cache_pil_images=False,
+                max_size=int(rollout_cfg.get("data_cache_max_size", 200)),
+            )
+        return self._data_cache
+
+    def _get_reward_weights(self) -> tuple[float, float, float]:
+        """Get reward function weights from config."""
+        reward_cfg = self.cfg.get("rewards", {})
+        return (
+            float(reward_cfg.get("trajectory_weight", 0.5)),
+            float(reward_cfg.get("reasoning_weight", 0.25)),
+            float(reward_cfg.get("consistency_weight", 0.25)),
+        )
+
+    def _get_or_create_value_head(self) -> torch.nn.Module:
+        """Get or create the segment-level value head."""
+        if not hasattr(self, "_value_head"):
+            from alpamayo_r1.training.value_head import SegmentValueHead
+
+            vh_cfg = self.cfg.get("value_head", {})
+            hidden_dim = int(vh_cfg.get("hidden_dim", 4096))
+            self._value_head = SegmentValueHead(hidden_dim=hidden_dim)
+
+            # Optionally load pretrained weights
+            load_path = vh_cfg.get("load_path")
+            if load_path:
+                state = torch.load(load_path, map_location="cpu", weights_only=False)
+                self._value_head.load_state_dict(state)
+                logger.info("Loaded value head from %s", load_path)
+
+            self._value_head_optimizer = torch.optim.Adam(
+                self._value_head.parameters(), lr=float(vh_cfg.get("lr", 1e-5))
+            )
+        return self._value_head
+
     def _save_checkpoint(self, iteration: int) -> None:
         """Save value head, advantage buffer, and replay buffer state."""
         output_dir = Path(self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
@@ -390,3 +608,9 @@ class SelfPlayLoop:
         adv_buf_path = iter_dir / "advantage_buffer.pt"
         torch.save(self.advantage_buffer.state_dict(), adv_buf_path)
         logger.info("Saved advantage buffer to %s", adv_buf_path)
+
+        # Save value head if it exists
+        if hasattr(self, "_value_head"):
+            vh_path = iter_dir / "value_head.pt"
+            torch.save(self._value_head.state_dict(), vh_path)
+            logger.info("Saved value head to %s", vh_path)
