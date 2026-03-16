@@ -1,0 +1,242 @@
+"""Unit tests for advantage conditioning and self-play loop modules."""
+
+import pytest
+
+from alpamayo_r1.models.base_model import IGNORE_INDEX
+from alpamayo_r1.training.advantage_conditioning import (
+    ADV_TOKEN_NAMES,
+    ADV_TOKEN_STRINGS,
+    AdvantageBuffer,
+    AdvCondDataset,
+    build_conditioned_sequence,
+)
+from alpamayo_r1.training.selfplay_loop import RolloutReplayBuffer, ScenePartitioner
+
+
+# ---------------------------------------------------------------------------
+# Fake token IDs for testing (no real tokenizer needed)
+# ---------------------------------------------------------------------------
+
+FAKE_ADV_TOKEN_IDS = {name: 200000 + i for i, name in enumerate(ADV_TOKEN_NAMES)}
+
+
+class TestAdvantageBuffer:
+    def test_initial_empty(self):
+        buf = AdvantageBuffer(k_obs=50, k_coc=50, k_traj=50)
+        # Empty buffer returns 0 thresholds
+        eps = buf.compute_thresholds()
+        assert eps == (0.0, 0.0, 0.0)
+
+    def test_update_and_binarize(self):
+        buf = AdvantageBuffer(k_obs=50, k_coc=50, k_traj=50)
+        # Add advantages: half positive, half negative
+        obs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        coc = [-5.0, -4.0, -3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        traj = [0.0] * 10
+        buf.update(obs, coc, traj)
+
+        # Median of obs = 5.5, so 6+ should be positive
+        i_obs, i_coc, i_traj = buf.binarize(6.0, 1.0, 0.0)
+        assert i_obs is True
+        assert i_coc is True
+        assert i_traj is True  # 0.0 >= 0.0
+
+        i_obs, i_coc, i_traj = buf.binarize(1.0, -5.0, -1.0)
+        assert i_obs is False
+        assert i_coc is False
+        assert i_traj is False
+
+    def test_ema_updates(self):
+        buf = AdvantageBuffer(ema_alpha=0.5)
+        buf.update([10.0], [0.0], [0.0])
+        assert buf._ema_obs == 10.0  # First value initializes EMA
+
+        buf.update([0.0], [0.0], [0.0])
+        # EMA = 0.5 * 10.0 + 0.5 * 0.0 = 5.0
+        assert buf._ema_obs == pytest.approx(5.0)
+
+    def test_state_dict_roundtrip(self):
+        buf = AdvantageBuffer(k_obs=30, k_coc=40, k_traj=50)
+        buf.update([1.0, 2.0], [3.0, 4.0], [5.0, 6.0])
+
+        state = buf.state_dict()
+        buf2 = AdvantageBuffer(k_obs=30, k_coc=40, k_traj=50)
+        buf2.load_state_dict(state)
+
+        assert list(buf2._buf_obs) == [1.0, 2.0]
+        assert list(buf2._buf_coc) == [3.0, 4.0]
+        assert list(buf2._buf_traj) == [5.0, 6.0]
+        assert buf2._ema_obs == buf._ema_obs
+
+
+class TestBuildConditionedSequence:
+    def test_conditional_positive(self):
+        """All-positive but no dropout (p_drop=0) -> conditional with positive tokens."""
+        result = build_conditioned_sequence(
+            prompt_ids=[1, 2, 3],
+            completion_ids=[10, 11, 12],
+            i_obs=True,
+            i_coc=True,
+            i_traj=True,
+            adv_token_ids=FAKE_ADV_TOKEN_IDS,
+            p_drop=0.0,  # Never drop
+        )
+        assert not result["is_unconditional"]
+        # Should have prompt(3) + cond(3) + completion(3) = 9 tokens
+        assert len(result["input_ids"]) == 9
+        # First 6 labels should be IGNORE_INDEX, last 3 should be completion
+        assert result["labels"][:6] == [IGNORE_INDEX] * 6
+        assert result["labels"][6:] == [10, 11, 12]
+        # Check conditioning tokens are positive variants
+        assert result["input_ids"][3] == FAKE_ADV_TOKEN_IDS["adv_obs_pos"]
+        assert result["input_ids"][4] == FAKE_ADV_TOKEN_IDS["adv_coc_pos"]
+        assert result["input_ids"][5] == FAKE_ADV_TOKEN_IDS["adv_traj_pos"]
+
+    def test_conditional_negative(self):
+        """Mixed labels -> always conditional."""
+        result = build_conditioned_sequence(
+            prompt_ids=[1, 2],
+            completion_ids=[10, 11],
+            i_obs=False,
+            i_coc=True,
+            i_traj=False,
+            adv_token_ids=FAKE_ADV_TOKEN_IDS,
+            p_drop=1.0,  # Even with 100% drop, non-all-positive is always conditional
+        )
+        assert not result["is_unconditional"]
+        assert result["input_ids"][2] == FAKE_ADV_TOKEN_IDS["adv_obs_neg"]
+        assert result["input_ids"][3] == FAKE_ADV_TOKEN_IDS["adv_coc_pos"]
+        assert result["input_ids"][4] == FAKE_ADV_TOKEN_IDS["adv_traj_neg"]
+
+    def test_unconditional_dropout(self):
+        """All-positive with p_drop=1.0 -> always unconditional."""
+        result = build_conditioned_sequence(
+            prompt_ids=[1, 2, 3],
+            completion_ids=[10, 11],
+            i_obs=True,
+            i_coc=True,
+            i_traj=True,
+            adv_token_ids=FAKE_ADV_TOKEN_IDS,
+            p_drop=1.0,  # Always drop
+        )
+        assert result["is_unconditional"]
+        # No conditioning tokens: prompt(3) + completion(2) = 5
+        assert len(result["input_ids"]) == 5
+        assert result["labels"][:3] == [IGNORE_INDEX] * 3
+        assert result["labels"][3:] == [10, 11]
+
+    def test_attention_mask_all_ones(self):
+        result = build_conditioned_sequence(
+            prompt_ids=[1, 2],
+            completion_ids=[10],
+            i_obs=True,
+            i_coc=False,
+            i_traj=True,
+            adv_token_ids=FAKE_ADV_TOKEN_IDS,
+            p_drop=0.0,
+        )
+        assert all(m == 1 for m in result["attention_mask"])
+        assert len(result["attention_mask"]) == len(result["input_ids"])
+
+
+class TestAdvCondDataset:
+    def test_basic(self):
+        rollouts = [
+            {"prompt_ids": [1, 2], "completion_ids": [10, 11]},
+            {"prompt_ids": [3, 4], "completion_ids": [12, 13]},
+        ]
+        labels = [
+            {"i_obs": True, "i_coc": True, "i_traj": True},
+            {"i_obs": False, "i_coc": False, "i_traj": False},
+        ]
+        ds = AdvCondDataset(rollouts, labels, FAKE_ADV_TOKEN_IDS, p_drop=0.0)
+        assert len(ds) == 2
+
+        item0 = ds[0]
+        assert "input_ids" in item0
+        assert "labels" in item0
+        assert "is_unconditional" in item0
+
+    def test_mismatched_lengths_raises(self):
+        with pytest.raises(ValueError, match="Mismatched lengths"):
+            AdvCondDataset([{"prompt_ids": [1], "completion_ids": [2]}], [], FAKE_ADV_TOKEN_IDS)
+
+
+class TestAdvTokenStrings:
+    def test_all_tokens_exist(self):
+        """Verify all 6 advantage tokens are defined in SPECIAL_TOKENS."""
+        for name in ADV_TOKEN_NAMES:
+            assert name in ADV_TOKEN_STRINGS
+            assert ADV_TOKEN_STRINGS[name] == f"<|{name}|>"
+
+
+class TestScenePartitioner:
+    def test_partitions_are_disjoint(self):
+        clip_ids = [f"clip_{i}" for i in range(30)]
+        sp = ScenePartitioner(clip_ids, num_iterations=3, seed=42)
+
+        p0 = set(sp.get_fresh_scenes(0))
+        p1 = set(sp.get_fresh_scenes(1))
+        p2 = set(sp.get_fresh_scenes(2))
+
+        # No overlap
+        assert p0 & p1 == set()
+        assert p0 & p2 == set()
+        assert p1 & p2 == set()
+
+        # All scenes covered
+        assert p0 | p1 | p2 == set(clip_ids)
+
+    def test_partition_sizes_approximately_equal(self):
+        clip_ids = [f"clip_{i}" for i in range(17)]
+        sp = ScenePartitioner(clip_ids, num_iterations=3)
+        sizes = [len(sp.get_fresh_scenes(i)) for i in range(3)]
+        # 17/3 = 5.67, so partitions should be 6, 6, 5
+        assert sum(sizes) == 17
+        assert max(sizes) - min(sizes) <= 1
+
+    def test_historical_scenes_accumulate(self):
+        clip_ids = [f"clip_{i}" for i in range(20)]
+        sp = ScenePartitioner(clip_ids, num_iterations=4, seed=42)
+
+        assert sp.get_historical_scenes(0) == []
+        assert set(sp.get_historical_scenes(1)) == set(sp.get_fresh_scenes(0))
+        assert set(sp.get_historical_scenes(2)) == set(sp.get_fresh_scenes(0)) | set(
+            sp.get_fresh_scenes(1)
+        )
+
+    def test_out_of_bounds_raises(self):
+        sp = ScenePartitioner(["a", "b", "c"], num_iterations=2)
+        with pytest.raises(IndexError):
+            sp.get_fresh_scenes(2)
+
+
+class TestRolloutReplayBuffer:
+    def test_add_and_sample(self):
+        buf = RolloutReplayBuffer(max_size=100)
+        rollouts = [{"prompt_ids": [1], "completion_ids": [2]}]
+        labels = [{"i_obs": True, "i_coc": True, "i_traj": False}]
+
+        buf.add(rollouts, labels, iteration=0)
+        assert len(buf) == 1
+
+        sampled_r, sampled_l = buf.sample(1)
+        assert len(sampled_r) == 1
+        assert sampled_r[0]["prompt_ids"] == [1]
+        assert sampled_l[0]["i_traj"] is False
+
+    def test_eviction_on_max_size(self):
+        buf = RolloutReplayBuffer(max_size=3)
+        for i in range(5):
+            buf.add(
+                [{"prompt_ids": [i], "completion_ids": [i]}],
+                [{"i_obs": True, "i_coc": True, "i_traj": True}],
+                iteration=i,
+            )
+        assert len(buf) == 3
+
+    def test_sample_empty(self):
+        buf = RolloutReplayBuffer()
+        r, l = buf.sample(5)
+        assert r == []
+        assert l == []
