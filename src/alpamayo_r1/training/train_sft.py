@@ -16,6 +16,7 @@ on advantage-conditioned completions from the current + historical rollouts.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import hydra
@@ -42,6 +43,15 @@ def main(cfg: DictConfig) -> None:
         cfg: Hydra config with model, training, data, advantage_conditioning,
              expert_finetune, and reward settings.
     """
+    # Hydra's job_logging: none disables all handlers — restore a stream handler
+    # so that logger.info() calls from all modules are visible on stdout.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
     logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
 
     # Save resolved Hydra config
@@ -63,6 +73,8 @@ def main(cfg: DictConfig) -> None:
     # ---------------------------------------------------------------
     # 1. Load the full AlpamayoR1 model
     # ---------------------------------------------------------------
+    logger.info("[STAGE 1/6] Loading model...")
+    t0 = time.time()
     adapter_config_path = Path(model_name) / "adapter_config.json"
     if adapter_config_path.exists():
         if base_model_name is None:
@@ -82,33 +94,43 @@ def main(cfg: DictConfig) -> None:
     else:
         logger.info("Loading model: %s", model_name)
         full_model = AlpamayoR1.from_pretrained(model_name, dtype=torch.bfloat16)
+    logger.info("[STAGE 1/6] Model loaded in %.1fs", time.time() - t0)
 
     # ---------------------------------------------------------------
     # 2. Processor and dataset interface
     # ---------------------------------------------------------------
+    logger.info("[STAGE 2/6] Initializing processor and dataset interface...")
+    t0 = time.time()
     processor = helper.get_processor(full_model.tokenizer)
     data_cfg = cfg.get("data", {})
     dataset_revision = data_cfg.get("dataset_revision", None)
     avdi = PhysicalAIAVDatasetInterface(revision=dataset_revision)
+    logger.info("[STAGE 2/6] Processor ready in %.1fs", time.time() - t0)
 
     # ---------------------------------------------------------------
     # 3. Register advantage tokens and resize embeddings
     # ---------------------------------------------------------------
+    logger.info("[STAGE 3/6] Registering advantage tokens and resizing embeddings...")
+    t0 = time.time()
     register_advantage_tokens(processor.tokenizer)
     full_model.vlm.resize_token_embeddings(len(processor.tokenizer))
     logger.info(
-        "Registered advantage tokens and resized embeddings to %d",
+        "[STAGE 3/6] Resized embeddings to %d in %.1fs",
         len(processor.tokenizer),
+        time.time() - t0,
     )
 
     # ---------------------------------------------------------------
     # 4. Prepare VLM for training compatibility
     # ---------------------------------------------------------------
+    logger.info("[STAGE 4/6] Preparing VLM for training...")
     prepare_vlm_for_training(full_model)
 
     # ---------------------------------------------------------------
     # 5. Build dataset and extract clip IDs for partitioning
     # ---------------------------------------------------------------
+    logger.info("[STAGE 5/6] Building dataset...")
+    t0 = time.time()
     dataset = build_alpamayo_dataset(
         split=data_cfg.get("split", "train"),
         t0_us=data_cfg.get("t0_us", 5_100_000),
@@ -118,11 +140,12 @@ def main(cfg: DictConfig) -> None:
         avdi=avdi,
     )
     all_clip_ids = dataset["clip_id"]
-    logger.info("Dataset: %d scenes total", len(all_clip_ids))
+    logger.info("[STAGE 5/6] Dataset built: %d scenes in %.1fs", len(all_clip_ids), time.time() - t0)
 
     # ---------------------------------------------------------------
     # 6. Create and run self-play loop
     # ---------------------------------------------------------------
+    logger.info("[STAGE 6/6] Creating self-play loop...")
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     loop = SelfPlayLoop(
         cfg=cfg_dict,
@@ -132,9 +155,17 @@ def main(cfg: DictConfig) -> None:
         all_clip_ids=all_clip_ids,
     )
 
-    logger.info("Starting advantage-conditioned iterative SFT...")
+    adv_cfg = cfg_dict.get("advantage_conditioning", {})
+    logger.info(
+        "Starting advantage-conditioned iterative SFT: "
+        "%d iterations, %d completions/scene, replay_ratio=%.2f",
+        int(adv_cfg.get("num_iterations", 5)),
+        int(adv_cfg.get("completions_per_scene", 8)),
+        float(adv_cfg.get("replay_ratio", 0.3)),
+    )
+    t_total = time.time()
     loop.run()
-    logger.info("Training complete!")
+    logger.info("Training complete! Total wall time: %.1fs", time.time() - t_total)
 
 
 if __name__ == "__main__":

@@ -452,6 +452,18 @@ def train_segment_value_head(
             "target_obs_mean": obs_target_t.mean().item(),
         }
 
+        # Log every 10 epochs or on first/last epoch
+        if epoch == 0 or epoch == num_epochs - 1 or (epoch + 1) % 10 == 0:
+            logger.info(
+                "  Value head epoch %d/%d: loss=%.4f (obs=%.4f coc=%.4f traj=%.4f)",
+                epoch + 1,
+                num_epochs,
+                metrics["loss"],
+                metrics["loss_obs"],
+                metrics["loss_coc"],
+                metrics["loss_traj"],
+            )
+
     logger.info(
         "Value head training: %d epochs, %d samples | "
         "loss=%.4f (obs=%.4f, coc=%.4f, traj=%.4f) | "
