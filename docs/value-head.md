@@ -68,6 +68,8 @@ The value network computes V(s) at three granularities using VLM hidden states a
 
 All three levels share the same MLP weights but receive an explicit **level embedding** to help the network distinguish what "stage" of generation the hidden state comes from. While the VLM's autoregressive hidden states already encode positional context (h_traj_t has "seen" both prompt and CoC text), the value head's MLP is small — a level embedding gives it a direct signal about whether it's predicting total return (obs), post-reasoning return (coc), or mid-trajectory return-to-go (traj), without needing to infer this from the hidden state alone.
 
+> **Note on the SFT pipeline:** The advantage conditioning pipeline (`docs/advantage-conditioning.md`) uses only two levels for conditioning tokens — obs and traj — because V(s_coc) and V(s_traj_0) see nearly identical information, making A_coc and A_traj at j=0 redundant for binarized labels. The three-level architecture is retained for GRPO (where the TD bootstrapping formulation uses V(s_coc) distinctly from V(s_traj)) and for value head training targets.
+
 ### Network Architecture
 
 Upgrade `SceneValueHead` → `SegmentValueHead`:
@@ -130,7 +132,7 @@ s_obs                    s_coc                           s_T (terminal)
 - `R_consistency` measures agreement between CoC and trajectory → requires BOTH segments → **trajectory segment reward** (assigned causally to the later segment).
 - `R_trajectory` (ADE) depends on the generated trajectory → **trajectory segment reward**.
 
-> **Note on R_reasoning**: The current `reasoning_quality_reward` is a noisy, rule-based heuristic (checks for causal connectors, driving vocabulary, appropriate length, no repetition). It does not measure actual reasoning quality — a fluent but factually wrong CoC can score high. This means the CoC segment advantage `A_coc` may receive unreliable signal from `R_reasoning`. However, the `V(s_coc) - V(s_obs)` term provides a complementary, learned signal: if the CoC text leads to better-than-expected trajectory outcomes, `V(s_coc) > V(s_obs)` regardless of the heuristic score. As R_reasoning improves (e.g., via a learned reward model), the CoC advantage becomes more informative.
+> **Note on R_reasoning**: The current `reasoning_quality_reward` is a noisy, rule-based heuristic (checks for causal connectors, driving vocabulary, appropriate length, no repetition). It does not measure actual reasoning quality — a fluent but factually wrong CoC can score high. In the GRPO path, the `V(s_coc) - V(s_obs)` term in Approach B's A_coc provides a complementary learned signal. In the SFT path, A_coc is not used directly (see advantage-conditioning.md), but R_reasoning still contributes to G(s_obs) and thus to A_obs.
 
 ### Reward assignment by segment
 
@@ -221,9 +223,10 @@ Advantages are simply the actual return minus the value head's prediction at eac
 
 ```
 A_obs    = G(s_obs)    - V(s_obs)       # completion quality vs scene baseline
-A_coc    = G(s_coc)    - V(s_coc)       # trajectory quality vs CoC-conditioned baseline
 A_traj_j = G(s_traj_j) - V(s_traj_j)   # remaining traj quality vs mid-trajectory baseline
 ```
+
+> A_coc = G(s_coc) - V(s_coc) is available but omitted for advantage conditioning because it is redundant with A_traj at j=0 (V(s_coc) and V(s_traj_0) see nearly identical information).
 
 **Properties:**
 - Zero bias (uses actual returns, no bootstrapping through V)
@@ -272,8 +275,8 @@ A_t = Σ_{k=0}^{T-t-1} (γλ)^k · δ_{t+k}    GAE with discount γ, trace decay
 
 | | Return-minus-baseline (A) | TD / GAE (B) |
 |---|---|---|
-| **A_coc formula** | `G(s_coc) - V(s_coc)` | `w_reason · R_reasoning + γ · V(s_coc) - V(s_obs)` |
-| **A_coc measures** | "was traj better than expected given CoC?" | "was the CoC action valuable?" |
+| **Levels used** | 2 (obs + traj) | 3 (obs + coc + traj) |
+| **A_coc** | Not used (redundant with A_traj at j=0) | `w_reason · R_reasoning + γ · V(s_coc) - V(s_obs)` |
 | **A_traj formula** | `G(s_traj_j) - V(s_traj_j)` | GAE(γ, λ) on per-step TD residuals |
 | **A_traj at γ=1, λ=1** | Same | Same (GAE reduces to MC - baseline) |
 | **Bias** | Zero | Proportional to V error |
@@ -284,8 +287,8 @@ A_t = Σ_{k=0}^{T-t-1} (γλ)^k · δ_{t+k}    GAE with discount γ, trace decay
 ### Current Implementation
 
 The codebase supports both approaches:
-- **GRPO path** (`rollout.py`): Uses Approach B (TD/GAE) for `(B, T)` per-token advantages in the policy gradient loss.
-- **SFT path** (`advantage_conditioning.py`): Uses Approach A (return-minus-baseline) for per-segment advantages that are binarized into conditioning labels.
+- **GRPO path** (`rollout.py`): Uses Approach B (TD/GAE) with all three levels (obs, coc, traj) for `(B, T)` per-token advantages in the policy gradient loss.
+- **SFT path** (`advantage_conditioning.py`): Uses Approach A (return-minus-baseline) with two levels (obs, traj) for per-segment advantages binarized into conditioning labels. The CoC level is omitted because A_coc ≈ A_traj at j=0 for binarized labels. See `docs/advantage-conditioning.md` for details on the two-level token design and causal placement (adv_obs before CoC, adv_traj between CoC and trajectory).
 
 ### Resulting Advantage Tensor (GRPO)
 

@@ -290,6 +290,34 @@ logits = logits_uncond
 
 This requires 3 forward passes (1 unconditional + 2 per-level). In practice, the single-block CFG (both tokens present or absent) is likely sufficient.
 
+### Interaction with the Action Expert (Flow Matching)
+
+The action expert receives the VLM's KV cache as a static prefix and appends 64 action embeddings as a continuation. At inference, the KV cache contains all tokens from the prompt through `<|traj_future_start|>`. The expert cross-attends to this entire context during each diffusion step.
+
+**How conditioning tokens enter the expert's context:**
+
+`adv_obs` is placed before the CoC in the VLM's input, so it is naturally part of the KV cache from VLM generation — no special handling needed.
+
+`adv_traj` is placed after the CoC but before the trajectory. Since VLM generation stops at `<|traj_future_start|>`, the `adv_traj` token is not part of the generated sequence. Instead, it is **injected into the KV cache** via one extra VLM forward step before the expert takes over:
+
+```
+VLM generation produces KV cache:
+  [prompt] [<adv_obs_pos>] [CoC text ...] [<traj_future_start>]
+                                                                 ↑ generation stops here
+
+Inject adv_traj by running one VLM forward step with <adv_traj_pos> token ID:
+  [prompt] [<adv_obs_pos>] [CoC text ...] [<traj_future_start>] [<adv_traj_pos>]
+                                                                                  ↑ new offset
+
+Expert receives updated KV cache and appends 64 action embeddings:
+  [...existing cache...] [<adv_traj_pos>] | [action_embed_1] ... [action_embed_64]
+                                          ↑ expert starts here
+```
+
+This is a single-token VLM forward with KV cache reuse (negligible cost). The expert then sees `adv_traj_pos` as the last VLM context token — matching its position during SFT training where `adv_traj` appeared in the token sequence between CoC and trajectory.
+
+For the unconditional CFG pass, `adv_traj` is simply not injected — the expert sees the original KV cache ending at `<|traj_future_start|>`.
+
 ---
 
 ## Self-Play Data Collection
@@ -386,7 +414,7 @@ G(s_traj_t) = Σ_{k=t}^{T} r_k                         # return-to-go per trajec
 
 5. **SFT training loop**: Standard teacher-forced cross-entropy, but with conditioning tokens in the input. No policy gradient computation needed.
 
-6. **Value head training**: Either jointly or in a separate pre-training stage (Option C above).
+6. **Value head training**: Either jointly or in a separate pre-training stage. Allow training the value head on the very first iteration.
 
 ### Phase 3: Inference
 

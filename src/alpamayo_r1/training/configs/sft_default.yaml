@@ -103,7 +103,7 @@ data:
 rewards:
   trajectory_weight: 0.50
   reasoning_weight: 0.25
-  consistency_weight: 0.25
+consistency_weight: 0.25
 
 # Rollout generation parameters
 rollout:
