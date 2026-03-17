@@ -223,6 +223,7 @@ class SelfPlayLoop:
         self.full_model = full_model
         self.avdi = avdi
         self.processor = processor
+        self.all_clip_ids = list(all_clip_ids)
 
         adv_cfg = cfg.get("advantage_conditioning", {})
         num_iterations = int(adv_cfg.get("num_iterations", 5))
@@ -300,14 +301,11 @@ class SelfPlayLoop:
         G = int(adv_cfg.get("completions_per_scene", 8))
         t0_us = int(self.cfg.get("data", {}).get("t0_us", 5_100_000))
 
-        # Use scenes from the first partition (they'll still be fresh for iter 0)
-        # Plus any extra scenes beyond the partitions if available
-        all_scenes = []
-        for i in range(self.num_iterations):
-            all_scenes.extend(self.partitioner.get_fresh_scenes(i))
-            if len(all_scenes) >= num_scenes:
-                break
-        pretrain_scenes = all_scenes[:num_scenes]
+        # Sample scenes for pre-training from all available clip_ids
+        rng = random.Random(self.cfg.get("seed", 42))
+        shuffled = list(self.all_clip_ids)
+        rng.shuffle(shuffled)
+        pretrain_scenes = shuffled[:num_scenes]
 
         # Generate rollouts from current model (pi_0)
         data_cache = self._get_data_cache()
