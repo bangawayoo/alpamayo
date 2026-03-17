@@ -17,6 +17,7 @@ See docs/advantage-conditioning.md for the full design specification.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import time
@@ -244,7 +245,9 @@ class SelfPlayLoop:
             ema_alpha=float(adv_cfg.get("ema_alpha", 0.99)),
         )
 
-        self.base_model_path = cfg.get("model_name", "nvidia/Alpamayo-R1-10B")
+        self.base_model_path = cfg.get("base_model_name", None) or cfg.get(
+            "model_name", "nvidia/Alpamayo-R1-10B"
+        )
         self.current_policy_path = self.base_model_path
 
         # Register advantage tokens once
@@ -299,7 +302,8 @@ class SelfPlayLoop:
 
         vh_cfg = self.cfg.get("value_head", {})
         if num_epochs is None:
-            num_epochs = int(vh_cfg.get("pretrain_epochs", 50))
+            num_epochs = vh_cfg.get("pretrain_epochs", None)
+            num_epochs = int(num_epochs) if num_epochs is not None else 50
 
         adv_cfg = self.cfg.get("advantage_conditioning", {})
         rollout_cfg = self.cfg.get("rollout", {})
@@ -586,19 +590,49 @@ class SelfPlayLoop:
         reset_to_base = bool(adv_cfg.get("reset_to_base", False))
 
         # 1. Load model for this iteration
-        if reset_to_base or iteration == 0:
-            # First iteration or RECAP-style: reload base model from scratch
+        #    First, free the old model's GPU memory (VLM stays on GPU after rollout/evaluate)
+        if self.full_model is not None:
+            self.full_model.vlm.cpu()
+            import gc
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        if reset_to_base:
+            # RECAP-style: reload base model from scratch every iteration
             logger.info("Loading base model from %s (reset-to-checkpoint)", self.base_model_path)
             full_model = AlpamayoR1.from_pretrained(self.base_model_path, dtype=torch.bfloat16)
         else:
-            # Continue from previous iteration: merge LoRA into base weights
-            logger.info(
-                "Continuing from iteration %d checkpoint (merge previous LoRA)", iteration - 1
-            )
+            # Reuse existing model; at iteration 0 the VLM is not a PeftModel
+            # so merge_and_unload is a no-op (hasattr check is False).
             full_model = self.full_model
             if hasattr(full_model.vlm, "merge_and_unload"):
+                logger.info(
+                    "Continuing from iteration %d checkpoint (merge previous LoRA)",
+                    iteration - 1,
+                )
                 full_model.vlm = full_model.vlm.merge_and_unload()
                 logger.info("Merged previous LoRA weights into base model")
+
+                # Persist merged base for crash recovery
+                merged_dir = (
+                    Path(train_cfg.get("output_dir", "outputs/sft_advcond")) / "merged_base"
+                )
+                merged_dir.mkdir(parents=True, exist_ok=True)
+                full_model.vlm.save_pretrained(str(merged_dir))
+                torch.save(
+                    {
+                        "expert": full_model.expert.state_dict(),
+                        "action_in_proj": full_model.action_in_proj.state_dict(),
+                        "action_out_proj": full_model.action_out_proj.state_dict(),
+                    },
+                    merged_dir / "expert_checkpoint.pt",
+                )
+                with open(merged_dir / "merged_meta.json", "w") as f:
+                    json.dump({"iteration": iteration, "merged_from_iter": iteration - 1}, f)
+                logger.info("Saved merged base to %s", merged_dir)
+            else:
+                logger.info("Reusing existing model for iteration %d", iteration)
 
         # Register advantage tokens and resize embeddings
         register_advantage_tokens(self.processor.tokenizer)
@@ -625,6 +659,7 @@ class SelfPlayLoop:
             from peft import get_peft_model
 
             full_model.vlm = get_peft_model(full_model.vlm, lora_config)
+            full_model.vlm.enable_input_require_grads()
             logger.info("Applied LoRA: r=%d, alpha=%d", lora_config.r, lora_config.lora_alpha)
 
         # 3. Build training dataset (fresh + historical replay)
@@ -640,6 +675,7 @@ class SelfPlayLoop:
             learning_rate=float(train_cfg.get("learning_rate", 5e-6)),
             bf16=bool(train_cfg.get("bf16", True)),
             gradient_checkpointing=bool(train_cfg.get("gradient_checkpointing", True)),
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             logging_steps=int(train_cfg.get("logging_steps", 1)),
             save_steps=int(train_cfg.get("save_steps", 200)),
             save_total_limit=int(train_cfg.get("save_total_limit", 3)),
