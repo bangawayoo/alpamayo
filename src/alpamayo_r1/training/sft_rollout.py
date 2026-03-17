@@ -10,6 +10,7 @@ Adapted from AlpamayoGRPOTrainer._generate_single_turn() in rollout.py.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -49,7 +50,14 @@ class RolloutEngine:
         self.processor = processor
         self.data_cache = data_cache
         self.rollout_cfg = rollout_cfg
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
+            # Respect accelerate/torchrun rank assignment
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.device = torch.device(f"cuda:{local_rank}")
+        else:
+            self.device = torch.device("cpu")
 
         # Config
         self.temperature = float(rollout_cfg.get("temperature", 1.2))
@@ -74,6 +82,10 @@ class RolloutEngine:
     ) -> list[dict]:
         """Generate G completions per scene.
 
+        When running with multiple GPUs (via accelerate/torchrun), each rank
+        processes a disjoint shard of scenes. Results from all ranks should be
+        gathered by the caller if needed.
+
         Args:
             clip_ids: List of clip IDs for fresh scenes.
             t0_us: Timestamp in microseconds.
@@ -89,11 +101,21 @@ class RolloutEngine:
         device = self.device
         results = []
 
+        # Shard scenes across ranks for parallel generation
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        local_clip_ids = clip_ids[rank::world_size]
+        if world_size > 1:
+            logger.info(
+                "Rank %d/%d: generating for %d/%d scenes",
+                rank, world_size, len(local_clip_ids), len(clip_ids),
+            )
+
         # Ensure VLM is on the target device for generation
         self.full_model.vlm.to(device)
         self.full_model.vlm.eval()
         with torch.no_grad():
-            for clip_id in clip_ids:
+            for clip_id in local_clip_ids:
                 try:
                     scene_results = self._generate_for_scene(
                         clip_id,
