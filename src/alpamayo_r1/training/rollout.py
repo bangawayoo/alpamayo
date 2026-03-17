@@ -1780,7 +1780,13 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 "VLM forward returned past_key_values=None. "
                 "Gradient checkpointing may not have been disabled properly."
             )
-        rope_deltas = self.full_model.vlm.model.rope_deltas
+        # Navigate through PeftModel wrapper: vlm.model may be
+        # Qwen3VLForConditionalGeneration (via LoraModel) instead of
+        # the inner Qwen3VLModel that stores rope_deltas.
+        _inner = self.full_model.vlm.model
+        if not hasattr(_inner, "rope_deltas"):
+            _inner = _inner.model
+        rope_deltas = _inner.rope_deltas
         prefill_seq_len = past_key_values.get_seq_length()
         b_star = 1
 

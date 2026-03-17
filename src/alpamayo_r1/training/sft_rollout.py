@@ -518,7 +518,13 @@ class RolloutEngine:
                     )
 
                 prompt_cache = tf_out.past_key_values
-                rope_deltas = vlm.model.rope_deltas
+                # Navigate through PeftModel wrapper: vlm.model may be
+                # Qwen3VLForConditionalGeneration (via LoraModel) instead of
+                # the inner Qwen3VLModel that stores rope_deltas.
+                _inner = vlm.model
+                if not hasattr(_inner, "rope_deltas"):
+                    _inner = _inner.model
+                rope_deltas = _inner.rope_deltas
                 prefill_seq_len = prompt_cache.get_seq_length()
                 b_star = 1
                 offset = torch.tensor([full_ids.shape[1]], device=device)
