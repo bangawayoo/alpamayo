@@ -56,6 +56,7 @@ advantage_conditioning:
   ema_alpha: 0.99               # EMA decay for obs-level baseline
   replay_ratio: 0.3             # fraction of training data from historical replay buffer
   replay_buffer_max_size: 50000
+  reset_to_base: false          # true = reload pi_0 each iteration (RECAP), false = continue from previous iteration's weights
 
 # Value head (required for segment-level advantage computation)
 value_head:
@@ -65,8 +66,8 @@ value_head:
   load_path: null               # pre-trained value head checkpoint (skips pre-training if provided)
   segment_level: true
   train_epochs: 10              # epochs to train value head per iteration (before advantage computation)
-  pretrain_scenes: 50           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)
-  pretrain_epochs: 50           # epochs for Stage 0 pre-training
+  pretrain_scenes: 3           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)
+  pretrain_epochs:            # epochs for Stage 0 pre-training
 
 # Action expert finetuning (CFM / flow matching)
 # Uses deferred GPU scheduling: expert step runs after VLM SFT backward
@@ -106,9 +107,13 @@ rewards:
 
 # Rollout generation parameters
 rollout:
+  mode: expert                  # "vlm_only" or "expert" — expert uses action expert + diffusion
   temperature: 1.2              # higher than GRPO (0.6) for exploration
   top_p: 0.98
   max_generation_length: 256
   logprob_mini_batch_size: 2
   data_cache_max_size: 200      # LRU cache entries (~130 MB each with PIL images)
   vllm_server_url: null         # optional: URL for vLLM server mode (null = use HF generate)
+  expert_diffusion_steps: 10    # Euler steps for flow matching (expert mode only)
+  expert_non_causal: true       # non-causal attention for expert transformer
+  use_adv_conditioning: false   # inject positive adv tokens during rollout (enable after pre-training)

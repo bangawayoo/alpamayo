@@ -3,7 +3,11 @@
 Orchestrates three phases per iteration:
 1. ROLLOUT: Generate G completions per scene from current policy
 2. EVALUATE: Score with rewards + value head, compute and binarize advantages
-3. TRAIN: Reset to pi_0, build advantage-conditioned dataset, SFT + expert CFM
+3. TRAIN: Build advantage-conditioned dataset, SFT + expert CFM
+
+By default, each iteration continues from the previous iteration's trained
+weights (LoRA merged into base). Set ``reset_to_base: true`` to reload pi_0
+every iteration (RECAP-style reset-to-checkpoint).
 
 Manages strict data partitioning (each scene used for fresh rollouts in exactly
 one iteration) and a replay buffer for historical rollouts.
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -201,7 +206,7 @@ class SelfPlayLoop:
     Each iteration:
     1. Generate G completions per fresh scene (never used before)
     2. Score and binarize advantages
-    3. Reset to pi_0, build advantage-conditioned dataset, train SFT + expert
+    3. Build advantage-conditioned dataset, train SFT + expert
 
     Args:
         cfg: Hydra config dict.
@@ -314,6 +319,7 @@ class SelfPlayLoop:
             processor=self.processor,
             data_cache=data_cache,
             rollout_cfg=rollout_cfg,
+            adv_token_ids=self.adv_token_ids,
         )
 
         logger.info("Generating rollouts from %d scenes (G=%d)...", len(pretrain_scenes), G)
@@ -364,7 +370,7 @@ class SelfPlayLoop:
 
         Phase 1: ROLLOUT — Generate completions from current policy
         Phase 2: EVALUATE — Score, compute advantages, binarize
-        Phase 3: TRAIN — Reset to pi_0, SFT with advantage conditioning + expert CFM
+        Phase 3: TRAIN — SFT with advantage conditioning + expert CFM
         Phase 4: BOOKKEEPING — Update replay buffer, save checkpoints
         """
         fresh_scenes = self.partitioner.get_fresh_scenes(iteration)
@@ -375,22 +381,36 @@ class SelfPlayLoop:
             len(self.replay_buffer),
         )
 
+        iter_start = time.time()
+
         # ----- Phase 1: ROLLOUT -----
         logger.info("Phase 1: ROLLOUT — generating completions from current policy")
+        t0 = time.time()
         rollout_results = self._rollout_phase(fresh_scenes, iteration)
+        logger.info("Phase 1 complete: %d completions in %.1fs", len(rollout_results), time.time() - t0)
 
         # ----- Phase 2: EVALUATE -----
         logger.info("Phase 2: EVALUATE — scoring and binarizing advantages")
+        t0 = time.time()
         adv_labels = self._evaluate_phase(rollout_results)
+        logger.info("Phase 2 complete in %.1fs", time.time() - t0)
 
         # ----- Phase 3: TRAIN -----
         logger.info("Phase 3: TRAIN — advantage-conditioned SFT + expert CFM")
+        t0 = time.time()
         self._train_phase(rollout_results, adv_labels, iteration)
+        logger.info("Phase 3 complete in %.1fs", time.time() - t0)
 
         # ----- Phase 4: BOOKKEEPING -----
         logger.info("Phase 4: BOOKKEEPING — updating replay buffer and checkpoints")
         self.replay_buffer.add(rollout_results, adv_labels, iteration)
         self._save_checkpoint(iteration)
+
+        logger.info(
+            "Iteration %d complete: total %.1fs",
+            iteration,
+            time.time() - iter_start,
+        )
 
     def _rollout_phase(self, fresh_scenes: list[str], iteration: int) -> list[dict]:
         """Generate G completions per fresh scene from current policy.
@@ -417,6 +437,7 @@ class SelfPlayLoop:
             processor=self.processor,
             data_cache=data_cache,
             rollout_cfg=rollout_cfg,
+            adv_token_ids=self.adv_token_ids,
         )
 
         # Generate completions
@@ -449,11 +470,25 @@ class SelfPlayLoop:
             processor=self.processor,
             data_cache=data_cache,
             rollout_cfg=rollout_cfg,
+            adv_token_ids=self.adv_token_ids,
         )
 
         # 1. Compute rewards
         reward_stash = engine.compute_rewards(rollout_results)
-        logger.info("Computed rewards for %d completions", len(reward_stash))
+        if reward_stash:
+            r_traj_vals = [r["r_traj"] for r in reward_stash]
+            r_reason_vals = [r["r_reason"] for r in reward_stash]
+            r_consist_vals = [r["r_consist"] for r in reward_stash]
+            logger.info(
+                "Rewards (%d completions): "
+                "traj=[%.3f, %.3f, %.3f] reason=[%.3f, %.3f, %.3f] consist=[%.3f, %.3f, %.3f]",
+                len(reward_stash),
+                min(r_traj_vals), np.mean(r_traj_vals), max(r_traj_vals),
+                min(r_reason_vals), np.mean(r_reason_vals), max(r_reason_vals),
+                min(r_consist_vals), np.mean(r_consist_vals), max(r_consist_vals),
+            )
+        else:
+            logger.info("Computed rewards for %d completions", len(reward_stash))
 
         # 2. Extract segment hidden states
         vh_cfg = self.cfg.get("value_head", {})
@@ -529,9 +564,9 @@ class SelfPlayLoop:
         adv_labels: list[dict],
         iteration: int,
     ) -> None:
-        """Reset to pi_0, build dataset, train SFT + expert.
+        """Build dataset, train SFT + expert.
 
-        1. Load pi_0 (base checkpoint) — reset-to-checkpoint per RECAP
+        1. Load model — either pi_0 (reset_to_base) or merge previous LoRA and continue
         2. Apply LoRA to VLM
         3. Build AdvCondDataset from fresh + historical rollouts
         4. Create AdvCondSFTTrainer (handles VLM SFT + expert CFM)
@@ -547,10 +582,23 @@ class SelfPlayLoop:
         train_cfg = self.cfg.get("training", {})
         lora_cfg = self.cfg.get("lora", {})
         expert_cfg = self.cfg.get("expert_finetune", {})
+        adv_cfg = self.cfg.get("advantage_conditioning", {})
+        reset_to_base = bool(adv_cfg.get("reset_to_base", False))
 
-        # 1. Reset to pi_0 (reload base model for a fresh start)
-        logger.info("Loading base model from %s (reset-to-checkpoint)", self.base_model_path)
-        full_model = AlpamayoR1.from_pretrained(self.base_model_path, dtype=torch.bfloat16)
+        # 1. Load model for this iteration
+        if reset_to_base or iteration == 0:
+            # First iteration or RECAP-style: reload base model from scratch
+            logger.info("Loading base model from %s (reset-to-checkpoint)", self.base_model_path)
+            full_model = AlpamayoR1.from_pretrained(self.base_model_path, dtype=torch.bfloat16)
+        else:
+            # Continue from previous iteration: merge LoRA into base weights
+            logger.info(
+                "Continuing from iteration %d checkpoint (merge previous LoRA)", iteration - 1
+            )
+            full_model = self.full_model
+            if hasattr(full_model.vlm, "merge_and_unload"):
+                full_model.vlm = full_model.vlm.merge_and_unload()
+                logger.info("Merged previous LoRA weights into base model")
 
         # Register advantage tokens and resize embeddings
         register_advantage_tokens(self.processor.tokenizer)

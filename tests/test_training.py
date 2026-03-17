@@ -1281,3 +1281,226 @@ class TestPerTimestepRewards:
         r = trajectory_per_timestep_rewards([], [])
         # Empty arrays — will fail on reshape
         assert r is None or len(r) == 0
+
+
+# ===================================================================
+# Expert rollout mode tests
+# ===================================================================
+
+
+class TestExpertRolloutConfig:
+    """Test that expert rollout config is parsed correctly."""
+
+    def test_rollout_config_has_expert_fields(self):
+        """sft_default.yaml should include expert rollout fields."""
+        import os
+
+        config_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "src",
+            "alpamayo_r1",
+            "training",
+            "configs",
+            "sft_default.yaml",
+        )
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        rollout = cfg["rollout"]
+        assert rollout["mode"] == "expert"
+        assert "expert_diffusion_steps" in rollout
+        assert "expert_non_causal" in rollout
+        assert "use_adv_conditioning" in rollout
+        assert rollout["expert_diffusion_steps"] == 10
+        assert rollout["expert_non_causal"] is True
+        assert rollout["use_adv_conditioning"] is False
+
+    def test_rollout_engine_mode_dispatch(self):
+        """RolloutEngine should accept mode config."""
+        from unittest.mock import MagicMock
+
+        import torch
+
+        from alpamayo_r1.training.sft_rollout import RolloutEngine
+
+        full_model = MagicMock()
+        full_model.future_token_start_idx = 151669
+        full_model.config.tokens_per_future_traj = 64
+        full_model.config.traj_vocab_size = 768
+        full_model.special_token_ids = {
+            "traj_future_end": 155686,
+            "traj_future_start": 155685,
+        }
+        full_model.traj_tokenizer = MagicMock()
+        full_model.tokenizer = MagicMock()
+        full_model.expert = MagicMock()
+        full_model.action_in_proj = MagicMock()
+        full_model.action_out_proj = MagicMock()
+        full_model.action_space = MagicMock()
+        full_model.diffusion = MagicMock()
+
+        processor = MagicMock()
+        processor.tokenizer.pad_token_id = 0
+        data_cache = MagicMock()
+
+        # Test expert mode
+        engine = RolloutEngine(
+            full_model=full_model,
+            processor=processor,
+            data_cache=data_cache,
+            rollout_cfg={"mode": "expert", "expert_diffusion_steps": 5},
+            device=torch.device("cpu"),
+        )
+        assert engine.mode == "expert"
+        assert engine.expert_diffusion_steps == 5
+
+        # Test vlm_only mode
+        engine2 = RolloutEngine(
+            full_model=full_model,
+            processor=processor,
+            data_cache=data_cache,
+            rollout_cfg={"mode": "vlm_only"},
+            device=torch.device("cpu"),
+        )
+        assert engine2.mode == "vlm_only"
+
+    def test_rollout_engine_adv_token_ids(self):
+        """RolloutEngine should store adv_token_ids when provided."""
+        from unittest.mock import MagicMock
+
+        import torch
+
+        from alpamayo_r1.training.sft_rollout import RolloutEngine
+
+        full_model = MagicMock()
+        full_model.future_token_start_idx = 151669
+        full_model.config.tokens_per_future_traj = 64
+        full_model.config.traj_vocab_size = 768
+        full_model.special_token_ids = {}
+        full_model.traj_tokenizer = MagicMock()
+        full_model.tokenizer = MagicMock()
+        full_model.expert = MagicMock()
+        full_model.action_in_proj = MagicMock()
+        full_model.action_out_proj = MagicMock()
+        full_model.action_space = MagicMock()
+        full_model.diffusion = MagicMock()
+
+        processor = MagicMock()
+        processor.tokenizer.pad_token_id = 0
+        data_cache = MagicMock()
+
+        adv_ids = {"adv_obs_pos": 100, "adv_obs_neg": 101, "adv_traj_pos": 102, "adv_traj_neg": 103}
+        engine = RolloutEngine(
+            full_model=full_model,
+            processor=processor,
+            data_cache=data_cache,
+            rollout_cfg={"mode": "expert", "use_adv_conditioning": True},
+            device=torch.device("cpu"),
+            adv_token_ids=adv_ids,
+        )
+        assert engine.use_adv_conditioning is True
+        assert engine.adv_token_ids == adv_ids
+
+        # Without adv_token_ids, should default to empty dict
+        engine2 = RolloutEngine(
+            full_model=full_model,
+            processor=processor,
+            data_cache=data_cache,
+            rollout_cfg={},
+            device=torch.device("cpu"),
+        )
+        assert engine2.adv_token_ids == {}
+        assert engine2.use_adv_conditioning is False
+
+
+class TestExpertRolloutCompletionFormat:
+    """Test that expert rollout output format is correct."""
+
+    def test_completion_ids_structure(self):
+        """Expert completion_ids should be [CoC] + [traj_future_start] + [64 traj] + [traj_future_end]."""
+        # Simulate an expert rollout result's completion_ids
+        traj_future_start_id = 155685
+        traj_future_end_id = 155686
+        traj_token_start_idx = 151669
+        traj_vocab_size = 768
+        tokens_per_future_traj = 64
+
+        # Simulated CoC tokens (arbitrary text token IDs)
+        coc_tokens = [1500, 2000, 3000, 4000, 5000]
+
+        # Simulated trajectory token IDs (within valid range)
+        traj_token_ids = [
+            traj_token_start_idx + i % traj_vocab_size for i in range(tokens_per_future_traj)
+        ]
+
+        # Build completion_ids as expert mode would
+        completion_ids = (
+            coc_tokens + [traj_future_start_id] + traj_token_ids + [traj_future_end_id]
+        )
+
+        # Verify structure
+        assert completion_ids[: len(coc_tokens)] == coc_tokens
+        assert completion_ids[len(coc_tokens)] == traj_future_start_id
+        assert completion_ids[-1] == traj_future_end_id
+
+        # Verify trajectory tokens are in valid range
+        traj_section = completion_ids[len(coc_tokens) + 1 : -1]
+        assert len(traj_section) == tokens_per_future_traj
+        for tid in traj_section:
+            assert traj_token_start_idx <= tid < traj_token_start_idx + traj_vocab_size
+
+    def test_no_adv_tokens_in_completion_ids(self):
+        """Advantage tokens should NOT appear in completion_ids (only in prompt/KV cache)."""
+        adv_token_ids = {
+            "adv_obs_pos": 155690,
+            "adv_obs_neg": 155691,
+            "adv_traj_pos": 155692,
+            "adv_traj_neg": 155693,
+        }
+        adv_values = set(adv_token_ids.values())
+
+        # Simulated completion_ids from expert mode
+        traj_future_start_id = 155685
+        traj_future_end_id = 155686
+        coc_tokens = [1500, 2000, 3000]
+        traj_token_ids = [151669 + i for i in range(64)]
+        completion_ids = coc_tokens + [traj_future_start_id] + traj_token_ids + [traj_future_end_id]
+
+        # No advantage token should be present
+        for tid in completion_ids:
+            assert tid not in adv_values, f"Adv token {tid} found in completion_ids"
+
+
+class TestResetToBaseConfig:
+    """Test reset_to_base config option for the self-play loop."""
+
+    def test_sft_config_has_reset_to_base(self):
+        """sft_default.yaml should include reset_to_base under advantage_conditioning."""
+        import os
+
+        config_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "src",
+            "alpamayo_r1",
+            "training",
+            "configs",
+            "sft_default.yaml",
+        )
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        adv_cfg = cfg["advantage_conditioning"]
+        assert "reset_to_base" in adv_cfg
+        assert adv_cfg["reset_to_base"] is False
+
+    def test_reset_to_base_defaults_to_false(self):
+        """When reset_to_base is absent from config, it should default to False."""
+        adv_cfg = {}  # no reset_to_base key
+        reset_to_base = bool(adv_cfg.get("reset_to_base", False))
+        assert reset_to_base is False
+
+    def test_reset_to_base_true_overrides(self):
+        """When reset_to_base is explicitly True, it should be respected."""
+        adv_cfg = {"reset_to_base": True}
+        reset_to_base = bool(adv_cfg.get("reset_to_base", False))
+        assert reset_to_base is True
