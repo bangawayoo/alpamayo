@@ -76,14 +76,14 @@ expert_finetune:
   enabled: true
   lr: 1e-4
   weight_decay: 0.01
-  num_noisy_samples: 2          # noise samples per GT action for CFM loss
+  num_noisy_samples: 1          # noise samples per GT action for CFM loss
   every_n_steps: 1              # run expert CFM step every N VLM SFT steps
   max_grad_norm: 1.0
   save_path: null               # where to save expert checkpoints
   load_path: null               # pre-trained expert weights to load
   expert_lora:
     enabled: true
-    r: 4
+    r: 16
     alpha: 32
     target_modules:
       - q_proj
