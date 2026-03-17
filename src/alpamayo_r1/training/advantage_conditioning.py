@@ -221,22 +221,12 @@ def compute_segment_advantages_from_rollouts(
         h_obs = seg["h_obs"].to(vh_device)
         h_traj = seg["h_traj"].to(vh_device)
 
-        # Value predictions (obs and traj levels only — no CoC level for conditioning)
-        with torch.no_grad():
-            v_obs = value_head(h_obs, level=SegmentValueHead.LEVEL_OBS).item()
-            if h_traj.shape[0] > 0:
-                v_traj = value_head(h_traj.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ).squeeze(
-                    0
-                )
-            else:
-                v_traj = torch.zeros(0, device=vh_device)
-
         # Per-function rewards
         r_traj_scalar = seg_rew.get("r_traj", 0.0)
         r_reason = seg_rew.get("r_reason", 0.0)
         r_consist = seg_rew.get("r_consist", 0.0)
 
-        # Per-timestep trajectory rewards
+        # Per-token trajectory rewards and returns-to-go (computed over all tokens)
         T_traj = seg_map["traj_len"]
         if T_traj > 0:
             r_per_step = seg_rew.get("r_traj_per_step")
@@ -248,21 +238,38 @@ def compute_segment_advantages_from_rollouts(
                 )
             r_traj_weighted = w_traj * r_per_step_t
             r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
+            g_traj_all = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
         else:
             r_traj_weighted = torch.zeros(0, device=vh_device)
+            g_traj_all = torch.zeros(0, device=vh_device)
 
-        # Returns-to-go at each state
+        # Returns-to-go at observation state
         traj_total = r_traj_weighted.sum().item() if T_traj > 0 else 0.0
         g_obs = w_reason * r_reason + traj_total  # total return from s_obs
 
-        # Advantages: actual return minus value baseline at each information level
+        # Value predictions at curvature positions only (idx % 2 == 1).
+        # Trajectory tokens are (acceleration, curvature) pairs; the curvature
+        # token has seen both components and is the natural V evaluation point.
+        with torch.no_grad():
+            v_obs = value_head(h_obs, level=SegmentValueHead.LEVEL_OBS).item()
+            if T_traj > 0:
+                curv_idx = torch.arange(1, T_traj, 2, device=vh_device)
+                h_traj_curv = h_traj[curv_idx]
+                traj_pos = (curv_idx // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0)
+                v_traj = value_head(
+                    h_traj_curv.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ,
+                    positions=traj_pos,
+                ).squeeze(0)
+                g_traj = g_traj_all[curv_idx]
+            else:
+                v_traj = torch.zeros(0, device=vh_device)
+                g_traj = torch.zeros(0, device=vh_device)
+
         # A_obs: completion quality relative to scene baseline
         a_obs = g_obs - v_obs
 
-        # A_traj_j: remaining trajectory quality at each step
+        # A_traj: per-timestep trajectory advantages (curvature positions only)
         if T_traj > 0:
-            # G(s_traj_j) = w_traj * Σ_{t=j}^{T} r_t + w_consist * R_consistency
-            g_traj = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
             a_traj_per_step = g_traj - v_traj
             a_traj_mean = a_traj_per_step.mean().item()
             a_traj_list = a_traj_per_step.cpu().tolist()
@@ -381,8 +388,9 @@ def train_segment_value_head(
     from alpamayo_r1.training.value_head import SegmentValueHead
 
     B = len(g_obs_list)
-    if B == 0:
-        return {"loss": 0.0}
+    if B == 0 or num_epochs <= 0:
+        return {"loss": 0.0, "loss_obs": 0.0, "loss_coc": 0.0, "loss_traj": 0.0,
+                "pred_obs_mean": 0.0, "target_obs_mean": 0.0}
 
     vh_device = next(value_head.parameters()).device
     metrics = {}
@@ -408,7 +416,12 @@ def train_segment_value_head(
         coc_target_t = torch.tensor(g_coc_list, device=vh_device, dtype=torch.float32)
         loss_coc = F.mse_loss(coc_pred_t, coc_target_t)
 
-        # --- Traj-level loss (sub-sampled) ---
+        # --- Traj-level loss (sub-sampled at curvature positions) ---
+        # Trajectory tokens come in (acceleration, curvature) pairs per timestep.
+        # We evaluate V only at curvature positions (idx % 2 == 1) because:
+        # (1) the curvature token has seen both components of the timestep,
+        # (2) rewards are per-timestep, so the value function is naturally
+        #     timestep-level rather than token-level.
         traj_preds = []
         traj_targets = []
         for i in range(B):
@@ -417,15 +430,20 @@ def train_segment_value_head(
             if h_traj.shape[0] == 0:
                 continue
             T_t = h_traj.shape[0]
-            n_keep = min(T_t, max_traj_samples_per_completion)
-            if n_keep < T_t:
-                indices = torch.randperm(T_t)[:n_keep]
-                h_sub = h_traj[indices].to(vh_device)
-                g_sub = g_traj[indices].to(vh_device)
+            curvature_idx = torch.arange(1, T_t, 2)  # [1, 3, 5, ...]
+            n_timesteps = len(curvature_idx)
+            n_keep = min(n_timesteps, max_traj_samples_per_completion)
+            if n_keep < n_timesteps:
+                sel = curvature_idx[torch.randperm(n_timesteps)[:n_keep]]
             else:
-                h_sub = h_traj.to(vh_device)
-                g_sub = g_traj.to(vh_device)
-            v = value_head(h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ).squeeze(0)
+                sel = curvature_idx
+            h_sub = h_traj[sel].to(vh_device)
+            g_sub = g_traj[sel].to(vh_device)
+            # RoPE positions: timestep index (sel // 2) + traj offset
+            traj_pos = (sel // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0).to(vh_device)
+            v = value_head(
+                h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos
+            ).squeeze(0)
             traj_preds.append(v)
             traj_targets.append(g_sub)
 
@@ -612,7 +630,7 @@ class AdvCondDataset(Dataset):
         rollout = self._rollouts[idx]
         label = self._labels[idx]
 
-        return build_conditioned_sequence(
+        item = build_conditioned_sequence(
             prompt_ids=rollout["prompt_ids"],
             completion_ids=rollout["completion_ids"],
             i_obs=label["i_obs"],
@@ -621,6 +639,16 @@ class AdvCondDataset(Dataset):
             traj_future_start_id=self._traj_future_start_id,
             p_drop=self._p_drop,
         )
+
+        # Propagate metadata for expert CFM step
+        if "clip_id" in rollout:
+            item["clip_id"] = rollout["clip_id"]
+        if "t0_us" in rollout:
+            item["t0_us"] = rollout["t0_us"]
+        if "completion_prefix" in rollout:
+            item["completion_prefix"] = rollout["completion_prefix"]
+
+        return item
 
     def set_p_drop(self, p_drop: float) -> None:
         """Update dropout probability (e.g., per epoch)."""

@@ -1312,13 +1312,26 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             h_traj = seg["h_traj"].to(vh_device)  # (T_traj, D)
 
             # Value predictions (detached for advantage computation, will backprop in training)
+            # Trajectory V is evaluated at curvature positions only (idx % 2 == 1),
+            # then expanded to per-token for GAE compatibility. Both tokens in each
+            # (acceleration, curvature) pair receive the same V since the curvature
+            # token is the natural evaluation point for the timestep.
             with torch.no_grad():
                 v_obs = self.value_head(h_obs, level=SegmentValueHead.LEVEL_OBS)  # (1,)
                 v_coc = self.value_head(h_coc, level=SegmentValueHead.LEVEL_COC)  # (1,)
                 if h_traj.shape[0] > 0:
-                    v_traj = self.value_head(
-                        h_traj.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ
-                    ).squeeze(0)  # (T_traj,)
+                    T_tokens = h_traj.shape[0]
+                    curv_idx = torch.arange(1, T_tokens, 2, device=vh_device)
+                    traj_pos = (curv_idx // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0)
+                    v_traj_ts = self.value_head(
+                        h_traj[curv_idx].unsqueeze(0),
+                        level=SegmentValueHead.LEVEL_TRAJ,
+                        positions=traj_pos,
+                    ).squeeze(0)  # (n_timesteps,)
+                    # Expand to per-token: both tokens in a pair get same V
+                    v_traj = v_traj_ts.repeat_interleave(2)
+                    if v_traj.shape[0] < T_tokens:  # odd T_traj
+                        v_traj = torch.cat([v_traj, v_traj_ts[-1:]])
                 else:
                     v_traj = torch.zeros(0, device=vh_device)
 
@@ -1488,7 +1501,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         coc_target_t = torch.tensor(coc_targets, device=vh_device, dtype=torch.float32)
         loss_coc = F.mse_loss(coc_pred_t, coc_target_t)
 
-        # Traj-level loss: sub-sample to avoid dominating
+        # Traj-level loss: sub-sample at curvature positions only.
+        # Trajectory tokens come in (acceleration, curvature) pairs per timestep.
+        # We evaluate V only at curvature positions (idx % 2 == 1) because the
+        # curvature token has seen both components and rewards are per-timestep.
         traj_preds = []
         traj_targets = []
         max_traj_samples = max(B * 2, 16)  # limit traj samples relative to obs+coc
@@ -1500,16 +1516,20 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             if h_traj.shape[0] == 0:
                 continue
             T_t = h_traj.shape[0]
-            # Sub-sample
-            n_keep = min(T_t, max(1, max_traj_samples - total_traj))
-            if n_keep < T_t:
-                indices = torch.randperm(T_t)[:n_keep]
-                h_sub = h_traj[indices].to(vh_device)
-                g_sub = g_traj[indices].to(vh_device)
+            curvature_idx = torch.arange(1, T_t, 2)  # [1, 3, 5, ...]
+            n_timesteps = len(curvature_idx)
+            n_keep = min(n_timesteps, max(1, max_traj_samples - total_traj))
+            if n_keep < n_timesteps:
+                sel = curvature_idx[torch.randperm(n_timesteps)[:n_keep]]
             else:
-                h_sub = h_traj.to(vh_device)
-                g_sub = g_traj.to(vh_device)
-            v = self.value_head(h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ).squeeze(0)
+                sel = curvature_idx
+            h_sub = h_traj[sel].to(vh_device)
+            g_sub = g_traj[sel].to(vh_device)
+            # RoPE positions: timestep index (sel // 2) + traj offset
+            traj_pos = (sel // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0).to(vh_device)
+            v = self.value_head(
+                h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos
+            ).squeeze(0)
             traj_preds.append(v)
             traj_targets.append(g_sub)
             total_traj += n_keep
