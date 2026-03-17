@@ -145,6 +145,8 @@ class AdvCondSFTTrainer(Trainer):
             "expert_cfm/valid_samples": [],
         }
         self._sft_step_count = 0
+        self._uncond_total = 0
+        self._uncond_count = 0
 
         # Expert finetuning setup
         self._expert_enabled = False
@@ -254,14 +256,24 @@ class AdvCondSFTTrainer(Trainer):
         # 1. Normal SFT forward + backward
         loss = super().training_step(model, inputs, num_items_in_batch)
 
+        # Track unconditional fraction
+        is_unconditional = inputs.get("is_unconditional")
+        if is_unconditional is not None:
+            self._uncond_total += is_unconditional.numel()
+            self._uncond_count += is_unconditional.sum().item()
+
         # Log SFT loss periodically
         self._sft_step_count += 1
         if self._sft_step_count % max(1, self.args.logging_steps) == 0:
+            uncond_frac = self._uncond_count / max(self._uncond_total, 1)
             logger.info(
-                "SFT step %d: loss=%.4f lr=%.2e",
+                "SFT step %d: loss=%.4f lr=%.2e uncond_frac=%.3f (%d/%d)",
                 self._sft_step_count,
                 loss.item() if hasattr(loss, "item") else loss,
                 self.optimizer.param_groups[0]["lr"] if self.optimizer else 0.0,
+                uncond_frac,
+                self._uncond_count,
+                self._uncond_total,
             )
 
         # 2. Deferred expert CFM step
