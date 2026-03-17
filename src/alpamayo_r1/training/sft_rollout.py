@@ -114,8 +114,15 @@ class RolloutEngine:
         # Ensure VLM is on the target device for generation
         self.full_model.vlm.to(device)
         self.full_model.vlm.eval()
+        n_local = len(local_clip_ids)
+        n_failed = 0
         with torch.no_grad():
-            for clip_id in local_clip_ids:
+            for scene_idx, clip_id in enumerate(local_clip_ids):
+                if scene_idx % max(1, n_local // 10) == 0 or scene_idx == n_local - 1:
+                    logger.info(
+                        "[Rank %d] Rollout progress: %d/%d scenes (%d completions, %d failed)",
+                        rank, scene_idx + 1, n_local, len(results), n_failed,
+                    )
                 try:
                     scene_results = self._generate_for_scene(
                         clip_id,
@@ -127,10 +134,14 @@ class RolloutEngine:
                     )
                     results.extend(scene_results)
                 except Exception as e:
+                    n_failed += 1
                     logger.warning("Generation failed for %s: %s", clip_id, e)
                     continue
 
-        logger.info("Generated %d completions from %d scenes", len(results), len(clip_ids))
+        logger.info(
+            "[Rank %d] Rollout complete: %d completions from %d scenes (%d failed)",
+            rank, len(results), n_local, n_failed,
+        )
         return results
 
     def _generate_for_scene(
