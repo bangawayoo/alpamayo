@@ -161,19 +161,31 @@ class AdvCondSFTTrainer(Trainer):
             self._setup_expert(full_model, self._expert_cfg)
 
     def _setup_expert(self, full_model: AlpamayoR1, cfg: dict) -> None:
-        """Initialize expert optimizer and optionally load pretrained weights."""
-        # Optionally load pretrained expert weights (before LoRA so base weights are set)
+        """Initialize expert optimizer and optionally load pretrained weights.
+
+        Loading order depends on checkpoint type:
+        - Full/base checkpoint: load weights first, then apply LoRA on top
+        - LoRA-only checkpoint: apply LoRA first, then load LoRA weights
+        - No checkpoint: just apply LoRA (if enabled)
+        """
         load_path = cfg.get("load_path")
+        lora_cfg = cfg.get("expert_lora", {})
+        lora_enabled = lora_cfg.get("enabled", False)
+
+        # Load checkpoint and detect type
+        checkpoint = None
+        checkpoint_is_lora = False
         if load_path:
-            state = torch.load(load_path, map_location="cpu", weights_only=False)
-            full_model.expert.load_state_dict(state["expert"], strict=False)
-            full_model.action_in_proj.load_state_dict(state["action_in_proj"])
-            full_model.action_out_proj.load_state_dict(state["action_out_proj"])
-            logger.info("Loaded pretrained expert weights from %s", load_path)
+            checkpoint = torch.load(load_path, map_location="cpu", weights_only=False)
+            checkpoint_is_lora = checkpoint.get("expert_lora", False)
+
+        # For full/base checkpoints: load weights BEFORE applying LoRA
+        if checkpoint and not checkpoint_is_lora:
+            full_model.expert.load_state_dict(checkpoint["expert"], strict=False)
+            logger.info("Loaded full expert weights from %s", load_path)
 
         # Apply LoRA to expert transformer if configured
-        lora_cfg = cfg.get("expert_lora", {})
-        if lora_cfg.get("enabled", False):
+        if lora_enabled:
             from peft import LoraConfig, get_peft_model
 
             expert_lora_config = LoraConfig(
@@ -191,6 +203,17 @@ class AdvCondSFTTrainer(Trainer):
                 expert_lora_config.r,
                 expert_lora_config.lora_alpha,
             )
+
+        # For LoRA-only checkpoints: load LoRA weights AFTER applying LoRA
+        if checkpoint and checkpoint_is_lora:
+            full_model.expert.load_state_dict(checkpoint["expert"], strict=False)
+            logger.info("Loaded expert LoRA weights from %s", load_path)
+
+        # Load projection layers (always full state_dict)
+        if checkpoint:
+            full_model.action_in_proj.load_state_dict(checkpoint["action_in_proj"])
+            full_model.action_out_proj.load_state_dict(checkpoint["action_out_proj"])
+            logger.info("Loaded projection layers from %s", load_path)
 
         # Collect trainable parameters: expert (LoRA or full) + projections
         expert_params = []
@@ -342,13 +365,15 @@ class AdvCondSFTTrainer(Trainer):
                 fut_xyz = ego_future_xyz.to(device)[:, -1]
                 fut_rot = ego_future_rot[:, -1]
 
-                cached_samples.append({
-                    "kv_result": kv_result,
-                    "hist_xyz": hist_xyz,
-                    "hist_rot": hist_rot,
-                    "fut_xyz": fut_xyz,
-                    "fut_rot": fut_rot,
-                })
+                cached_samples.append(
+                    {
+                        "kv_result": kv_result,
+                        "hist_xyz": hist_xyz,
+                        "hist_rot": hist_rot,
+                        "fut_xyz": fut_xyz,
+                        "fut_rot": fut_rot,
+                    }
+                )
             except Exception as e:
                 logger.warning("KV cache extraction failed for sample %d: %s", i, e)
                 continue
@@ -377,8 +402,10 @@ class AdvCondSFTTrainer(Trainer):
 
                 with torch.no_grad():
                     gt_action = self.full_model.action_space.traj_to_action(
-                        sample["hist_xyz"], sample["hist_rot"],
-                        sample["fut_xyz"], sample["fut_rot"],
+                        sample["hist_xyz"],
+                        sample["hist_rot"],
+                        sample["fut_xyz"],
+                        sample["fut_rot"],
                     )
 
                 # Compute CFM loss
@@ -509,12 +536,26 @@ class AdvCondSFTTrainer(Trainer):
         return past_key_values, rope_deltas, prefill_seq_len, b_star, offset
 
     def _save(self, output_dir: str, state_dict=None) -> None:
-        """Extend default save to also persist expert and value head weights."""
+        """Extend default save to also persist expert and value head weights.
+
+        If the expert is a PeftModel (LoRA enabled), saves only LoRA weights
+        and sets ``expert_lora: True`` in the checkpoint. Otherwise saves the
+        full expert state_dict.  Projection layers are always saved in full.
+        """
         super()._save(output_dir, state_dict)
 
         if self.full_model is not None:
+            expert = self.full_model.expert
+            is_lora = hasattr(expert, "peft_config")
+
+            if is_lora:
+                expert_sd = {k: v for k, v in expert.state_dict().items() if "lora_" in k}
+            else:
+                expert_sd = expert.state_dict()
+
             expert_state = {
-                "expert": self.full_model.expert.state_dict(),
+                "expert": expert_sd,
+                "expert_lora": is_lora,
                 "action_in_proj": self.full_model.action_in_proj.state_dict(),
                 "action_out_proj": self.full_model.action_out_proj.state_dict(),
             }
@@ -523,7 +564,12 @@ class AdvCondSFTTrainer(Trainer):
 
             expert_path = Path(output_dir) / "expert_checkpoint.pt"
             torch.save(expert_state, expert_path)
-            logger.info("Saved expert checkpoint to %s", expert_path)
+            logger.info(
+                "Saved expert checkpoint to %s (lora_only=%s, keys=%d)",
+                expert_path,
+                is_lora,
+                len(expert_sd),
+            )
 
         if self._value_head is not None:
             vh_path = Path(output_dir) / "value_head.pt"

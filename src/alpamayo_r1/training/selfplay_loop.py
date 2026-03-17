@@ -17,7 +17,6 @@ See docs/advantage-conditioning.md for the full design specification.
 
 from __future__ import annotations
 
-import json
 import logging
 import random
 import time
@@ -197,6 +196,149 @@ class RolloutReplayBuffer:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint loading utilities
+# ---------------------------------------------------------------------------
+
+
+def load_value_head_checkpoint(
+    path: str | Path,
+    hidden_dim: int = 4096,
+) -> torch.nn.Module:
+    """Load a saved SegmentValueHead checkpoint.
+
+    Args:
+        path: Path to the ``value_head.pt`` file.
+        hidden_dim: Hidden dimension (must match the saved checkpoint).
+
+    Returns:
+        SegmentValueHead module with loaded weights.
+    """
+    from alpamayo_r1.training.value_head import SegmentValueHead
+
+    value_head = SegmentValueHead(hidden_dim=hidden_dim)
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    value_head.load_state_dict(state)
+    logger.info("Loaded value head from %s", path)
+    return value_head
+
+
+def load_expert_checkpoint(
+    full_model: Any,
+    path: str | Path,
+    expert_lora_cfg: dict | None = None,
+) -> Any:
+    """Load expert + projection weights from a checkpoint.
+
+    Handles both full-state and LoRA-only checkpoints. When the checkpoint
+    contains only LoRA weights (``expert_lora: True``), the caller must
+    supply ``expert_lora_cfg`` so that LoRA layers can be created before
+    the weights are loaded.
+
+    Args:
+        full_model: AlpamayoR1 instance (mutated in place).
+        path: Path to ``expert_checkpoint.pt``.
+        expert_lora_cfg: LoRA config dict (``r``, ``alpha``, ``target_modules``, …).
+            Required when loading a LoRA-only checkpoint.
+
+    Returns:
+        The same ``full_model`` reference (mutated).
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    is_lora = checkpoint.get("expert_lora", False)
+
+    if is_lora:
+        if expert_lora_cfg is None:
+            raise ValueError(
+                "Checkpoint at %s is LoRA-only but no expert_lora_cfg was provided" % path
+            )
+        from peft import LoraConfig, get_peft_model
+
+        lora_config = LoraConfig(
+            r=int(expert_lora_cfg.get("r", 4)),
+            lora_alpha=int(expert_lora_cfg.get("alpha", 32)),
+            lora_dropout=float(expert_lora_cfg.get("dropout", 0.0)),
+            target_modules=list(
+                expert_lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
+            ),
+            task_type="FEATURE_EXTRACTION",
+        )
+        full_model.expert = get_peft_model(full_model.expert, lora_config)
+        full_model.expert.load_state_dict(checkpoint["expert"], strict=False)
+        logger.info("Loaded expert LoRA weights from %s", path)
+    else:
+        full_model.expert.load_state_dict(checkpoint["expert"], strict=False)
+        logger.info("Loaded full expert weights from %s", path)
+
+    full_model.action_in_proj.load_state_dict(checkpoint["action_in_proj"])
+    full_model.action_out_proj.load_state_dict(checkpoint["action_out_proj"])
+    logger.info("Loaded projection layers from %s", path)
+    return full_model
+
+
+def load_vlm_from_iterations(
+    base_model_name: str,
+    output_dir: str | Path,
+    up_to_iteration: int,
+    expert_lora_cfg: dict | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> Any:
+    """Reconstruct a model by iteratively merging per-iteration LoRA adapters.
+
+    Starting from the base model, loads and merges VLM LoRA adapters from
+    ``iter_0/final/`` through ``iter_{up_to_iteration}/final/``. Also loads
+    the latest expert checkpoint and value head from the final iteration.
+
+    Args:
+        base_model_name: HuggingFace model name or path for the base AlpamayoR1.
+        output_dir: Root output directory containing ``iter_*/final/`` subdirs.
+        up_to_iteration: Last iteration index (inclusive) to merge.
+        expert_lora_cfg: Expert LoRA config dict (needed if expert checkpoint is LoRA-only).
+        dtype: Model dtype.
+
+    Returns:
+        Dict with keys ``full_model``, ``value_head`` (or None).
+    """
+    from peft import PeftModel
+
+    from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+
+    output_dir = Path(output_dir)
+
+    logger.info("Loading base model from %s", base_model_name)
+    full_model = AlpamayoR1.from_pretrained(base_model_name, dtype=dtype)
+
+    # Iteratively apply and merge VLM LoRA adapters
+    for i in range(up_to_iteration + 1):
+        adapter_path = output_dir / f"iter_{i}" / "final"
+        adapter_config = adapter_path / "adapter_config.json"
+        if not adapter_config.exists():
+            logger.info("No VLM adapter at %s — skipping iteration %d", adapter_path, i)
+            continue
+        logger.info("Loading VLM LoRA adapter from %s", adapter_path)
+        full_model.vlm = PeftModel.from_pretrained(full_model.vlm, str(adapter_path))
+        full_model.vlm = full_model.vlm.merge_and_unload()
+        logger.info("Merged VLM LoRA from iteration %d", i)
+
+    # Load expert checkpoint from the latest iteration
+    latest_expert = output_dir / f"iter_{up_to_iteration}" / "final" / "expert_checkpoint.pt"
+    if latest_expert.exists():
+        load_expert_checkpoint(full_model, latest_expert, expert_lora_cfg=expert_lora_cfg)
+
+    # Load value head from the latest iteration
+    value_head = None
+    latest_vh = output_dir / f"iter_{up_to_iteration}" / "final" / "value_head.pt"
+    if latest_vh.exists():
+        value_head = load_value_head_checkpoint(latest_vh)
+
+    logger.info(
+        "Reconstructed model through iteration %d (VLM merged, expert loaded, vh=%s)",
+        up_to_iteration,
+        value_head is not None,
+    )
+    return {"full_model": full_model, "value_head": value_head}
+
+
+# ---------------------------------------------------------------------------
 # Self-play loop
 # ---------------------------------------------------------------------------
 
@@ -362,24 +504,15 @@ class SelfPlayLoop:
             num_epochs=num_epochs,
         )
 
-        # Save all components after value head pre-training so Stage 0 work
-        # is recoverable on crash.  VLM has no LoRA yet, so save base weights.
+        # Save only the value head after pre-training — the VLM and expert
+        # are unchanged during Stage 0, so no need to save them.
         output_dir = Path(self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
         pretrain_dir = output_dir / "pretrained"
         pretrain_dir.mkdir(parents=True, exist_ok=True)
 
         torch.save(value_head.state_dict(), pretrain_dir / "value_head.pt")
-        self.full_model.vlm.save_pretrained(str(pretrain_dir / "vlm"))
-        torch.save(
-            {
-                "expert": self.full_model.expert.state_dict(),
-                "action_in_proj": self.full_model.action_in_proj.state_dict(),
-                "action_out_proj": self.full_model.action_out_proj.state_dict(),
-            },
-            pretrain_dir / "expert_checkpoint.pt",
-        )
         logger.info(
-            "Saved pretrained checkpoint (vlm + expert + value_head) to %s (vh loss=%.4f)",
+            "Saved pretrained value head to %s (vh loss=%.4f)",
             pretrain_dir,
             metrics["loss"],
         )
@@ -406,7 +539,9 @@ class SelfPlayLoop:
         logger.info("Phase 1: ROLLOUT — generating completions from current policy")
         t0 = time.time()
         rollout_results = self._rollout_phase(fresh_scenes, iteration)
-        logger.info("Phase 1 complete: %d completions in %.1fs", len(rollout_results), time.time() - t0)
+        logger.info(
+            "Phase 1 complete: %d completions in %.1fs", len(rollout_results), time.time() - t0
+        )
 
         # ----- Phase 2: EVALUATE -----
         logger.info("Phase 2: EVALUATE — scoring and binarizing advantages")
@@ -502,9 +637,15 @@ class SelfPlayLoop:
                 "Rewards (%d completions): "
                 "traj=[%.3f, %.3f, %.3f] reason=[%.3f, %.3f, %.3f] consist=[%.3f, %.3f, %.3f]",
                 len(reward_stash),
-                min(r_traj_vals), np.mean(r_traj_vals), max(r_traj_vals),
-                min(r_reason_vals), np.mean(r_reason_vals), max(r_reason_vals),
-                min(r_consist_vals), np.mean(r_consist_vals), max(r_consist_vals),
+                min(r_traj_vals),
+                np.mean(r_traj_vals),
+                max(r_traj_vals),
+                min(r_reason_vals),
+                np.mean(r_reason_vals),
+                max(r_reason_vals),
+                min(r_consist_vals),
+                np.mean(r_consist_vals),
+                max(r_consist_vals),
             )
         else:
             logger.info("Computed rewards for %d completions", len(reward_stash))
@@ -627,27 +768,15 @@ class SelfPlayLoop:
                     iteration - 1,
                 )
                 full_model.vlm = full_model.vlm.merge_and_unload()
-                logger.info("Merged previous LoRA weights into base model")
-
-                # Persist merged base for crash recovery
-                merged_dir = (
-                    Path(train_cfg.get("output_dir", "outputs/sft_advcond")) / "merged_base"
-                )
-                merged_dir.mkdir(parents=True, exist_ok=True)
-                full_model.vlm.save_pretrained(str(merged_dir))
-                torch.save(
-                    {
-                        "expert": full_model.expert.state_dict(),
-                        "action_in_proj": full_model.action_in_proj.state_dict(),
-                        "action_out_proj": full_model.action_out_proj.state_dict(),
-                    },
-                    merged_dir / "expert_checkpoint.pt",
-                )
-                with open(merged_dir / "merged_meta.json", "w") as f:
-                    json.dump({"iteration": iteration, "merged_from_iter": iteration - 1}, f)
-                logger.info("Saved merged base to %s", merged_dir)
+                logger.info("Merged previous VLM LoRA weights into base model")
             else:
                 logger.info("Reusing existing model for iteration %d", iteration)
+
+            # Merge expert LoRA if present (prevents double-wrapping when
+            # _setup_expert applies fresh LoRA in the next training phase)
+            if hasattr(full_model.expert, "merge_and_unload"):
+                full_model.expert = full_model.expert.merge_and_unload()
+                logger.info("Merged previous expert LoRA weights into base model")
 
         # Register advantage tokens and resize embeddings
         register_advantage_tokens(self.processor.tokenizer)
