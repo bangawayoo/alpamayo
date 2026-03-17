@@ -152,9 +152,16 @@ class RolloutEngine:
         if use_expert:
             self._move_expert_to_device(device)
 
+        # Pre-fetch first scene so it's ready when the loop starts
+        if local_clip_ids:
+            self.data_cache.prefetch(local_clip_ids[0], t0_us)
+
         rollout_start = time.time()
         with torch.no_grad():
             for scene_idx, clip_id in enumerate(local_clip_ids):
+                # Kick off prefetch for the next scene while this one generates
+                if scene_idx + 1 < n_local:
+                    self.data_cache.prefetch(local_clip_ids[scene_idx + 1], t0_us)
                 if scene_idx % max(1, n_local // 10) == 0 or scene_idx == n_local - 1:
                     elapsed = time.time() - rollout_start
                     mem_alloc = torch.cuda.memory_allocated(device) / 1e9 if device.type == "cuda" else 0
@@ -221,10 +228,15 @@ class RolloutEngine:
         traj_future_start_id: int,
     ) -> list[dict]:
         """Generate G completions for a single scene using VLM-only rollout."""
+        timings: dict[str, float] = {}
+
         # 1. Load driving data
+        t_ = time.time()
         model_inputs, ego_future_xyz = self.data_cache.get(clip_id, t0_us, device)
+        timings["data_load"] = time.time() - t_
 
         # 2. Fuse history trajectory tokens
+        t_ = time.time()
         tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
         input_ids = tokenized.pop("input_ids")
         traj_data = {
@@ -234,8 +246,10 @@ class RolloutEngine:
         input_ids = self.full_model.fuse_traj_tokens(input_ids, traj_data)
         prompt_len = input_ids.shape[1]
         prompt_input_ids = input_ids.clone()
+        timings["fuse_tokens"] = time.time() - t_
 
         # 3. VLM generation
+        t_ = time.time()
         gen_config = GenerationConfig(
             do_sample=True,
             temperature=self.temperature,
@@ -257,10 +271,14 @@ class RolloutEngine:
                 stopping_criteria=stopping,
                 **tokenized,
             )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        timings["vlm_generate"] = time.time() - t_
 
         generated_seqs = vlm_output[:, prompt_len:]
 
         # 4. Extract trajectory tokens and decode to continuous xyz
+        t_ = time.time()
         traj_tokens = extract_traj_tokens(
             vlm_output,
             self.special_token_ids,
@@ -279,8 +297,10 @@ class RolloutEngine:
                 hist_rot_rep,
                 traj_tokens,
             )
+        timings["traj_decode"] = time.time() - t_
 
         # 5. Build per-sample outputs
+        t_ = time.time()
         prompt_ids_list = prompt_input_ids[0].cpu().tolist()
         results = []
 
@@ -332,7 +352,15 @@ class RolloutEngine:
                     "hist_rot": hist_rot[0].cpu(),  # (T, 3, 3)
                 }
             )
+        timings["postprocess"] = time.time() - t_
 
+        logger.info(
+            "[vlm_only] Scene %s (G=%d) timings: %s | total=%.2fs",
+            clip_id,
+            G,
+            ", ".join(f"{k}={v:.3f}s" for k, v in timings.items()),
+            sum(timings.values()),
+        )
         return results
 
     def _generate_for_scene_expert(
@@ -357,11 +385,15 @@ class RolloutEngine:
         generation (~15-20s), giving ~3x overall speedup per scene.
         """
         t_scene = time.time()
+        timings: dict[str, float] = {}
 
         # 1. Load driving data
+        t_ = time.time()
         model_inputs, ego_future_xyz = self.data_cache.get(clip_id, t0_us, device)
+        timings["data_load"] = time.time() - t_
 
         # 2. Fuse history trajectory tokens
+        t_ = time.time()
         tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
         input_ids = tokenized.pop("input_ids")
         traj_data = {
@@ -384,6 +416,7 @@ class RolloutEngine:
         hist_xyz = model_inputs["ego_history_xyz"][:, -1]  # (1, T, 3)
         hist_rot = model_inputs["ego_history_rot"][:, -1]  # (1, T, 3, 3)
         gt_traj = ego_future_xyz[0, 0].numpy().flatten().tolist()
+        timings["fuse_tokens"] = time.time() - t_
 
         # ---- 4. Batch VLM CoC generation for all G samples at once ----
         t_gen = time.time()
@@ -413,15 +446,18 @@ class RolloutEngine:
                 logits_processor=logits_processor,
                 **tokenized,
             )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         # vlm_output: (G, seq_len) — padded to longest sequence
         generated_seqs = vlm_output[:, prompt_len:]
-        logger.debug(
-            "Batch VLM CoC gen for %s: G=%d in %.2fs", clip_id, G, time.time() - t_gen
-        )
+        timings["vlm_coc_generate"] = time.time() - t_gen
 
         # ---- 5. Per-sample: teacher-forced KV cache + expert diffusion ----
         n_diffusion_tokens = self.action_space.get_action_space_dims()[0]  # 64
         results = []
+        per_sample_tf_times: list[float] = []
+        per_sample_diffusion_times: list[float] = []
+        per_sample_encode_times: list[float] = []
 
         # Disable gradient checkpointing for all teacher-forced forwards + adv injection
         vlm = self.full_model.vlm
@@ -457,6 +493,7 @@ class RolloutEngine:
                 completion_prefix_ids = coc_tokens + [traj_future_start_id]
 
                 # ---- Teacher-forced VLM forward to reconstruct KV cache ----
+                t_tf = time.time()
                 prefix_tensor = torch.tensor(
                     [completion_prefix_ids], device=device, dtype=torch.long
                 )
@@ -502,7 +539,12 @@ class RolloutEngine:
                     prefill_seq_len = prompt_cache.get_seq_length()
                     offset = offset + 1
 
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                per_sample_tf_times.append(time.time() - t_tf)
+
                 # ---- Build expert position_ids and attention_mask ----
+                t_diff = time.time()
                 position_ids = torch.arange(n_diffusion_tokens, device=device)
                 position_ids = einops.repeat(
                     position_ids, "l -> 3 b l", b=b_star
@@ -558,8 +600,12 @@ class RolloutEngine:
                         return_all_steps=False,
                         **diffusion_kwargs,
                     )
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                per_sample_diffusion_times.append(time.time() - t_diff)
 
                 # ---- Convert action → trajectory → discrete tokens ----
+                t_enc = time.time()
                 pred_xyz, pred_rot = self.action_space.action_to_traj(
                     sampled_action, hist_xyz, hist_rot
                 )
@@ -580,6 +626,8 @@ class RolloutEngine:
                 )
 
                 pred_traj = pred_xyz[0].cpu().numpy().flatten().tolist()
+
+                per_sample_encode_times.append(time.time() - t_enc)
 
                 results.append(
                     {
@@ -602,13 +650,21 @@ class RolloutEngine:
             for m in gc_modules:
                 m.gradient_checkpointing = True
 
-        logger.debug(
-            "Scene %s: %d/%d completions in %.2fs (gen=%.2fs)",
+        timings["teacher_forced_total"] = sum(per_sample_tf_times)
+        timings["diffusion_total"] = sum(per_sample_diffusion_times)
+        timings["traj_encode_total"] = sum(per_sample_encode_times)
+        n_ok = len(per_sample_tf_times)
+        logger.info(
+            "[expert] Scene %s (G=%d, %d ok) timings: %s | total=%.2fs | "
+            "per-sample avg: tf=%.3fs, diffusion=%.3fs, encode=%.3fs",
             clip_id,
-            len(results),
             G,
+            n_ok,
+            ", ".join(f"{k}={v:.3f}s" for k, v in timings.items()),
             time.time() - t_scene,
-            time.time() - t_gen,
+            sum(per_sample_tf_times) / max(n_ok, 1),
+            sum(per_sample_diffusion_times) / max(n_ok, 1),
+            sum(per_sample_encode_times) / max(n_ok, 1),
         )
         return results
 

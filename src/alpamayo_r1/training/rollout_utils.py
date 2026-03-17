@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -64,6 +66,9 @@ class ClipDataCache:
         self._hits = 0
         self._misses = 0
         self._evictions = 0
+        self._prefetch_executor = ThreadPoolExecutor(max_workers=1)
+        self._prefetch_future: Future | None = None
+        self._prefetch_lock = threading.Lock()
 
     def _load_and_cache(self, clip_id: str, t0_us: int) -> None:
         """Load raw data and populate the cache entry, evicting LRU if full."""
@@ -99,13 +104,39 @@ class ClipDataCache:
             self._evictions,
         )
 
+    def prefetch(self, clip_id: str, t0_us: int) -> None:
+        """Submit a background load for (clip_id, t0_us) if not already cached.
+
+        The load runs in a single-thread executor so it overlaps with GPU work.
+        Call this for the *next* scene before starting generation on the current one.
+        """
+        key = (clip_id, t0_us)
+        with self._prefetch_lock:
+            if key in self._cache:
+                return
+            # Wait for any in-flight prefetch before starting a new one
+            if self._prefetch_future is not None and not self._prefetch_future.done():
+                self._prefetch_future.result()
+            self._prefetch_future = self._prefetch_executor.submit(
+                self._load_and_cache, clip_id, t0_us
+            )
+
+    def _wait_for_prefetch(self) -> None:
+        """Block until any in-flight prefetch completes."""
+        with self._prefetch_lock:
+            if self._prefetch_future is not None and not self._prefetch_future.done():
+                self._prefetch_future.result()
+
     def get(self, clip_id: str, t0_us: int, device: torch.device) -> tuple[dict, torch.Tensor]:
         """Return (model_inputs_on_device, ego_future_xyz_cpu).
 
         model_inputs are freshly moved to device each call (safe to modify).
         ego_future_xyz stays on CPU for numpy compatibility.
+        If a prefetch is in-flight for this key, waits for it to finish.
         """
         key = (clip_id, t0_us)
+        if key not in self._cache:
+            self._wait_for_prefetch()
         if key not in self._cache:
             self._load_and_cache(clip_id, t0_us)
         else:
