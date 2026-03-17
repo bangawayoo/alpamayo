@@ -177,10 +177,8 @@ class RolloutReplayBuffer:
 
         # Update labels in buffer
         for entry, adv in zip(self._entries, new_advantages):
-            i_obs, i_coc, i_traj = advantage_buffer.binarize(
-                adv["a_obs"], adv["a_coc"], adv["a_traj"]
-            )
-            entry["adv_label"] = {"i_obs": i_obs, "i_coc": i_coc, "i_traj": i_traj}
+            i_obs, i_traj = advantage_buffer.binarize(adv["a_obs"], adv["a_traj"])
+            entry["adv_label"] = {"i_obs": i_obs, "i_traj": i_traj}
 
         logger.info("Recomputed advantage labels for %d buffer entries", len(self._entries))
 
@@ -232,7 +230,6 @@ class SelfPlayLoop:
         )
         self.advantage_buffer = AdvantageBuffer(
             k_obs=float(adv_cfg.get("k_obs", 30)),
-            k_coc=float(adv_cfg.get("k_coc", 30)),
             k_traj=float(adv_cfg.get("k_traj", 30)),
             ema_alpha=float(adv_cfg.get("ema_alpha", 0.99)),
         )
@@ -439,7 +436,7 @@ class SelfPlayLoop:
         5. Binarize advantages into conditioning labels
 
         Returns:
-            List of dicts per completion: {i_obs, i_coc, i_traj}
+            List of dicts per completion: {i_obs, i_traj}
         """
         from alpamayo_r1.training.sft_rollout import RolloutEngine
 
@@ -502,23 +499,20 @@ class SelfPlayLoop:
                     + w_reason * rew["r_reason"]
                     + w_consist * rew["r_consist"]
                 )
-                advantages.append({"a_obs": composite, "a_coc": composite, "a_traj": composite})
+                advantages.append({"a_obs": composite, "a_traj": composite})
 
         # 5. Update advantage buffer
         a_obs_list = [a["a_obs"] for a in advantages]
-        a_coc_list = [a["a_coc"] for a in advantages]
         a_traj_list = [a["a_traj"] for a in advantages]
-        self.advantage_buffer.update(a_obs_list, a_coc_list, a_traj_list)
+        self.advantage_buffer.update(a_obs_list, a_traj_list)
 
         # 6. Binarize
         adv_labels = []
         for adv in advantages:
-            i_obs, i_coc, i_traj = self.advantage_buffer.binarize(
-                adv["a_obs"], adv["a_coc"], adv["a_traj"]
-            )
-            adv_labels.append({"i_obs": i_obs, "i_coc": i_coc, "i_traj": i_traj})
+            i_obs, i_traj = self.advantage_buffer.binarize(adv["a_obs"], adv["a_traj"])
+            adv_labels.append({"i_obs": i_obs, "i_traj": i_traj})
 
-        n_pos = sum(1 for lab in adv_labels if lab["i_obs"] and lab["i_coc"] and lab["i_traj"])
+        n_pos = sum(1 for lab in adv_labels if lab["i_obs"] and lab["i_traj"])
         logger.info(
             "Evaluate phase: %d/%d all-positive, thresholds=%s",
             n_pos,

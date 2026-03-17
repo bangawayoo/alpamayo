@@ -81,8 +81,6 @@ SPECIAL_TOKENS = {k: "<|" + k + "|>" for k in SPECIAL_TOKENS_KEYS}
 ADV_CONDITIONING_TOKEN_KEYS = [
     "adv_obs_pos",
     "adv_obs_neg",
-    "adv_coc_pos",
-    "adv_coc_neg",
     "adv_traj_pos",
     "adv_traj_neg",
 ]

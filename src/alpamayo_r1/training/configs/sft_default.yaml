@@ -52,7 +52,6 @@ advantage_conditioning:
   p_drop: 0.3                   # conditioning dropout probability for CFG
   alpha: 1.0                    # conditional loss weight (unconditional = 1.0)
   k_obs: 30                     # percentile threshold for obs-level binarization
-  k_coc: 30                     # percentile threshold for coc-level binarization
   k_traj: 30                    # percentile threshold for traj-level binarization
   ema_alpha: 0.99               # EMA decay for obs-level baseline
   replay_ratio: 0.3             # fraction of training data from historical replay buffer

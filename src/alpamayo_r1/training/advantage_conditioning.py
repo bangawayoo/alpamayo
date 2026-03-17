@@ -1,9 +1,10 @@
 """Advantage conditioning for iterative SFT training.
 
-This module implements the three-level advantage conditioning pipeline:
-1. Token registration (6 advantage tokens: obs/coc/traj x pos/neg)
+This module implements the two-level advantage conditioning pipeline:
+1. Token registration (4 advantage tokens: obs/traj x pos/neg)
 2. Advantage binarization via percentile thresholds
-3. Conditioned sequence construction (with dropout for CFG)
+3. Conditioned sequence construction with causal placement (adv_obs before
+   CoC, adv_traj between CoC and trajectory) and dropout for CFG
 4. Dataset wrapper for the SFT trainer
 
 See docs/advantage-conditioning.md for the design specification.
@@ -25,9 +26,9 @@ from alpamayo_r1.models.base_model import ADV_CONDITIONING_TOKENS, IGNORE_INDEX
 
 logger = logging.getLogger(__name__)
 
-# The 6 advantage token string representations, from ADV_CONDITIONING_TOKENS
-# in base_model.py. These are separate from SPECIAL_TOKENS to avoid changing
-# vocab_size during model loading (which would break checkpoint compatibility).
+# The 4 advantage token string representations, from ADV_CONDITIONING_TOKENS
+# in base_model.py. Two levels (obs + traj), two polarities each.
+# Separate from SPECIAL_TOKENS to avoid changing vocab_size during model loading.
 ADV_TOKEN_NAMES = list(ADV_CONDITIONING_TOKENS.keys())
 ADV_TOKEN_STRINGS = dict(ADV_CONDITIONING_TOKENS)
 
@@ -38,7 +39,7 @@ ADV_TOKEN_STRINGS = dict(ADV_CONDITIONING_TOKENS)
 
 
 def register_advantage_tokens(tokenizer) -> dict[str, int]:
-    """Add 6 advantage conditioning tokens to the tokenizer.
+    """Add 4 advantage conditioning tokens to the tokenizer.
 
     Should be called once during SFT model setup. After calling this, the
     caller must resize model embeddings:
@@ -80,7 +81,7 @@ def register_advantage_tokens(tokenizer) -> dict[str, int]:
 class AdvantageBuffer:
     """Rolling buffer for percentile-based advantage binarization.
 
-    Maintains separate deques for each advantage level (obs, coc, traj).
+    Maintains separate deques for each advantage level (obs, traj).
     Uses percentile thresholds to binarize continuous advantages into
     positive/negative labels for conditioning.
 
@@ -90,7 +91,6 @@ class AdvantageBuffer:
     Args:
         k_obs: Percentile threshold for obs-level (0-100). Values above
             the k-th percentile are labeled positive.
-        k_coc: Percentile threshold for coc-level.
         k_traj: Percentile threshold for traj-level.
         ema_alpha: EMA decay for observation-level baseline.
         max_size: Maximum number of entries per buffer.
@@ -99,38 +99,32 @@ class AdvantageBuffer:
     def __init__(
         self,
         k_obs: float = 30.0,
-        k_coc: float = 30.0,
         k_traj: float = 30.0,
         ema_alpha: float = 0.99,
         max_size: int = 10000,
     ) -> None:
         self.k_obs = k_obs
-        self.k_coc = k_coc
         self.k_traj = k_traj
         self.ema_alpha = ema_alpha
         self.max_size = max_size
 
         self._buf_obs: deque[float] = deque(maxlen=max_size)
-        self._buf_coc: deque[float] = deque(maxlen=max_size)
         self._buf_traj: deque[float] = deque(maxlen=max_size)
         self._ema_obs: float | None = None
 
     def update(
         self,
         a_obs_list: list[float],
-        a_coc_list: list[float],
         a_traj_list: list[float],
     ) -> None:
         """Append new advantages to the rolling buffers.
 
         Args:
             a_obs_list: Per-completion observation-level advantages.
-            a_coc_list: Per-completion CoC-level advantages.
             a_traj_list: Per-completion trajectory-level advantages
                 (mean across timesteps for each completion).
         """
         self._buf_obs.extend(a_obs_list)
-        self._buf_coc.extend(a_coc_list)
         self._buf_traj.extend(a_traj_list)
 
         # Update EMA for observation level
@@ -140,37 +134,34 @@ class AdvantageBuffer:
             else:
                 self._ema_obs = self.ema_alpha * self._ema_obs + (1 - self.ema_alpha) * a
 
-    def compute_thresholds(self) -> tuple[float, float, float]:
+    def compute_thresholds(self) -> tuple[float, float]:
         """Compute current percentile thresholds for binarization.
 
         Returns:
-            (eps_obs, eps_coc, eps_traj) threshold values. Advantages above
+            (eps_obs, eps_traj) threshold values. Advantages above
             the threshold are labeled positive.
         """
         eps_obs = float(np.percentile(self._buf_obs, self.k_obs)) if self._buf_obs else 0.0
-        eps_coc = float(np.percentile(self._buf_coc, self.k_coc)) if self._buf_coc else 0.0
         eps_traj = float(np.percentile(self._buf_traj, self.k_traj)) if self._buf_traj else 0.0
-        return eps_obs, eps_coc, eps_traj
+        return eps_obs, eps_traj
 
-    def binarize(self, a_obs: float, a_coc: float, a_traj: float) -> tuple[bool, bool, bool]:
+    def binarize(self, a_obs: float, a_traj: float) -> tuple[bool, bool]:
         """Binarize per-level advantages using current thresholds.
 
         Args:
             a_obs: Observation-level advantage.
-            a_coc: CoC-level advantage.
             a_traj: Trajectory-level advantage (mean over timesteps).
 
         Returns:
-            (i_obs, i_coc, i_traj): True = positive, False = negative.
+            (i_obs, i_traj): True = positive, False = negative.
         """
-        eps_obs, eps_coc, eps_traj = self.compute_thresholds()
-        return a_obs >= eps_obs, a_coc >= eps_coc, a_traj >= eps_traj
+        eps_obs, eps_traj = self.compute_thresholds()
+        return a_obs > eps_obs, a_traj > eps_traj
 
     def state_dict(self) -> dict:
         """Serialize buffer state for checkpointing."""
         return {
             "buf_obs": list(self._buf_obs),
-            "buf_coc": list(self._buf_coc),
             "buf_traj": list(self._buf_traj),
             "ema_obs": self._ema_obs,
         }
@@ -178,7 +169,6 @@ class AdvantageBuffer:
     def load_state_dict(self, state: dict) -> None:
         """Restore buffer state from checkpoint."""
         self._buf_obs = deque(state["buf_obs"], maxlen=self.max_size)
-        self._buf_coc = deque(state["buf_coc"], maxlen=self.max_size)
         self._buf_traj = deque(state["buf_traj"], maxlen=self.max_size)
         self._ema_obs = state.get("ema_obs")
 
@@ -230,13 +220,11 @@ def compute_segment_advantages_from_rollouts(
         seg_rew = segment_reward_stash[i]
 
         h_obs = seg["h_obs"].to(vh_device)
-        h_coc = seg["h_coc"].to(vh_device)
         h_traj = seg["h_traj"].to(vh_device)
 
-        # Value predictions
+        # Value predictions (obs and traj levels only — no CoC level for conditioning)
         with torch.no_grad():
             v_obs = value_head(h_obs, level=SegmentValueHead.LEVEL_OBS).item()
-            v_coc = value_head(h_coc, level=SegmentValueHead.LEVEL_COC).item()
             if h_traj.shape[0] > 0:
                 v_traj = value_head(h_traj.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ).squeeze(
                     0
@@ -267,14 +255,10 @@ def compute_segment_advantages_from_rollouts(
         # Returns-to-go at each state
         traj_total = r_traj_weighted.sum().item() if T_traj > 0 else 0.0
         g_obs = w_reason * r_reason + traj_total  # total return from s_obs
-        g_coc = traj_total  # remaining return from s_coc (R_reasoning already collected)
 
         # Advantages: actual return minus value baseline at each information level
         # A_obs: completion quality relative to scene baseline
         a_obs = g_obs - v_obs
-
-        # A_coc: trajectory quality relative to CoC-conditioned baseline
-        a_coc = g_coc - v_coc
 
         # A_traj_j: remaining trajectory quality at each step
         if T_traj > 0:
@@ -290,7 +274,6 @@ def compute_segment_advantages_from_rollouts(
         results.append(
             {
                 "a_obs": a_obs,
-                "a_coc": a_coc,
                 "a_traj": a_traj_mean,
                 "a_traj_per_step": a_traj_list,
             }
@@ -495,15 +478,18 @@ def build_conditioned_sequence(
     prompt_ids: list[int],
     completion_ids: list[int],
     i_obs: bool,
-    i_coc: bool,
     i_traj: bool,
     adv_token_ids: dict[str, int],
+    traj_future_start_id: int | None = None,
     p_drop: float = 0.3,
 ) -> dict[str, Any]:
-    """Construct a training sequence with advantage conditioning tokens.
+    """Construct a training sequence with causally-placed advantage tokens.
 
-    Inserts 3 conditioning tokens (one per level) between the prompt and
-    completion. Implements conditioning dropout for classifier-free guidance:
+    Each conditioning token is placed immediately before the segment it
+    conditions: adv_obs before CoC (conditions entire completion), adv_traj
+    between CoC and trajectory (conditions only trajectory generation).
+
+    Implements conditioning dropout for classifier-free guidance:
     all-positive completions have a p_drop probability of being treated as
     unconditional (no conditioning tokens).
 
@@ -511,9 +497,11 @@ def build_conditioned_sequence(
         prompt_ids: Tokenized prompt (with fused history trajectory).
         completion_ids: Tokenized completion (CoC + trajectory tokens).
         i_obs: Binarized observation advantage (True=positive).
-        i_coc: Binarized CoC advantage (True=positive).
         i_traj: Binarized trajectory advantage (True=positive).
         adv_token_ids: Dict mapping token name -> ID.
+        traj_future_start_id: Token ID of <|traj_future_start|> used to find
+            the CoC/trajectory boundary. If None, adv_traj is placed at the
+            end of the completion (fallback).
         p_drop: Conditioning dropout probability for all-positive completions.
 
     Returns:
@@ -523,7 +511,7 @@ def build_conditioned_sequence(
         - attention_mask: list[int] — all 1s
         - is_unconditional: bool — True if this is an unconditional example
     """
-    is_all_positive = i_obs and i_coc and i_traj
+    is_all_positive = i_obs and i_traj
     is_unconditional = is_all_positive and random.random() < p_drop
 
     if is_unconditional:
@@ -531,14 +519,30 @@ def build_conditioned_sequence(
         input_ids = prompt_ids + completion_ids
         labels = [IGNORE_INDEX] * len(prompt_ids) + completion_ids
     else:
-        # Conditional path: insert 3 advantage tokens after prompt
-        cond_tokens = [
-            adv_token_ids["adv_obs_pos" if i_obs else "adv_obs_neg"],
-            adv_token_ids["adv_coc_pos" if i_coc else "adv_coc_neg"],
-            adv_token_ids["adv_traj_pos" if i_traj else "adv_traj_neg"],
-        ]
-        input_ids = prompt_ids + cond_tokens + completion_ids
-        labels = [IGNORE_INDEX] * (len(prompt_ids) + len(cond_tokens)) + completion_ids
+        # Conditional path: split placement
+        # adv_obs goes after prompt (before CoC)
+        obs_token = adv_token_ids["adv_obs_pos" if i_obs else "adv_obs_neg"]
+        traj_token = adv_token_ids["adv_traj_pos" if i_traj else "adv_traj_neg"]
+
+        # Find CoC/trajectory boundary in completion_ids
+        traj_boundary = len(completion_ids)  # fallback: end of completion
+        if traj_future_start_id is not None:
+            for idx, tid in enumerate(completion_ids):
+                if tid == traj_future_start_id:
+                    traj_boundary = idx
+                    break
+
+        coc_part = completion_ids[:traj_boundary]
+        traj_part = completion_ids[traj_boundary:]
+
+        # [prompt] [adv_obs] [CoC tokens...] [adv_traj] [trajectory tokens...]
+        input_ids = prompt_ids + [obs_token] + coc_part + [traj_token] + traj_part
+        labels = (
+            [IGNORE_INDEX] * (len(prompt_ids) + 1)  # prompt + adv_obs
+            + coc_part  # CoC tokens (supervised)
+            + [IGNORE_INDEX]  # adv_traj
+            + traj_part  # trajectory tokens (supervised)
+        )
 
     attention_mask = [1] * len(input_ids)
 
@@ -565,9 +569,11 @@ class AdvCondDataset(Dataset):
         rollout_results: List of dicts per completion with at least:
             {prompt_ids: list[int], completion_ids: list[int]}.
         adv_labels: List of dicts per completion with:
-            {i_obs: bool, i_coc: bool, i_traj: bool}.
+            {i_obs: bool, i_traj: bool}.
         adv_token_ids: Dict mapping token name -> ID.
         p_drop: Conditioning dropout probability.
+        traj_future_start_id: Token ID of <|traj_future_start|> for finding
+            CoC/trajectory boundary. If None, adv_traj is placed at end.
     """
 
     def __init__(
@@ -576,6 +582,7 @@ class AdvCondDataset(Dataset):
         adv_labels: list[dict],
         adv_token_ids: dict[str, int],
         p_drop: float = 0.3,
+        traj_future_start_id: int | None = None,
     ) -> None:
         if len(rollout_results) != len(adv_labels):
             raise ValueError(
@@ -585,6 +592,7 @@ class AdvCondDataset(Dataset):
         self._labels = adv_labels
         self._adv_token_ids = adv_token_ids
         self._p_drop = p_drop
+        self._traj_future_start_id = traj_future_start_id
 
     def __len__(self) -> int:
         return len(self._rollouts)
@@ -597,9 +605,9 @@ class AdvCondDataset(Dataset):
             prompt_ids=rollout["prompt_ids"],
             completion_ids=rollout["completion_ids"],
             i_obs=label["i_obs"],
-            i_coc=label["i_coc"],
             i_traj=label["i_traj"],
             adv_token_ids=self._adv_token_ids,
+            traj_future_start_id=self._traj_future_start_id,
             p_drop=self._p_drop,
         )
 

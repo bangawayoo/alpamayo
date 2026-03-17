@@ -390,8 +390,8 @@ Separate loop:
 Same as the existing value head design:
 
 ```
-G(s_obs)    = w_reason · R_reasoning + Σ_t r_t        # total return
-G(s_traj_t) = Σ_{k=t}^{T} r_k                         # return-to-go per trajectory token
+G(s_obs)    = w_reason · R_reasoning + w_traj · Σ_t r_t + w_consist · R_consistency   # total return
+G(s_traj_t) = w_traj · Σ_{k=t}^{T} r_k + w_consist · R_consistency                   # return-to-go per trajectory token
 ```
 
 ---

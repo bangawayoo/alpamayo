@@ -21,121 +21,148 @@ from alpamayo_r1.training.selfplay_loop import RolloutReplayBuffer, ScenePartiti
 # ---------------------------------------------------------------------------
 
 FAKE_ADV_TOKEN_IDS = {name: 200000 + i for i, name in enumerate(ADV_TOKEN_NAMES)}
+# Fake traj_future_start token ID for testing split placement
+FAKE_TRAJ_START_ID = 999999
 
 
 class TestAdvantageBuffer:
     def test_initial_empty(self):
-        buf = AdvantageBuffer(k_obs=50, k_coc=50, k_traj=50)
-        # Empty buffer returns 0 thresholds
+        buf = AdvantageBuffer(k_obs=50, k_traj=50)
         eps = buf.compute_thresholds()
-        assert eps == (0.0, 0.0, 0.0)
+        assert eps == (0.0, 0.0)
 
     def test_update_and_binarize(self):
-        buf = AdvantageBuffer(k_obs=50, k_coc=50, k_traj=50)
-        # Add advantages: half positive, half negative
+        buf = AdvantageBuffer(k_obs=50, k_traj=50)
         obs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
-        coc = [-5.0, -4.0, -3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0, 5.0]
         traj = [0.0] * 10
-        buf.update(obs, coc, traj)
+        buf.update(obs, traj)
 
-        # Median of obs = 5.5, so 6+ should be positive
-        i_obs, i_coc, i_traj = buf.binarize(6.0, 1.0, 0.0)
+        # Median of obs = 5.5, so 6+ should be positive (strict >)
+        i_obs, i_traj = buf.binarize(6.0, 0.1)
         assert i_obs is True
-        assert i_coc is True
-        assert i_traj is True  # 0.0 >= 0.0
+        assert i_traj is True
 
-        i_obs, i_coc, i_traj = buf.binarize(1.0, -5.0, -1.0)
+        i_obs, i_traj = buf.binarize(1.0, -1.0)
         assert i_obs is False
-        assert i_coc is False
+        assert i_traj is False
+
+    def test_binarize_uses_strict_greater_than(self):
+        """Binarization uses > (strict), not >= (inclusive)."""
+        buf = AdvantageBuffer(k_obs=50, k_traj=50)
+        buf.update([1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0])
+        eps_obs, eps_traj = buf.compute_thresholds()
+        # At the exact threshold, should be False (strict >)
+        i_obs, i_traj = buf.binarize(eps_obs, eps_traj)
+        assert i_obs is False
         assert i_traj is False
 
     def test_ema_updates(self):
         buf = AdvantageBuffer(ema_alpha=0.5)
-        buf.update([10.0], [0.0], [0.0])
-        assert buf._ema_obs == 10.0  # First value initializes EMA
+        buf.update([10.0], [0.0])
+        assert buf._ema_obs == 10.0
 
-        buf.update([0.0], [0.0], [0.0])
-        # EMA = 0.5 * 10.0 + 0.5 * 0.0 = 5.0
+        buf.update([0.0], [0.0])
         assert buf._ema_obs == pytest.approx(5.0)
 
     def test_state_dict_roundtrip(self):
-        buf = AdvantageBuffer(k_obs=30, k_coc=40, k_traj=50)
-        buf.update([1.0, 2.0], [3.0, 4.0], [5.0, 6.0])
+        buf = AdvantageBuffer(k_obs=30, k_traj=50)
+        buf.update([1.0, 2.0], [5.0, 6.0])
 
         state = buf.state_dict()
-        buf2 = AdvantageBuffer(k_obs=30, k_coc=40, k_traj=50)
+        buf2 = AdvantageBuffer(k_obs=30, k_traj=50)
         buf2.load_state_dict(state)
 
         assert list(buf2._buf_obs) == [1.0, 2.0]
-        assert list(buf2._buf_coc) == [3.0, 4.0]
         assert list(buf2._buf_traj) == [5.0, 6.0]
         assert buf2._ema_obs == buf._ema_obs
 
 
 class TestBuildConditionedSequence:
-    def test_conditional_positive(self):
-        """All-positive but no dropout (p_drop=0) -> conditional with positive tokens."""
+    def test_split_placement(self):
+        """Tokens are placed at causal positions: adv_obs before CoC, adv_traj between CoC and traj."""
+        # completion_ids: [CoC tokens..., traj_future_start, traj tokens...]
+        completion = [10, 11, FAKE_TRAJ_START_ID, 20, 21]
         result = build_conditioned_sequence(
             prompt_ids=[1, 2, 3],
-            completion_ids=[10, 11, 12],
+            completion_ids=completion,
             i_obs=True,
-            i_coc=True,
             i_traj=True,
             adv_token_ids=FAKE_ADV_TOKEN_IDS,
-            p_drop=0.0,  # Never drop
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+            p_drop=0.0,
         )
         assert not result["is_unconditional"]
-        # Should have prompt(3) + cond(3) + completion(3) = 9 tokens
-        assert len(result["input_ids"]) == 9
-        # First 6 labels should be IGNORE_INDEX, last 3 should be completion
-        assert result["labels"][:6] == [IGNORE_INDEX] * 6
-        assert result["labels"][6:] == [10, 11, 12]
-        # Check conditioning tokens are positive variants
-        assert result["input_ids"][3] == FAKE_ADV_TOKEN_IDS["adv_obs_pos"]
-        assert result["input_ids"][4] == FAKE_ADV_TOKEN_IDS["adv_coc_pos"]
-        assert result["input_ids"][5] == FAKE_ADV_TOKEN_IDS["adv_traj_pos"]
+        # Expected: [1,2,3] [obs_pos] [10,11] [traj_pos] [TRAJ_START,20,21]
+        ids = result["input_ids"]
+        assert ids[3] == FAKE_ADV_TOKEN_IDS["adv_obs_pos"]
+        assert ids[4:6] == [10, 11]  # CoC part
+        assert ids[6] == FAKE_ADV_TOKEN_IDS["adv_traj_pos"]
+        assert ids[7] == FAKE_TRAJ_START_ID  # traj part starts
 
-    def test_conditional_negative(self):
-        """Mixed labels -> always conditional."""
+    def test_negative_labels(self):
+        """Mixed labels produce neg tokens at correct positions."""
+        completion = [10, FAKE_TRAJ_START_ID, 20]
         result = build_conditioned_sequence(
             prompt_ids=[1, 2],
-            completion_ids=[10, 11],
+            completion_ids=completion,
             i_obs=False,
-            i_coc=True,
             i_traj=False,
             adv_token_ids=FAKE_ADV_TOKEN_IDS,
-            p_drop=1.0,  # Even with 100% drop, non-all-positive is always conditional
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+            p_drop=1.0,  # Even 100% drop: non-all-positive → conditional
         )
         assert not result["is_unconditional"]
         assert result["input_ids"][2] == FAKE_ADV_TOKEN_IDS["adv_obs_neg"]
-        assert result["input_ids"][3] == FAKE_ADV_TOKEN_IDS["adv_coc_pos"]
         assert result["input_ids"][4] == FAKE_ADV_TOKEN_IDS["adv_traj_neg"]
 
     def test_unconditional_dropout(self):
-        """All-positive with p_drop=1.0 -> always unconditional."""
+        """All-positive with p_drop=1.0 -> always unconditional (no tokens inserted)."""
+        completion = [10, 11, FAKE_TRAJ_START_ID, 20]
         result = build_conditioned_sequence(
             prompt_ids=[1, 2, 3],
-            completion_ids=[10, 11],
+            completion_ids=completion,
             i_obs=True,
-            i_coc=True,
             i_traj=True,
             adv_token_ids=FAKE_ADV_TOKEN_IDS,
-            p_drop=1.0,  # Always drop
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+            p_drop=1.0,
         )
         assert result["is_unconditional"]
-        # No conditioning tokens: prompt(3) + completion(2) = 5
-        assert len(result["input_ids"]) == 5
+        # No conditioning tokens: prompt(3) + completion(4) = 7
+        assert len(result["input_ids"]) == 7
         assert result["labels"][:3] == [IGNORE_INDEX] * 3
-        assert result["labels"][3:] == [10, 11]
+        assert result["labels"][3:] == completion
+
+    def test_labels_mask_conditioning_tokens(self):
+        """Conditioning tokens get IGNORE_INDEX in labels, completion tokens get real IDs."""
+        completion = [10, FAKE_TRAJ_START_ID, 20, 21]
+        result = build_conditioned_sequence(
+            prompt_ids=[1, 2],
+            completion_ids=completion,
+            i_obs=True,
+            i_traj=True,
+            adv_token_ids=FAKE_ADV_TOKEN_IDS,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+            p_drop=0.0,
+        )
+        labels = result["labels"]
+        # prompt(2) + adv_obs(1) = 3 IGNORE_INDEX
+        assert labels[:3] == [IGNORE_INDEX] * 3
+        # CoC token (supervised)
+        assert labels[3] == 10
+        # adv_traj = IGNORE_INDEX
+        assert labels[4] == IGNORE_INDEX
+        # traj tokens (supervised)
+        assert labels[5:] == [FAKE_TRAJ_START_ID, 20, 21]
 
     def test_attention_mask_all_ones(self):
         result = build_conditioned_sequence(
             prompt_ids=[1, 2],
-            completion_ids=[10],
+            completion_ids=[10, FAKE_TRAJ_START_ID, 20],
             i_obs=True,
-            i_coc=False,
-            i_traj=True,
+            i_traj=False,
             adv_token_ids=FAKE_ADV_TOKEN_IDS,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
             p_drop=0.0,
         )
         assert all(m == 1 for m in result["attention_mask"])
@@ -145,16 +172,21 @@ class TestBuildConditionedSequence:
 class TestAdvCondDataset:
     def test_basic(self):
         rollouts = [
-            {"prompt_ids": [1, 2], "completion_ids": [10, 11]},
-            {"prompt_ids": [3, 4], "completion_ids": [12, 13]},
+            {"prompt_ids": [1, 2], "completion_ids": [10, FAKE_TRAJ_START_ID, 20]},
+            {"prompt_ids": [3, 4], "completion_ids": [12, FAKE_TRAJ_START_ID, 22]},
         ]
         labels = [
-            {"i_obs": True, "i_coc": True, "i_traj": True},
-            {"i_obs": False, "i_coc": False, "i_traj": False},
+            {"i_obs": True, "i_traj": True},
+            {"i_obs": False, "i_traj": False},
         ]
-        ds = AdvCondDataset(rollouts, labels, FAKE_ADV_TOKEN_IDS, p_drop=0.0)
+        ds = AdvCondDataset(
+            rollouts,
+            labels,
+            FAKE_ADV_TOKEN_IDS,
+            p_drop=0.0,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+        )
         assert len(ds) == 2
-
         item0 = ds[0]
         assert "input_ids" in item0
         assert "labels" in item0
@@ -218,7 +250,7 @@ class TestRolloutReplayBuffer:
     def test_add_and_sample(self):
         buf = RolloutReplayBuffer(max_size=100)
         rollouts = [{"prompt_ids": [1], "completion_ids": [2]}]
-        labels = [{"i_obs": True, "i_coc": True, "i_traj": False}]
+        labels = [{"i_obs": True, "i_traj": False}]
 
         buf.add(rollouts, labels, iteration=0)
         assert len(buf) == 1
@@ -233,7 +265,7 @@ class TestRolloutReplayBuffer:
         for i in range(5):
             buf.add(
                 [{"prompt_ids": [i], "completion_ids": [i]}],
-                [{"i_obs": True, "i_coc": True, "i_traj": True}],
+                [{"i_obs": True, "i_traj": True}],
                 iteration=i,
             )
         assert len(buf) == 3
@@ -255,23 +287,29 @@ class TestValueHeadTraining:
         completion_segment_map = []
 
         for i in range(n):
-            segment_hidden_stash.append({
-                "h_obs": torch.randn(1, D),
-                "h_coc": torch.randn(1, D),
-                "h_traj": torch.randn(T_traj, D),
-            })
-            segment_reward_stash.append({
-                "r_traj": 0.5 + 0.3 * i,
-                "r_reason": 0.4 + 0.1 * i,
-                "r_consist": 0.3,
-                "r_traj_per_step": [0.5 / T_traj] * T_traj,
-            })
-            completion_segment_map.append({
-                "coc_len": 20,
-                "traj_len": T_traj,
-                "traj_positions": list(range(T_traj)),
-                "total_len": 20 + T_traj,
-            })
+            segment_hidden_stash.append(
+                {
+                    "h_obs": torch.randn(1, D),
+                    "h_coc": torch.randn(1, D),
+                    "h_traj": torch.randn(T_traj, D),
+                }
+            )
+            segment_reward_stash.append(
+                {
+                    "r_traj": 0.5 + 0.3 * i,
+                    "r_reason": 0.4 + 0.1 * i,
+                    "r_consist": 0.3,
+                    "r_traj_per_step": [0.5 / T_traj] * T_traj,
+                }
+            )
+            completion_segment_map.append(
+                {
+                    "coc_len": 20,
+                    "traj_len": T_traj,
+                    "traj_positions": list(range(T_traj)),
+                    "total_len": 20 + T_traj,
+                }
+            )
 
         return segment_hidden_stash, segment_reward_stash, completion_segment_map
 
