@@ -63,8 +63,12 @@ class ScenePartitioner:
         rng.shuffle(shuffled)
 
         # np.array_split handles uneven division gracefully
-        chunks = np.array_split(shuffled, num_iterations)
-        self.partitions: list[list[str]] = [chunk.tolist() for chunk in chunks]
+        if num_iterations > 0:
+            chunks = np.array_split(shuffled, num_iterations)
+            self.partitions: list[list[str]] = [chunk.tolist() for chunk in chunks]
+        else:
+            # num_iterations=0: pre-training only, no partitioning needed
+            self.partitions = []
 
         logger.info(
             "Partitioned %d scenes across %d iterations: %s",
