@@ -30,9 +30,39 @@ import torch
 from transformers import Trainer
 
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+from alpamayo_r1.models.base_model import IGNORE_INDEX
 from alpamayo_r1.training.rollout_utils import ClipDataCache
 
 logger = logging.getLogger(__name__)
+
+
+def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
+    """Collate variable-length AdvCondDataset samples by padding to max length.
+
+    Pads input_ids with pad_token_id, labels with IGNORE_INDEX, and
+    attention_mask with 0.
+    """
+    max_len = max(len(f["input_ids"]) for f in features)
+
+    batch = {
+        "input_ids": [],
+        "labels": [],
+        "attention_mask": [],
+        "is_unconditional": [],
+    }
+    for f in features:
+        seq_len = len(f["input_ids"])
+        pad_len = max_len - seq_len
+        batch["input_ids"].append(f["input_ids"] + [pad_token_id] * pad_len)
+        batch["labels"].append(f["labels"] + [IGNORE_INDEX] * pad_len)
+        batch["attention_mask"].append(f["attention_mask"] + [0] * pad_len)
+        batch["is_unconditional"].append(f["is_unconditional"])
+
+    batch["input_ids"] = torch.tensor(batch["input_ids"], dtype=torch.long)
+    batch["labels"] = torch.tensor(batch["labels"], dtype=torch.long)
+    batch["attention_mask"] = torch.tensor(batch["attention_mask"], dtype=torch.long)
+    batch["is_unconditional"] = torch.tensor(batch["is_unconditional"], dtype=torch.bool)
+    return batch
 
 
 class AdvCondSFTTrainer(Trainer):
@@ -72,11 +102,20 @@ class AdvCondSFTTrainer(Trainer):
         data_cache: ClipDataCache | None = None,
         **kwargs,
     ):
+        # Determine pad_token_id for the collator
+        pad_id = 0
+        if processing_class is not None:
+            if hasattr(processing_class, "tokenizer"):
+                pad_id = processing_class.tokenizer.pad_token_id or 0
+            elif hasattr(processing_class, "pad_token_id"):
+                pad_id = processing_class.pad_token_id or 0
+
         super().__init__(
             model=model,
             args=args,
             train_dataset=train_dataset,
             processing_class=processing_class,
+            data_collator=lambda features: adv_cond_collator(features, pad_token_id=pad_id),
             **kwargs,
         )
         self.full_model = full_model
@@ -87,6 +126,7 @@ class AdvCondSFTTrainer(Trainer):
             "expert_cfm/loss": [],
             "expert_cfm/valid_samples": [],
         }
+        self._sft_step_count = 0
 
         # Expert finetuning setup
         self._expert_enabled = False
@@ -173,6 +213,16 @@ class AdvCondSFTTrainer(Trainer):
         """Override to add deferred expert CFM step after VLM backward."""
         # 1. Normal SFT forward + backward
         loss = super().training_step(model, inputs, num_items_in_batch)
+
+        # Log SFT loss periodically
+        self._sft_step_count += 1
+        if self._sft_step_count % max(1, self.args.logging_steps) == 0:
+            logger.info(
+                "SFT step %d: loss=%.4f lr=%.2e",
+                self._sft_step_count,
+                loss.item() if hasattr(loss, "item") else loss,
+                self.optimizer.param_groups[0]["lr"] if self.optimizer else 0.0,
+            )
 
         # 2. Deferred expert CFM step
         if self._expert_enabled and self.state.global_step % self._expert_every_n_steps == 0:
