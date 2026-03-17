@@ -41,7 +41,7 @@ The key insight: advantage conditioning converts the RL problem into a **conditi
 │  ─────────────────                                                  │
 │  Score each completion using the segment value head + reward         │
 │  functions. Compute per-segment advantages. Binarize into           │
-│  conditioning labels: {obs, coc, traj} × {positive, negative}.     │
+│  conditioning labels: {obs, traj} × {positive, negative}.          │
 │                                                                     │
 │  Phase 3: TRAIN (SFT with advantage conditioning)                   │
 │  ──────────────────────────────────────────────────                  │

@@ -658,11 +658,16 @@ class SelfPlayLoop:
         )
 
         adv_cfg = self.cfg.get("advantage_conditioning", {})
+        # Get traj_future_start token ID for causal placement of adv_traj
+        traj_future_start_id = None
+        if hasattr(self.full_model, "special_token_ids"):
+            traj_future_start_id = self.full_model.special_token_ids.get("traj_future_start")
         return AdvCondDataset(
             rollout_results=all_rollouts,
             adv_labels=all_labels,
             adv_token_ids=self.adv_token_ids,
             p_drop=float(adv_cfg.get("p_drop", 0.3)),
+            traj_future_start_id=traj_future_start_id,
         )
 
     def _get_data_cache(self):

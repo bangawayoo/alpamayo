@@ -202,9 +202,8 @@ def compute_segment_advantages_from_rollouts(
         reward_weights: (w_traj, w_reason, w_consist).
 
     Returns:
-        List of dicts per completion: {a_obs, a_coc, a_traj, a_traj_per_step}.
+        List of dicts per completion: {a_obs, a_traj, a_traj_per_step}.
         a_obs: observation-level advantage — G(s_obs) - V(s_obs)
-        a_coc: CoC-level advantage — G(s_coc) - V(s_coc)
         a_traj: mean trajectory advantage (over timesteps)
         a_traj_per_step: per-timestep trajectory advantages
     """
