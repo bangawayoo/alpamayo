@@ -40,7 +40,7 @@ def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
     """Collate variable-length AdvCondDataset samples by padding to max length.
 
     Pads input_ids with pad_token_id, labels with IGNORE_INDEX, and
-    attention_mask with 0.
+    attention_mask with 0. Also collates expert CFM metadata if present.
     """
     max_len = max(len(f["input_ids"]) for f in features)
 
@@ -50,6 +50,11 @@ def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
         "attention_mask": [],
         "is_unconditional": [],
     }
+    # Expert CFM metadata (non-tensor, collected as lists)
+    clip_ids = []
+    t0_us_list = []
+    completion_prefixes = []
+
     for f in features:
         seq_len = len(f["input_ids"])
         pad_len = max_len - seq_len
@@ -58,10 +63,23 @@ def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
         batch["attention_mask"].append(f["attention_mask"] + [0] * pad_len)
         batch["is_unconditional"].append(f["is_unconditional"])
 
+        if "clip_id" in f:
+            clip_ids.append(f["clip_id"])
+        if "t0_us" in f:
+            t0_us_list.append(f["t0_us"])
+        if "completion_prefix" in f:
+            completion_prefixes.append(f["completion_prefix"])
+
     batch["input_ids"] = torch.tensor(batch["input_ids"], dtype=torch.long)
     batch["labels"] = torch.tensor(batch["labels"], dtype=torch.long)
     batch["attention_mask"] = torch.tensor(batch["attention_mask"], dtype=torch.long)
     batch["is_unconditional"] = torch.tensor(batch["is_unconditional"], dtype=torch.bool)
+
+    if clip_ids:
+        batch["clip_ids"] = clip_ids
+        batch["t0_us_list"] = t0_us_list
+        batch["completion_prefixes"] = completion_prefixes
+
     return batch
 
 
@@ -139,12 +157,43 @@ class AdvCondSFTTrainer(Trainer):
 
     def _setup_expert(self, full_model: AlpamayoR1, cfg: dict) -> None:
         """Initialize expert optimizer and optionally load pretrained weights."""
-        # Collect expert trainable parameters
+        # Optionally load pretrained expert weights (before LoRA so base weights are set)
+        load_path = cfg.get("load_path")
+        if load_path:
+            state = torch.load(load_path, map_location="cpu", weights_only=False)
+            full_model.expert.load_state_dict(state["expert"], strict=False)
+            full_model.action_in_proj.load_state_dict(state["action_in_proj"])
+            full_model.action_out_proj.load_state_dict(state["action_out_proj"])
+            logger.info("Loaded pretrained expert weights from %s", load_path)
+
+        # Apply LoRA to expert transformer if configured
+        lora_cfg = cfg.get("expert_lora", {})
+        if lora_cfg.get("enabled", False):
+            from peft import LoraConfig, get_peft_model
+
+            expert_lora_config = LoraConfig(
+                r=int(lora_cfg.get("r", 4)),
+                lora_alpha=int(lora_cfg.get("alpha", 32)),
+                lora_dropout=float(lora_cfg.get("dropout", 0.0)),
+                target_modules=list(
+                    lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
+                ),
+                task_type="FEATURE_EXTRACTION",
+            )
+            full_model.expert = get_peft_model(full_model.expert, expert_lora_config)
+            logger.info(
+                "Applied LoRA to expert: r=%d, alpha=%d",
+                expert_lora_config.r,
+                expert_lora_config.lora_alpha,
+            )
+
+        # Collect trainable parameters: expert (LoRA or full) + projections
         expert_params = []
-        for name, param in full_model.named_parameters():
-            if any(
-                name.startswith(pfx) for pfx in ("expert.", "action_in_proj.", "action_out_proj.")
-            ):
+        for name, param in full_model.expert.named_parameters():
+            if param.requires_grad:
+                expert_params.append(param)
+        for module in (full_model.action_in_proj, full_model.action_out_proj):
+            for param in module.parameters():
                 param.requires_grad = True
                 expert_params.append(param)
 
@@ -158,18 +207,9 @@ class AdvCondSFTTrainer(Trainer):
             weight_decay=float(cfg.get("weight_decay", 0.01)),
         )
 
-        # Optionally load pretrained expert weights
-        load_path = cfg.get("load_path")
-        if load_path:
-            state = torch.load(load_path, map_location="cpu", weights_only=False)
-            full_model.expert.load_state_dict(state["expert"], strict=False)
-            full_model.action_in_proj.load_state_dict(state["action_in_proj"])
-            full_model.action_out_proj.load_state_dict(state["action_out_proj"])
-            logger.info("Loaded pretrained expert weights from %s", load_path)
-
         self._expert_enabled = True
         logger.info(
-            "Expert CFM finetuning enabled: %d params, lr=%s, every_n_steps=%d",
+            "Expert CFM finetuning enabled: %d trainable params, lr=%s, every_n_steps=%d",
             sum(p.numel() for p in expert_params),
             cfg.get("lr", 1e-4),
             self._expert_every_n_steps,
@@ -240,8 +280,11 @@ class AdvCondSFTTrainer(Trainer):
     def _expert_cfm_step(self, inputs: dict) -> None:
         """Run one expert CFM training step using deferred GPU scheduling.
 
-        Moves expert to GPU, computes CFM loss on GT trajectories conditioned
-        on VLM KV cache, then moves expert back to CPU.
+        Two-phase approach to avoid VLM + expert co-residency on GPU:
+        Phase A: Extract KV caches with VLM on GPU, then offload VLM to CPU.
+        Phase B: Move expert to GPU, compute CFM losses using cached KV,
+                 run optimizer step, then move expert back to CPU and
+                 restore VLM to GPU.
         """
         if self.full_model is None or self._data_cache is None:
             return
@@ -261,16 +304,8 @@ class AdvCondSFTTrainer(Trainer):
         if not clip_ids:
             return
 
-        # Move expert + projections to GPU
-        self.full_model.expert.to(device)
-        self.full_model.action_in_proj.to(device)
-        self.full_model.action_out_proj.to(device)
-        self.full_model.action_space.to(device)
-
-        total_loss = 0.0
-        n_valid = 0
-        self._expert_optimizer.zero_grad()
-
+        # ---- Phase A: Extract KV caches (VLM on GPU) ----
+        cached_samples = []
         for i in range(len(clip_ids)):
             try:
                 clip_id = clip_ids[i]
@@ -285,17 +320,50 @@ class AdvCondSFTTrainer(Trainer):
                 kv_result = self._get_vlm_kv_cache_teacher_forced(
                     model_inputs, completion_prefix, device
                 )
-                prompt_cache, rope_deltas, prefill_seq_len, b_star, offset = kv_result
 
-                # Convert GT trajectory to action space
+                # Prepare GT trajectory data
                 hist_xyz = model_inputs["ego_history_xyz"][:, -1].to(device)
                 hist_rot = model_inputs["ego_history_rot"][:, -1].to(device)
                 fut_xyz = ego_future_xyz.to(device)[:, -1]
                 fut_rot = ego_future_rot[:, -1]
 
+                cached_samples.append({
+                    "kv_result": kv_result,
+                    "hist_xyz": hist_xyz,
+                    "hist_rot": hist_rot,
+                    "fut_xyz": fut_xyz,
+                    "fut_rot": fut_rot,
+                })
+            except Exception as e:
+                logger.warning("KV cache extraction failed for sample %d: %s", i, e)
+                continue
+
+        if not cached_samples:
+            return
+
+        # ---- Offload VLM to CPU, free GPU for expert ----
+        # self.full_model.vlm.cpu()
+        # gc.collect()
+        # torch.cuda.empty_cache()
+
+        # ---- Phase B: Expert CFM (expert on GPU, VLM offloaded) ----
+        self.full_model.expert.to(device)
+        self.full_model.action_in_proj.to(device)
+        self.full_model.action_out_proj.to(device)
+        self.full_model.action_space.to(device)
+
+        total_loss = 0.0
+        n_valid = 0
+        self._expert_optimizer.zero_grad()
+
+        for i, sample in enumerate(cached_samples):
+            try:
+                prompt_cache, rope_deltas, prefill_seq_len, b_star, offset = sample["kv_result"]
+
                 with torch.no_grad():
                     gt_action = self.full_model.action_space.traj_to_action(
-                        hist_xyz, hist_rot, fut_xyz, fut_rot
+                        sample["hist_xyz"], sample["hist_rot"],
+                        sample["fut_xyz"], sample["fut_rot"],
                     )
 
                 # Compute CFM loss
@@ -311,7 +379,7 @@ class AdvCondSFTTrainer(Trainer):
                         num_noisy_samples=num_noisy_samples,
                         device=device,
                     )
-                    loss = loss / max(len(clip_ids), 1)
+                    loss = loss / max(len(cached_samples), 1)
 
                 loss.backward()
                 total_loss += loss.item()
@@ -339,14 +407,17 @@ class AdvCondSFTTrainer(Trainer):
                 "expert CFM step | loss=%.6f valid=%d/%d",
                 total_loss,
                 n_valid,
-                len(clip_ids),
+                len(cached_samples),
             )
 
-        # Move expert back to CPU
-        self.full_model.expert.cpu()
-        self.full_model.action_in_proj.cpu()
-        self.full_model.action_out_proj.cpu()
-        self.full_model.action_space.cpu()
+        # Move expert back to CPU, restore VLM to GPU for next training step
+        # self.full_model.expert.cpu()
+        # self.full_model.action_in_proj.cpu()
+        # self.full_model.action_out_proj.cpu()
+        # self.full_model.action_space.cpu()
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        # self.full_model.vlm.to(device)
 
     def _get_vlm_kv_cache_teacher_forced(
         self,
@@ -409,7 +480,13 @@ class AdvCondSFTTrainer(Trainer):
                 "VLM forward returned past_key_values=None. "
                 "Gradient checkpointing may not have been disabled properly."
             )
-        rope_deltas = self.full_model.vlm.model.rope_deltas
+        # Navigate through PeftModel wrapper: vlm.model may be
+        # Qwen3VLForConditionalGeneration (via LoraModel) instead of
+        # the inner Qwen3VLModel that stores rope_deltas.
+        _inner = self.full_model.vlm.model
+        if not hasattr(_inner, "rope_deltas"):
+            _inner = _inner.model
+        rope_deltas = _inner.rope_deltas
         prefill_seq_len = past_key_values.get_seq_length()
         b_star = 1
         offset = torch.tensor([full_ids.shape[1]], device=device)
