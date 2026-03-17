@@ -33,13 +33,14 @@ lora:
 training:
   output_dir: outputs/sft_advcond
   num_train_epochs: 1           # epochs per iteration
-  per_device_train_batch_size: 4
-  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 2
   learning_rate: 5e-6
   bf16: true
   gradient_checkpointing: true
   logging_steps: 1
-  save_steps: 200
+  save_strategy: "no"              # "no" = off (default), "steps" = periodic mid-iteration saves
+  save_steps: 200                  # used when save_strategy: steps
   save_total_limit: 3
   warmup_ratio: 0.05
   max_grad_norm: 1.0
@@ -48,7 +49,7 @@ training:
 # Advantage conditioning parameters (outer self-play loop)
 advantage_conditioning:
   num_iterations: 5             # self-play outer loop iterations
-  completions_per_scene: 8      # G completions per scene during rollout
+  completions_per_scene: 4      # G completions per scene during rollout
   p_drop: 0.3                   # conditioning dropout probability for CFG
   alpha: 1.0                    # conditional loss weight (unconditional = 1.0)
   k_obs: 30                     # percentile threshold for obs-level binarization
@@ -65,9 +66,9 @@ value_head:
   lr: 1e-5
   load_path: null               # pre-trained value head checkpoint (skips pre-training if provided)
   segment_level: true
-  train_epochs: 10              # epochs to train value head per iteration (before advantage computation)
-  pretrain_scenes: 3           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)
-  pretrain_epochs:            # epochs for Stage 0 pre-training
+  train_epochs: 1              # epochs to train value head per iteration (before advantage computation)
+  pretrain_scenes: 500           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)
+  pretrain_epochs: 1           # epochs for Stage 0 pre-training
 
 # Action expert finetuning (CFM / flow matching)
 # Uses deferred GPU scheduling: expert step runs after VLM SFT backward
@@ -75,7 +76,7 @@ expert_finetune:
   enabled: true
   lr: 1e-4
   weight_decay: 0.01
-  num_noisy_samples: 4          # noise samples per GT action for CFM loss
+  num_noisy_samples: 2          # noise samples per GT action for CFM loss
   every_n_steps: 1              # run expert CFM step every N VLM SFT steps
   max_grad_norm: 1.0
   save_path: null               # where to save expert checkpoints

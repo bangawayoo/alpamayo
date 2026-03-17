@@ -105,6 +105,7 @@ class AdvCondSFTTrainer(Trainer):
         alpha: Weight for conditional loss (unconditional = 1.0).
         expert_cfg: Expert finetuning config dict, or None to disable.
         data_cache: ClipDataCache for loading scene data during expert step.
+        value_head: SegmentValueHead instance to co-save with VLM/expert checkpoints.
     """
 
     def __init__(
@@ -118,6 +119,7 @@ class AdvCondSFTTrainer(Trainer):
         alpha: float = 1.0,
         expert_cfg: dict | None = None,
         data_cache: ClipDataCache | None = None,
+        value_head: torch.nn.Module | None = None,
         **kwargs,
     ):
         # Determine pad_token_id for the collator
@@ -140,6 +142,7 @@ class AdvCondSFTTrainer(Trainer):
         self.adv_token_ids = adv_token_ids or {}
         self.alpha = alpha
         self._data_cache = data_cache
+        self._value_head = value_head
         self._expert_metrics: dict[str, list[float]] = {
             "expert_cfm/loss": [],
             "expert_cfm/valid_samples": [],
@@ -506,10 +509,10 @@ class AdvCondSFTTrainer(Trainer):
         return past_key_values, rope_deltas, prefill_seq_len, b_star, offset
 
     def _save(self, output_dir: str, state_dict=None) -> None:
-        """Extend default save to also persist expert weights."""
+        """Extend default save to also persist expert and value head weights."""
         super()._save(output_dir, state_dict)
 
-        if self._expert_enabled and self.full_model is not None:
+        if self.full_model is not None:
             expert_state = {
                 "expert": self.full_model.expert.state_dict(),
                 "action_in_proj": self.full_model.action_in_proj.state_dict(),
@@ -521,3 +524,8 @@ class AdvCondSFTTrainer(Trainer):
             expert_path = Path(output_dir) / "expert_checkpoint.pt"
             torch.save(expert_state, expert_path)
             logger.info("Saved expert checkpoint to %s", expert_path)
+
+        if self._value_head is not None:
+            vh_path = Path(output_dir) / "value_head.pt"
+            torch.save(self._value_head.state_dict(), vh_path)
+            logger.info("Saved value head to %s", vh_path)

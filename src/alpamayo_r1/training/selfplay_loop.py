@@ -362,12 +362,27 @@ class SelfPlayLoop:
             num_epochs=num_epochs,
         )
 
-        # Save pre-trained value head
+        # Save all components after value head pre-training so Stage 0 work
+        # is recoverable on crash.  VLM has no LoRA yet, so save base weights.
         output_dir = Path(self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
-        vh_path = output_dir / "value_head_pretrained.pt"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(value_head.state_dict(), vh_path)
-        logger.info("Saved pre-trained value head to %s (loss=%.4f)", vh_path, metrics["loss"])
+        pretrain_dir = output_dir / "pretrained"
+        pretrain_dir.mkdir(parents=True, exist_ok=True)
+
+        torch.save(value_head.state_dict(), pretrain_dir / "value_head.pt")
+        self.full_model.vlm.save_pretrained(str(pretrain_dir / "vlm"))
+        torch.save(
+            {
+                "expert": self.full_model.expert.state_dict(),
+                "action_in_proj": self.full_model.action_in_proj.state_dict(),
+                "action_out_proj": self.full_model.action_out_proj.state_dict(),
+            },
+            pretrain_dir / "expert_checkpoint.pt",
+        )
+        logger.info(
+            "Saved pretrained checkpoint (vlm + expert + value_head) to %s (vh loss=%.4f)",
+            pretrain_dir,
+            metrics["loss"],
+        )
 
     def run_iteration(self, iteration: int) -> None:
         """Run a single iteration of the self-play loop.
@@ -677,6 +692,7 @@ class SelfPlayLoop:
             gradient_checkpointing=bool(train_cfg.get("gradient_checkpointing", True)),
             gradient_checkpointing_kwargs={"use_reentrant": False},
             logging_steps=int(train_cfg.get("logging_steps", 1)),
+            save_strategy=train_cfg.get("save_strategy", "no"),
             save_steps=int(train_cfg.get("save_steps", 200)),
             save_total_limit=int(train_cfg.get("save_total_limit", 3)),
             warmup_ratio=float(train_cfg.get("warmup_ratio", 0.05)),
@@ -688,6 +704,7 @@ class SelfPlayLoop:
         # 5. Create trainer
         data_cache = self._get_data_cache()
         adv_cfg = self.cfg.get("advantage_conditioning", {})
+        value_head = self._value_head if hasattr(self, "_value_head") else None
         trainer = AdvCondSFTTrainer(
             model=full_model.vlm,
             args=training_args,
@@ -698,6 +715,7 @@ class SelfPlayLoop:
             alpha=float(adv_cfg.get("alpha", 1.0)),
             expert_cfg=expert_cfg,
             data_cache=data_cache,
+            value_head=value_head,
         )
 
         # 6. Train
@@ -801,18 +819,17 @@ class SelfPlayLoop:
         return self._value_head
 
     def _save_checkpoint(self, iteration: int) -> None:
-        """Save value head, advantage buffer, and replay buffer state."""
+        """Save advantage buffer state for the iteration.
+
+        VLM LoRA, expert, and value head are already saved by
+        trainer.save_model() → AdvCondSFTTrainer._save() into
+        iter_{n}/final/ at the end of Phase 3.
+        """
         output_dir = Path(self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
         iter_dir = output_dir / f"iter_{iteration}"
         iter_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save advantage buffer state
+        # Save advantage buffer state (loop-level, not managed by trainer)
         adv_buf_path = iter_dir / "advantage_buffer.pt"
         torch.save(self.advantage_buffer.state_dict(), adv_buf_path)
         logger.info("Saved advantage buffer to %s", adv_buf_path)
-
-        # Save value head if it exists
-        if hasattr(self, "_value_head"):
-            vh_path = iter_dir / "value_head.pt"
-            torch.save(self._value_head.state_dict(), vh_path)
-            logger.info("Saved value head to %s", vh_path)
