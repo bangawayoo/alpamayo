@@ -290,7 +290,6 @@ class TestValueHeadTraining:
             segment_hidden_stash.append(
                 {
                     "h_obs": torch.randn(1, D),
-                    "h_coc": torch.randn(1, D),
                     "h_traj": torch.randn(T_traj, D),
                 }
             )
@@ -316,16 +315,14 @@ class TestValueHeadTraining:
     def test_compute_value_targets(self):
         """Verify returns-to-go are computed correctly."""
         _, reward_stash, seg_map = self._make_mock_data(n=2, T_traj=4)
-        g_obs, g_coc, g_traj = compute_value_targets(
+        g_obs, g_traj = compute_value_targets(
             reward_stash, seg_map, reward_weights=(0.5, 0.25, 0.25)
         )
         assert len(g_obs) == 2
-        assert len(g_coc) == 2
         assert len(g_traj) == 2
 
-        # G(s_obs) = w_reason * r_reason + traj_total
-        # G(s_coc) = traj_total (excludes reasoning reward)
-        assert g_obs[0] > g_coc[0]  # obs includes reasoning reward
+        # G(s_obs) = w_reason * r_reason + traj_total (includes reasoning reward)
+        assert g_obs[0] > 0
 
         # G(s_traj) should be decreasing (return-to-go shrinks)
         assert g_traj[0][0].item() >= g_traj[0][-1].item()
@@ -339,17 +336,17 @@ class TestValueHeadTraining:
         optimizer = torch.optim.Adam(vh.parameters(), lr=1e-3)
 
         hidden_stash, reward_stash, seg_map = self._make_mock_data(n=8, T_traj=4, D=D)
-        g_obs, g_coc, g_traj = compute_value_targets(
+        g_obs, g_traj = compute_value_targets(
             reward_stash, seg_map, reward_weights=(0.5, 0.25, 0.25)
         )
 
         # Train for 1 epoch to get initial loss
         m1 = train_segment_value_head(
-            vh, optimizer, hidden_stash, g_obs, g_coc, g_traj, num_epochs=1
+            vh, optimizer, hidden_stash, g_obs, g_traj, num_epochs=1
         )
         # Train for 50 more epochs
         m2 = train_segment_value_head(
-            vh, optimizer, hidden_stash, g_obs, g_coc, g_traj, num_epochs=50
+            vh, optimizer, hidden_stash, g_obs, g_traj, num_epochs=50
         )
         assert m2["loss"] < m1["loss"], f"Loss should decrease: {m1['loss']} -> {m2['loss']}"
 
@@ -359,5 +356,5 @@ class TestValueHeadTraining:
 
         vh = SegmentValueHead(hidden_dim=32)
         optimizer = torch.optim.Adam(vh.parameters(), lr=1e-3)
-        metrics = train_segment_value_head(vh, optimizer, [], [], [], [], num_epochs=5)
+        metrics = train_segment_value_head(vh, optimizer, [], [], [], num_epochs=5)
         assert metrics["loss"] == 0.0

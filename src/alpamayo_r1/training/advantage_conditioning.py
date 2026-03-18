@@ -34,43 +34,90 @@ ADV_TOKEN_STRINGS = dict(ADV_CONDITIONING_TOKENS)
 
 
 # ---------------------------------------------------------------------------
-# 3a. Token registration
+# 3a. Token ID computation + trainable side embedding
 # ---------------------------------------------------------------------------
 
 
-def register_advantage_tokens(tokenizer) -> dict[str, int]:
-    """Add 4 advantage conditioning tokens to the tokenizer.
+def compute_advantage_token_ids(vocab_size: int) -> dict[str, int]:
+    """Compute sentinel IDs for advantage tokens without modifying the tokenizer.
 
-    Should be called once during SFT model setup. After calling this, the
-    caller must resize model embeddings:
-        model.vlm.resize_token_embeddings(len(tokenizer))
+    Uses IDs just past the VLM's vocab_size boundary. These IDs never hit
+    the embedding layer directly — the AdvantageEmbedding pre-hook intercepts
+    them before lookup.
 
     Args:
-        tokenizer: HuggingFace tokenizer instance.
+        vocab_size: The VLM's original vocabulary size.
 
     Returns:
-        Dict mapping token name -> token ID, e.g.
+        Dict mapping token name -> sentinel token ID, e.g.
         {"adv_obs_pos": 155690, "adv_obs_neg": 155691, ...}
     """
-    tokens_to_add = list(ADV_TOKEN_STRINGS.values())
+    return {name: vocab_size + i for i, name in enumerate(ADV_TOKEN_NAMES)}
 
-    # Check if already registered
-    existing = tokenizer.convert_tokens_to_ids(tokens_to_add[0])
-    if existing != tokenizer.unk_token_id:
-        logger.info("Advantage tokens already registered (first token ID=%d)", existing)
-    else:
-        num_added = tokenizer.add_tokens(tokens_to_add, special_tokens=True)
-        logger.info("Registered %d advantage conditioning tokens", num_added)
 
-    # Build name -> id mapping
-    adv_token_ids = {}
-    for name in ADV_TOKEN_NAMES:
-        token_str = ADV_TOKEN_STRINGS[name]
-        tid = tokenizer.convert_tokens_to_ids(token_str)
-        if tid == tokenizer.unk_token_id:
-            raise ValueError(f"Failed to register advantage token {token_str!r}")
-        adv_token_ids[name] = tid
-    return adv_token_ids
+class AdvantageEmbedding(torch.nn.Module):
+    """Small trainable embedding for advantage conditioning tokens.
+
+    Uses a pre-hook to clamp out-of-range sentinel IDs before embed_tokens
+    lookup, then a post-hook to replace those positions with learned embeddings.
+    """
+
+    def __init__(self, hidden_size: int, adv_token_ids: dict[str, int]):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(len(adv_token_ids), hidden_size)
+        torch.nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        # token_id -> local index (0..3)
+        self._tid_to_idx = {tid: i for i, tid in enumerate(adv_token_ids.values())}
+        self._sentinel_ids = set(adv_token_ids.values())
+        self._pre_handle = None
+        self._post_handle = None
+        self._stashed_ids = None  # holds original input_ids across pre→post
+
+    def attach(self, vlm: torch.nn.Module) -> None:
+        """Register pre+post hooks on the VLM's input embedding layer."""
+        self.detach()
+        embed_layer = vlm.get_input_embeddings()
+        self._pre_handle = embed_layer.register_forward_pre_hook(self._pre_hook)
+        self._post_handle = embed_layer.register_forward_hook(self._post_hook)
+
+    def detach(self) -> None:
+        """Remove hooks."""
+        if self._pre_handle is not None:
+            self._pre_handle.remove()
+            self._pre_handle = None
+        if self._post_handle is not None:
+            self._post_handle.remove()
+            self._post_handle = None
+        self._stashed_ids = None
+
+    def _pre_hook(self, module, args):
+        """Clamp sentinel IDs to 0 so embed_tokens doesn't crash on out-of-range."""
+        input_ids = args[0]
+        mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for tid in self._sentinel_ids:
+            mask |= (input_ids == tid)
+        if mask.any():
+            self._stashed_ids = input_ids  # save originals for post-hook
+            safe_ids = input_ids.clone()
+            safe_ids[mask] = 0
+            return (safe_ids,) + args[1:]  # preserve any extra args
+        self._stashed_ids = None
+        return None  # no modification
+
+    def _post_hook(self, module, args, output):
+        """Replace embeddings at sentinel positions with learned embeddings."""
+        if self._stashed_ids is None:
+            return output
+        input_ids = self._stashed_ids
+        self._stashed_ids = None
+        result = output
+        for tid, idx in self._tid_to_idx.items():
+            positions = (input_ids == tid)
+            if positions.any():
+                idx_t = torch.tensor(idx, device=output.device)
+                emb = self.embedding(idx_t)  # (hidden_size,)
+                result = torch.where(positions.unsqueeze(-1), emb, result)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -297,8 +344,8 @@ def compute_value_targets(
     segment_reward_stash: list[dict],
     completion_segment_map: list[dict],
     reward_weights: tuple[float, float, float] = (0.5, 0.25, 0.25),
-) -> tuple[list[float], list[float], list[torch.Tensor]]:
-    """Compute returns-to-go targets for value head training at all three levels.
+) -> tuple[list[float], list[torch.Tensor]]:
+    """Compute returns-to-go targets for value head training at obs and traj levels.
 
     Uses the same reward decomposition as compute_segment_advantages_from_rollouts,
     but returns the raw targets (not advantages) for MSE training.
@@ -309,14 +356,12 @@ def compute_value_targets(
         reward_weights: (w_traj, w_reason, w_consist).
 
     Returns:
-        (g_obs_list, g_coc_list, g_traj_list):
+        (g_obs_list, g_traj_list):
         - g_obs_list: per-completion total return G(s_obs)
-        - g_coc_list: per-completion remaining return G(s_coc)
         - g_traj_list: per-completion return-to-go tensors G(s_traj_j), shape (T_traj,) each
     """
     w_traj, w_reason, w_consist = reward_weights
     g_obs_list = []
-    g_coc_list = []
     g_traj_list = []
 
     for i in range(len(segment_reward_stash)):
@@ -341,10 +386,8 @@ def compute_value_targets(
 
         traj_total = r_traj_weighted.sum().item() if T_traj > 0 else 0.0
         g_obs = w_reason * r_reason + traj_total
-        g_coc = traj_total
 
         g_obs_list.append(g_obs)
-        g_coc_list.append(g_coc)
 
         if T_traj > 0:
             g_traj = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
@@ -352,7 +395,7 @@ def compute_value_targets(
         else:
             g_traj_list.append(torch.zeros(0))
 
-    return g_obs_list, g_coc_list, g_traj_list
+    return g_obs_list, g_traj_list
 
 
 def train_segment_value_head(
@@ -360,7 +403,6 @@ def train_segment_value_head(
     optimizer: torch.optim.Optimizer,
     segment_hidden_stash: list[dict],
     g_obs_list: list[float],
-    g_coc_list: list[float],
     g_traj_list: list[torch.Tensor],
     num_epochs: int = 10,
     batch_size: int = 64,
@@ -369,19 +411,18 @@ def train_segment_value_head(
     tb_writer: Any | None = None,
     global_step_offset: int = 0,
 ) -> dict[str, float]:
-    """Train the three-level value head on returns-to-go targets.
+    """Train the two-level value head on returns-to-go targets.
 
-    Uses mini-batch SGD with shuffled indices each epoch. Obs and CoC hidden
-    states are pre-stacked for efficient batched forward passes; traj tokens
-    are processed per-completion within each mini-batch (variable-length
-    sequences cannot be stacked without padding).
+    Uses mini-batch SGD with shuffled indices each epoch. Obs hidden states
+    are pre-stacked for efficient batched forward passes; traj tokens are
+    processed per-completion within each mini-batch (variable-length sequences
+    cannot be stacked without padding).
 
     Args:
         value_head: SegmentValueHead instance.
         optimizer: Optimizer for the value head parameters.
-        segment_hidden_stash: Per-completion {h_obs, h_coc, h_traj}.
+        segment_hidden_stash: Per-completion {h_obs, h_traj}.
         g_obs_list: Per-completion G(s_obs) targets.
-        g_coc_list: Per-completion G(s_coc) targets.
         g_traj_list: Per-completion G(s_traj_j) tensors.
         num_epochs: Number of training epochs over the data.
         batch_size: Mini-batch size (default 64).
@@ -393,23 +434,21 @@ def train_segment_value_head(
             monotonically increasing steps across pretrain + iterations).
 
     Returns:
-        Dict of final-step metrics: {loss, loss_obs, loss_coc, loss_traj,
+        Dict of final-step metrics: {loss, loss_obs, loss_traj,
         pred_obs_mean, target_obs_mean, total_steps}.
     """
     from alpamayo_r1.training.value_head import SegmentValueHead
 
     B = len(g_obs_list)
     if B == 0 or num_epochs <= 0:
-        return {"loss": 0.0, "loss_obs": 0.0, "loss_coc": 0.0, "loss_traj": 0.0,
+        return {"loss": 0.0, "loss_obs": 0.0, "loss_traj": 0.0,
                 "pred_obs_mean": 0.0, "target_obs_mean": 0.0, "total_steps": 0}
 
     vh_device = next(value_head.parameters()).device
 
-    # Pre-stack obs and coc into (B, D) / (B,) tensors on CPU for efficient indexing
+    # Pre-stack obs into (B, D) / (B,) tensors on CPU for efficient indexing
     h_obs_all = torch.cat([segment_hidden_stash[i]["h_obs"] for i in range(B)], dim=0)
     g_obs_all = torch.tensor(g_obs_list, dtype=torch.float32)
-    h_coc_all = torch.cat([segment_hidden_stash[i]["h_coc"] for i in range(B)], dim=0)
-    g_coc_all = torch.tensor(g_coc_list, dtype=torch.float32)
 
     metrics = {}
     global_step = 0
@@ -425,12 +464,6 @@ def train_segment_value_head(
             g_obs_batch = g_obs_all[idx].to(vh_device)
             obs_pred = value_head(h_obs_batch, level=SegmentValueHead.LEVEL_OBS)
             loss_obs = F.mse_loss(obs_pred, g_obs_batch)
-
-            # --- CoC-level loss ---
-            h_coc_batch = h_coc_all[idx].to(vh_device)
-            g_coc_batch = g_coc_all[idx].to(vh_device)
-            coc_pred = value_head(h_coc_batch, level=SegmentValueHead.LEVEL_COC)
-            loss_coc = F.mse_loss(coc_pred, g_coc_batch)
 
             # --- Traj-level loss (sub-sampled at curvature positions) ---
             # Trajectory tokens come in (acceleration, curvature) pairs per timestep.
@@ -471,7 +504,7 @@ def train_segment_value_head(
                 loss_traj = torch.tensor(0.0, device=vh_device)
 
             # --- Combined loss ---
-            total_loss = (loss_obs + loss_coc + loss_traj) / 3.0
+            total_loss = (loss_obs + loss_traj) / 2.0
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -480,7 +513,6 @@ def train_segment_value_head(
             metrics = {
                 "loss": total_loss.item(),
                 "loss_obs": loss_obs.item(),
-                "loss_coc": loss_coc.item(),
                 "loss_traj": loss_traj.item(),
                 "pred_obs_mean": obs_pred.detach().mean().item(),
                 "target_obs_mean": g_obs_batch.mean().item(),
@@ -498,13 +530,12 @@ def train_segment_value_head(
             if global_step == 0 or at_log_interval or at_epoch_start:
                 logger.info(
                     "  Value head step %d (epoch %d/%d): "
-                    "loss=%.4f (obs=%.4f coc=%.4f traj=%.4f)",
+                    "loss=%.4f (obs=%.4f traj=%.4f)",
                     global_step + 1,
                     epoch + 1,
                     num_epochs,
                     metrics["loss"],
                     metrics["loss_obs"],
-                    metrics["loss_coc"],
                     metrics["loss_traj"],
                 )
 
@@ -518,7 +549,7 @@ def train_segment_value_head(
 
     logger.info(
         "Value head training: %d epochs, %d steps, %d samples (batch_size=%d) | "
-        "loss=%.4f (obs=%.4f, coc=%.4f, traj=%.4f) | "
+        "loss=%.4f (obs=%.4f, traj=%.4f) | "
         "pred_obs=%.3f target_obs=%.3f",
         num_epochs,
         total_steps,
@@ -526,7 +557,6 @@ def train_segment_value_head(
         batch_size,
         metrics["loss"],
         metrics["loss_obs"],
-        metrics["loss_coc"],
         metrics["loss_traj"],
         metrics["pred_obs_mean"],
         metrics["target_obs_mean"],

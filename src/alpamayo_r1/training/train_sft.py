@@ -27,7 +27,6 @@ from physical_ai_av import PhysicalAIAVDatasetInterface
 
 from alpamayo_r1 import helper
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
-from alpamayo_r1.training.advantage_conditioning import register_advantage_tokens
 from alpamayo_r1.training.dataset import build_alpamayo_dataset
 from alpamayo_r1.training.rollout_utils import prepare_vlm_for_training
 from alpamayo_r1.training.selfplay_loop import SelfPlayLoop
@@ -108,17 +107,9 @@ def main(cfg: DictConfig) -> None:
     logger.info("[STAGE 2/6] Processor ready in %.1fs", time.time() - t0)
 
     # ---------------------------------------------------------------
-    # 3. Register advantage tokens and resize embeddings
+    # 3. Advantage token IDs (computed by SelfPlayLoop, no tokenizer changes)
     # ---------------------------------------------------------------
-    logger.info("[STAGE 3/6] Registering advantage tokens and resizing embeddings...")
-    t0 = time.time()
-    register_advantage_tokens(processor.tokenizer)
-    full_model.vlm.resize_token_embeddings(len(processor.tokenizer))
-    logger.info(
-        "[STAGE 3/6] Resized embeddings to %d in %.1fs",
-        len(processor.tokenizer),
-        time.time() - t0,
-    )
+    logger.info("[STAGE 3/6] Advantage token setup deferred to SelfPlayLoop")
 
     # ---------------------------------------------------------------
     # 4. Prepare VLM for training compatibility

@@ -76,8 +76,9 @@ SPECIAL_TOKENS = {k: "<|" + k + "|>" for k in SPECIAL_TOKENS_KEYS}
 
 # Advantage conditioning tokens — NOT included in SPECIAL_TOKENS_KEYS because
 # they must not be registered by _build_processor (which would change vocab_size
-# and break checkpoint loading). Instead, the SFT pipeline registers them
-# explicitly via advantage_conditioning.register_advantage_tokens().
+# and break checkpoint loading). Instead, the SFT pipeline assigns sentinel IDs
+# via compute_advantage_token_ids() and a trainable AdvantageEmbedding side
+# module intercepts them at the embedding layer via forward hooks.
 ADV_CONDITIONING_TOKEN_KEYS = [
     "adv_obs_pos",
     "adv_obs_neg",

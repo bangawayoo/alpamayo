@@ -70,6 +70,7 @@ value_head:
   batch_size: 64                 # mini-batch size for value head training
   pretrain_scenes: 500           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)
   pretrain_epochs: 1           # epochs for Stage 0 pre-training
+  pretrain_batch_scenes: 4      # scenes per pretrain iteration (match GPU batch)
   log_interval: 10               # log to display every N steps (TensorBoard logs every step)
 
 # Action expert finetuning (CFM / flow matching)

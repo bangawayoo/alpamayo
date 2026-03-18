@@ -1,7 +1,7 @@
 """Segment-level value head for GRPO baseline estimation.
 
-SegmentValueHead maps VLM hidden states to scalar value estimates at three
-semantic levels: observation (scene), CoC reasoning, and trajectory tokens.
+SegmentValueHead maps VLM hidden states to scalar value estimates at two
+semantic levels: observation (scene) and trajectory tokens.
 A shared MLP with additive level embeddings and rotary positional encoding
 predicts V(s) at each level.
 """
@@ -15,36 +15,33 @@ import torch.nn as nn
 class SegmentValueHead(nn.Module):
     """Shared MLP with level embedding and rotary positional encoding.
 
-    Three levels correspond to the three semantic segments of a VLA generation:
+    Two levels correspond to the two semantic segments of a VLA generation:
       - Level 0 (obs): last prompt token — scene understanding before generation
-      - Level 1 (coc): <cot_end> token — scene + quality of reasoning produced
-      - Level 2 (traj): each trajectory token — scene + reasoning + trajectory-so-far
+      - Level 1 (traj): each trajectory token — scene + reasoning + trajectory-so-far
 
     The level embedding is additive: h' = h + level_embed[level], giving the
     MLP an explicit signal about which stage of generation it's evaluating.
 
     Rotary positional encoding (RoPE) provides a parameter-free sinusoidal
-    position signal. Default positions place obs at 0, coc at 1, and trajectory
-    tokens at 2, 3, ..., T+1 — enabling the MLP to learn that earlier positions
-    have higher returns-to-go.
+    position signal. Default positions place obs at 0 and trajectory tokens at
+    1, 2, ..., T — enabling the MLP to learn that earlier positions have higher
+    returns-to-go.
 
     Args:
         hidden_dim: VLM hidden state dimension (4096 for Qwen3-VL-7B/10B).
-        num_levels: Number of distinct levels (default 3).
+        num_levels: Number of distinct levels (default 2).
         rope_base: Base frequency for RoPE (default 10000.0).
     """
 
     LEVEL_OBS = 0
-    LEVEL_COC = 1
-    LEVEL_TRAJ = 2
+    LEVEL_TRAJ = 1
 
     # Default position offsets for each level
     POS_OBS = 0
-    POS_COC = 1
-    POS_TRAJ_START = 2
+    POS_TRAJ_START = 1
 
     def __init__(
-        self, hidden_dim: int = 4096, num_levels: int = 3, rope_base: float = 10000.0
+        self, hidden_dim: int = 4096, num_levels: int = 2, rope_base: float = 10000.0
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -95,8 +92,7 @@ class SegmentValueHead(nn.Module):
 
         Default mapping:
           - obs:  position 0
-          - coc:  position 1
-          - traj: positions 2, 3, ..., T+1
+          - traj: positions 1, 2, ..., T
 
         Args:
             h: Input hidden state, (B, D) or (B, T, D).
@@ -108,8 +104,6 @@ class SegmentValueHead(nn.Module):
         device = h.device
         if level == self.LEVEL_OBS:
             pos_val = self.POS_OBS
-        elif level == self.LEVEL_COC:
-            pos_val = self.POS_COC
         else:
             pos_val = self.POS_TRAJ_START
 
@@ -137,7 +131,7 @@ class SegmentValueHead(nn.Module):
 
         Args:
             h: Hidden state, shape (B, D) or (B, T, D).
-            level: 0=obs, 1=coc, 2=traj. Additive embedding.
+            level: 0=obs, 1=traj. Additive embedding.
             positions: Position indices for RoPE encoding. Shape (B,) for
                 2D h or (B, T) for 3D h. If None, uses default positions
                 based on level (obs=0, coc=1, traj=2..T+1).

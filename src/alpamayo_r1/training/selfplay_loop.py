@@ -17,7 +17,9 @@ See docs/advantage-conditioning.md for the full design specification.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import random
 import time
 from pathlib import Path
@@ -30,10 +32,11 @@ from transformers import TrainingArguments
 
 from alpamayo_r1.training.advantage_conditioning import (
     AdvantageBuffer,
+    AdvantageEmbedding,
     AdvCondDataset,
+    compute_advantage_token_ids,
     compute_segment_advantages_from_rollouts,
     compute_value_targets,
-    register_advantage_tokens,
     train_segment_value_head,
 )
 
@@ -372,12 +375,38 @@ class SelfPlayLoop:
         self.avdi = avdi
         self.processor = processor
         self.all_clip_ids = list(all_clip_ids)
+        self._pretrain_clip_ids: list[str] = []
 
         adv_cfg = cfg.get("advantage_conditioning", {})
         num_iterations = int(adv_cfg.get("num_iterations", 5))
         self.num_iterations = num_iterations
 
-        self.partitioner = ScenePartitioner(all_clip_ids, num_iterations, seed=cfg.get("seed", 42))
+        # If a pretrained value head is being loaded, also load the clip IDs
+        # used during pre-training so they can be excluded from partitioning.
+        vh_cfg = cfg.get("value_head", {})
+        load_path = vh_cfg.get("load_path")
+        if load_path:
+            clip_ids_path = Path(load_path).parent / "clip_ids.json"
+            if clip_ids_path.exists():
+                with open(clip_ids_path) as f:
+                    self._pretrain_clip_ids = json.load(f)
+                logger.info(
+                    "Loaded %d pretrain clip IDs from %s — excluding from partitioner",
+                    len(self._pretrain_clip_ids),
+                    clip_ids_path,
+                )
+            else:
+                logger.warning(
+                    "Value head load_path set but no clip_ids.json found at %s",
+                    clip_ids_path,
+                )
+
+        partitioner_clip_ids = [
+            cid for cid in all_clip_ids if cid not in set(self._pretrain_clip_ids)
+        ]
+        self.partitioner = ScenePartitioner(
+            partitioner_clip_ids, num_iterations, seed=cfg.get("seed", 42)
+        )
         self.replay_buffer = RolloutReplayBuffer(
             max_size=int(adv_cfg.get("replay_buffer_max_size", 50000))
         )
@@ -392,8 +421,11 @@ class SelfPlayLoop:
         )
         self.current_policy_path = self.base_model_path
 
-        # Register advantage tokens once
-        self.adv_token_ids = register_advantage_tokens(processor.tokenizer)
+        # Compute advantage token IDs and create trainable side embedding
+        vocab_size = full_model.vlm.config.text_config.vocab_size
+        self.adv_token_ids = compute_advantage_token_ids(vocab_size)
+        hidden_size = full_model.vlm.config.text_config.hidden_size
+        self.adv_embedding = AdvantageEmbedding(hidden_size, self.adv_token_ids)
 
         # Replay ratio: fraction of training data from historical replay buffer
         self.replay_ratio = float(adv_cfg.get("replay_ratio", 0.3))
@@ -442,17 +474,19 @@ class SelfPlayLoop:
     ) -> None:
         """Stage 0: Pre-train the value head on rollouts from pi_0.
 
-        Generates rollouts from the base policy, extracts segment hidden
-        states, and trains the value head for many epochs so that the first
-        SFT iteration starts with a sensible baseline instead of random
-        predictions.
+        Iteratively processes small batches of scenes (pretrain_batch_scenes)
+        instead of all scenes at once. Each iteration: rollout -> reward ->
+        hidden states -> VH train. This yields many more gradient steps
+        (one full training pass per batch) and avoids holding all intermediate
+        data in memory simultaneously.
 
-        This can be called standalone (before run()) or is called automatically
-        when value_head.pretrain_scenes > 0 in the config.
+        The RolloutEngine is created once and reused (pi_0 and expert are frozen).
+        After pre-training, saves value_head.pt and clip_ids.json so that
+        pretrain scenes can be excluded from self-play partitioning.
 
         Args:
             num_scenes: Number of scenes to generate rollouts for.
-            num_epochs: Training epochs (default: value_head.pretrain_epochs
+            num_epochs: Training epochs per batch (default: value_head.pretrain_epochs
                 from config, or 50).
         """
         from alpamayo_r1.training.sft_rollout import RolloutEngine
@@ -470,6 +504,7 @@ class SelfPlayLoop:
         rollout_cfg = self.cfg.get("rollout", {})
         G = int(adv_cfg.get("completions_per_scene", 8))
         t0_us = int(self.cfg.get("data", {}).get("t0_us", 5_100_000))
+        pretrain_batch_scenes = int(vh_cfg.get("pretrain_batch_scenes", 4))
 
         # Sample scenes for pre-training from all available clip_ids
         rng = random.Random(self.cfg.get("seed", 42))
@@ -477,7 +512,7 @@ class SelfPlayLoop:
         rng.shuffle(shuffled)
         pretrain_scenes = shuffled[:num_scenes]
 
-        # Generate rollouts from current model (pi_0)
+        # Create RolloutEngine once — pi_0 and expert are frozen throughout
         data_cache = self._get_data_cache()
         engine = RolloutEngine(
             full_model=self.full_model,
@@ -487,60 +522,115 @@ class SelfPlayLoop:
             adv_token_ids=self.adv_token_ids,
         )
 
-        logger.info("Generating rollouts from %d scenes (G=%d)...", len(pretrain_scenes), G)
-        rollout_results = engine.generate_completions(pretrain_scenes, t0_us, G)
-        logger.info("Generated %d completions", len(rollout_results))
-
-        if not rollout_results:
-            logger.warning("No rollouts generated — skipping value head pre-training")
-            return
-
-        # Compute rewards
-        reward_stash = engine.compute_rewards(rollout_results)
-
-        # Extract segment hidden states
-        segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
-            rollout_results
-        )
-
-        # Compute value targets
-        reward_weights = self._get_reward_weights()
-        g_obs, g_coc, g_traj = compute_value_targets(
-            segment_reward_stash=reward_stash,
-            completion_segment_map=completion_segment_map,
-            reward_weights=reward_weights,
-        )
-
-        # Train value head
+        # Create value head and optimizer once before the loop
         vh_log_interval = int(vh_cfg.get("log_interval", 10))
         vh_batch_size = int(vh_cfg.get("batch_size", 64))
         value_head = self._get_or_create_value_head()
-        metrics = train_segment_value_head(
-            value_head=value_head,
-            optimizer=self._value_head_optimizer,
-            segment_hidden_stash=segment_hidden_stash,
-            g_obs_list=g_obs,
-            g_coc_list=g_coc,
-            g_traj_list=g_traj,
-            num_epochs=num_epochs,
-            batch_size=vh_batch_size,
-            log_interval=vh_log_interval,
-            tb_writer=self._get_tb_writer(),
-            global_step_offset=self._vh_global_step,
-        )
-        self._vh_global_step += metrics.get("total_steps", 0)
+        reward_weights = self._get_reward_weights()
 
-        # Save only the value head after pre-training — the VLM and expert
-        # are unchanged during Stage 0, so no need to save them.
+        num_iters = math.ceil(len(pretrain_scenes) / pretrain_batch_scenes)
+        logger.info(
+            "Iterative pre-training: %d scenes, batch=%d, %d iterations, "
+            "%d epochs/batch, G=%d",
+            len(pretrain_scenes),
+            pretrain_batch_scenes,
+            num_iters,
+            num_epochs,
+            G,
+        )
+
+        last_loss = float("nan")
+        for i in range(num_iters):
+            chunk_start = i * pretrain_batch_scenes
+            chunk_end = chunk_start + pretrain_batch_scenes
+            chunk_scenes = pretrain_scenes[chunk_start:chunk_end]
+            if not chunk_scenes:
+                break
+
+            logger.info(
+                "Pretrain iter %d/%d: %d scenes (clips %d–%d)",
+                i + 1,
+                num_iters,
+                len(chunk_scenes),
+                chunk_start,
+                chunk_start + len(chunk_scenes) - 1,
+            )
+
+            # 1. Generate rollouts
+            rollout_results = engine.generate_completions(chunk_scenes, t0_us, G)
+            if not rollout_results:
+                logger.warning("No rollouts from iter %d — skipping", i + 1)
+                continue
+
+            # 2. Compute rewards
+            reward_stash = engine.compute_rewards(rollout_results)
+
+            # 3. Extract segment hidden states
+            segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
+                rollout_results
+            )
+
+            # 4. Compute value targets
+            g_obs, g_traj = compute_value_targets(
+                segment_reward_stash=reward_stash,
+                completion_segment_map=completion_segment_map,
+                reward_weights=reward_weights,
+            )
+
+            # 5. Train value head on this batch
+            metrics = train_segment_value_head(
+                value_head=value_head,
+                optimizer=self._value_head_optimizer,
+                segment_hidden_stash=segment_hidden_stash,
+                g_obs_list=g_obs,
+                g_traj_list=g_traj,
+                num_epochs=num_epochs,
+                batch_size=vh_batch_size,
+                log_interval=vh_log_interval,
+                tb_writer=self._get_tb_writer(),
+                global_step_offset=self._vh_global_step,
+            )
+            self._vh_global_step += metrics.get("total_steps", 0)
+            last_loss = metrics.get("loss", float("nan"))
+
+            logger.info(
+                "Pretrain iter %d/%d done: loss=%.4f, completions=%d, vh_steps=%d",
+                i + 1,
+                num_iters,
+                last_loss,
+                len(rollout_results),
+                metrics.get("total_steps", 0),
+            )
+
+            # Free intermediate data to reduce memory pressure
+            del rollout_results, reward_stash, segment_hidden_stash
+            del completion_segment_map, g_obs, g_traj
+
+        # Save value head and pretrain clip IDs
         output_dir = Path(self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
         pretrain_dir = output_dir / "pretrained"
         pretrain_dir.mkdir(parents=True, exist_ok=True)
 
         torch.save(value_head.state_dict(), pretrain_dir / "value_head.pt")
+        with open(pretrain_dir / "clip_ids.json", "w") as f:
+            json.dump(pretrain_scenes, f)
+
         logger.info(
-            "Saved pretrained value head to %s (vh loss=%.4f)",
+            "Saved pretrained value head and %d clip IDs to %s (final loss=%.4f)",
+            len(pretrain_scenes),
             pretrain_dir,
-            metrics["loss"],
+            last_loss,
+        )
+
+        # Exclude pretrain scenes from self-play partitioning
+        self._pretrain_clip_ids = pretrain_scenes
+        partitioner_clip_ids = [
+            cid for cid in self.all_clip_ids if cid not in set(self._pretrain_clip_ids)
+        ]
+        self.partitioner = ScenePartitioner(
+            partitioner_clip_ids,
+            self.num_iterations,
+            seed=self.cfg.get("seed", 42),
         )
 
     def run_iteration(self, iteration: int) -> None:
@@ -686,7 +776,7 @@ class SelfPlayLoop:
             # 3. Train value head to convergence on rollout data
             reward_weights = self._get_reward_weights()
             value_head = self._get_or_create_value_head()
-            g_obs, g_coc, g_traj = compute_value_targets(
+            g_obs, g_traj = compute_value_targets(
                 segment_reward_stash=reward_stash,
                 completion_segment_map=completion_segment_map,
                 reward_weights=reward_weights,
@@ -699,7 +789,6 @@ class SelfPlayLoop:
                 optimizer=self._value_head_optimizer,
                 segment_hidden_stash=segment_hidden_stash,
                 g_obs_list=g_obs,
-                g_coc_list=g_coc,
                 g_traj_list=g_traj,
                 num_epochs=vh_train_epochs,
                 batch_size=vh_batch_size,
@@ -802,6 +891,9 @@ class SelfPlayLoop:
             # Reuse existing model; at iteration 0 the VLM is not a PeftModel
             # so merge_and_unload is a no-op (hasattr check is False).
             full_model = self.full_model
+            # Detach advantage embedding hooks before merge
+            if hasattr(self, "adv_embedding"):
+                self.adv_embedding.detach()
             if hasattr(full_model.vlm, "merge_and_unload"):
                 logger.info(
                     "Continuing from iteration %d checkpoint (merge previous LoRA)",
@@ -818,9 +910,6 @@ class SelfPlayLoop:
                 full_model.expert = full_model.expert.merge_and_unload()
                 logger.info("Merged previous expert LoRA weights into base model")
 
-        # Register advantage tokens and resize embeddings
-        register_advantage_tokens(self.processor.tokenizer)
-        full_model.vlm.resize_token_embeddings(len(self.processor.tokenizer))
         prepare_vlm_for_training(full_model)
 
         # Freeze non-VLM params
@@ -845,6 +934,13 @@ class SelfPlayLoop:
             full_model.vlm = get_peft_model(full_model.vlm, lora_config)
             full_model.vlm.enable_input_require_grads()
             logger.info("Applied LoRA: r=%d, alpha=%d", lora_config.r, lora_config.lora_alpha)
+
+        # Attach trainable advantage embedding to PeftModel
+        self.adv_embedding = self.adv_embedding.to(
+            dtype=next(full_model.vlm.parameters()).dtype
+        )
+        full_model.vlm.adv_embedding = self.adv_embedding  # visible to Trainer optimizer
+        self.adv_embedding.attach(full_model.vlm)
 
         # 3. Build training dataset (fresh + historical replay)
         train_dataset = self._build_training_dataset(rollout_results, adv_labels)

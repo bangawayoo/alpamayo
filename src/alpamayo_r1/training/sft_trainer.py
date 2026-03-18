@@ -575,3 +575,9 @@ class AdvCondSFTTrainer(Trainer):
             vh_path = Path(output_dir) / "value_head.pt"
             torch.save(self._value_head.state_dict(), vh_path)
             logger.info("Saved value head to %s", vh_path)
+
+        adv_embed = getattr(self.model, "adv_embedding", None)
+        if adv_embed is not None:
+            adv_embed_path = Path(output_dir) / "adv_embedding.pt"
+            torch.save(adv_embed.state_dict(), adv_embed_path)
+            logger.info("Saved advantage embedding to %s", adv_embed_path)

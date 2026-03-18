@@ -795,10 +795,10 @@ class TestSceneValueHead:
 
         vh = SceneValueHead(hidden_dim=32)
         # MLP: Layer 1: 32*512 + 512 = 16896, Layer 2: 512*128 + 128 = 65664, Layer 3: 128*1 + 1 = 129
-        # Level embedding: 3 * 32 = 96
+        # Level embedding: 2 * 32 = 64
         total_params = sum(p.numel() for p in vh.parameters())
         mlp_params = (32 * 512 + 512) + (512 * 128 + 128) + (128 * 1 + 1)
-        level_embed_params = 3 * 32
+        level_embed_params = 2 * 32
         expected = mlp_params + level_embed_params
         assert total_params == expected, f"Expected {expected} params, got {total_params}"
 
@@ -925,149 +925,6 @@ class TestValueHeadStage0:
 
 
 # ===================================================================
-# Monte Carlo value target tests
-# ===================================================================
-
-
-class TestMonteCarloValueTarget:
-    """Tests for the Monte Carlo aggregation of value head targets.
-
-    The pending buffer + flush pattern collects G per-rollout rewards for
-    each scene and produces a single (h0, V_mc) pair where V_mc = mean(rewards).
-    """
-
-    def _make_pending_state(self):
-        """Create a minimal namespace that mimics the trainer's pending state."""
-        from collections import deque
-
-        import torch
-
-        class FakeTrainer:
-            pass
-
-        # Import the flush method and bind it
-        from alpamayo_r1.training.rollout import AlpamayoGRPOTrainer
-
-        trainer = FakeTrainer()
-        trainer._value_pending_groups = deque()
-        trainer._value_pending_rewards = []
-        trainer._value_h0_stash = []
-        trainer._value_targets_stash = []
-        trainer._flush_value_pending = AlpamayoGRPOTrainer._flush_value_pending.__get__(trainer)
-        return trainer
-
-    def test_mc_aggregation(self):
-        """G=4 rewards for one scene → 1 stashed pair with mean reward."""
-        import torch
-
-        trainer = self._make_pending_state()
-        h0 = torch.randn(1, 32)
-        trainer._value_pending_groups.append((h0, 4))
-        trainer._value_pending_rewards = [0.2, 0.4, 0.6, 0.8]
-
-        trainer._flush_value_pending()
-
-        assert len(trainer._value_h0_stash) == 1
-        assert len(trainer._value_targets_stash) == 1
-        assert trainer._value_targets_stash[0] == pytest.approx(0.5)
-        assert torch.equal(trainer._value_h0_stash[0], h0)
-        # Pending state should be reset
-        assert len(trainer._value_pending_groups) == 0
-        assert trainer._value_pending_rewards == []
-
-    def test_mc_multiple_scenes(self):
-        """Two scenes with different G sizes → 2 stashed pairs."""
-        import torch
-
-        trainer = self._make_pending_state()
-
-        # Scene 1: G=2, Scene 2: G=3 — both queued before rewards arrive
-        trainer._value_pending_groups.append((torch.ones(1, 32), 2))
-        trainer._value_pending_groups.append((torch.zeros(1, 32), 3))
-        trainer._value_pending_rewards = [0.3, 0.7, 0.1, 0.2, 0.3]
-
-        trainer._flush_value_pending()
-
-        assert len(trainer._value_h0_stash) == 2
-        assert len(trainer._value_targets_stash) == 2
-        assert trainer._value_targets_stash[0] == pytest.approx(0.5)
-        assert trainer._value_targets_stash[1] == pytest.approx(0.2)
-
-    def test_partial_group_not_flushed(self):
-        """Fewer than G rewards → nothing flushed to the ready stash."""
-        import torch
-
-        trainer = self._make_pending_state()
-        trainer._value_pending_groups.append((torch.randn(1, 32), 4))
-        trainer._value_pending_rewards = [0.1, 0.2]  # only 2 of 4
-
-        trainer._flush_value_pending()
-
-        assert len(trainer._value_h0_stash) == 0
-        assert len(trainer._value_targets_stash) == 0
-        # Pending state should be unchanged
-        assert len(trainer._value_pending_groups) == 1
-        assert len(trainer._value_pending_rewards) == 2
-
-    def test_no_pending_groups_noop(self):
-        """No pending groups → flush is a no-op."""
-        trainer = self._make_pending_state()
-        trainer._value_pending_rewards = [0.5]
-
-        trainer._flush_value_pending()
-
-        assert len(trainer._value_h0_stash) == 0
-        assert len(trainer._value_targets_stash) == 0
-
-    def test_single_rollout_per_scene(self):
-        """G=1 → V_mc equals the single reward (no special-casing needed)."""
-        import torch
-
-        trainer = self._make_pending_state()
-        trainer._value_pending_groups.append((torch.randn(1, 32), 1))
-        trainer._value_pending_rewards = [0.42]
-
-        trainer._flush_value_pending()
-
-        assert len(trainer._value_targets_stash) == 1
-        assert trainer._value_targets_stash[0] == pytest.approx(0.42)
-
-    def test_multi_scene_batch_interleaved(self):
-        """Simulates multi-scene batch: 2 scenes queued, rewards arrive together.
-
-        This is the critical case where per_device_batch_size > 1, so
-        _generate_single_turn queues multiple (h0, G) pairs before
-        _calculate_rewards is called once with all rewards.
-        """
-        import torch
-
-        trainer = self._make_pending_state()
-
-        # Generation phase: 2 scenes, G=4 each → 8 completions total
-        h0_a = torch.ones(1, 32)
-        h0_b = torch.zeros(1, 32)
-        trainer._value_pending_groups.append((h0_a, 4))
-        trainer._value_pending_groups.append((h0_b, 4))
-
-        # Reward phase: all 8 rewards arrive at once
-        # Scene A: rewards [0.1, 0.2, 0.3, 0.4] → mean = 0.25
-        # Scene B: rewards [0.5, 0.6, 0.7, 0.8] → mean = 0.65
-        trainer._value_pending_rewards = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
-
-        trainer._flush_value_pending()
-
-        assert len(trainer._value_h0_stash) == 2
-        assert len(trainer._value_targets_stash) == 2
-        assert torch.equal(trainer._value_h0_stash[0], h0_a)
-        assert torch.equal(trainer._value_h0_stash[1], h0_b)
-        assert trainer._value_targets_stash[0] == pytest.approx(0.25)
-        assert trainer._value_targets_stash[1] == pytest.approx(0.65)
-        # Queue fully drained
-        assert len(trainer._value_pending_groups) == 0
-        assert len(trainer._value_pending_rewards) == 0
-
-
-# ===================================================================
 # SegmentValueHead tests (level embedding + 3D input)
 # ===================================================================
 
@@ -1079,8 +936,8 @@ class TestSegmentValueHead:
         """Level embedding should have (num_levels, hidden_dim) shape."""
         from alpamayo_r1.training.value_head import SegmentValueHead
 
-        vh = SegmentValueHead(hidden_dim=64, num_levels=3)
-        assert vh.level_embed.weight.shape == (3, 64)
+        vh = SegmentValueHead(hidden_dim=64, num_levels=2)
+        assert vh.level_embed.weight.shape == (2, 64)
 
     def test_level_changes_output(self):
         """Different levels should produce different values for the same input."""
@@ -1091,9 +948,8 @@ class TestSegmentValueHead:
         h = torch.randn(2, 32)
         v0 = vh(h, level=0)
         v1 = vh(h, level=1)
-        v2 = vh(h, level=2)
         # At init with random weights, different level embeddings should give different outputs
-        assert not torch.allclose(v0, v1, atol=1e-6) or not torch.allclose(v1, v2, atol=1e-6)
+        assert not torch.allclose(v0, v1, atol=1e-6)
 
     def test_3d_input_shape(self):
         """SegmentValueHead should accept (B, T, D) input and return (B, T)."""
@@ -1102,7 +958,7 @@ class TestSegmentValueHead:
 
         vh = SegmentValueHead(hidden_dim=32)
         h = torch.randn(2, 10, 32)  # batch=2, seq_len=10
-        v = vh(h, level=2)
+        v = vh(h, level=1)
         assert v.shape == (2, 10), f"Expected (2, 10), got {v.shape}"
 
     def test_2d_input_shape(self):
@@ -1142,10 +998,9 @@ class TestSegmentValueHead:
         loss = v.sum()
         loss.backward()
         assert vh.level_embed.weight.grad is not None
-        # Only level 1 row should have non-zero gradients
+        # Only level 1 (traj) row should have non-zero gradients
         assert vh.level_embed.weight.grad[1].abs().sum() > 0
         assert vh.level_embed.weight.grad[0].abs().sum() == 0
-        assert vh.level_embed.weight.grad[2].abs().sum() == 0
 
 
 # ===================================================================
