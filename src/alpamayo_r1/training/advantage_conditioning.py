@@ -406,7 +406,6 @@ def train_segment_value_head(
     g_traj_list: list[torch.Tensor],
     num_epochs: int = 10,
     batch_size: int = 64,
-    max_traj_samples_per_completion: int = 8,
     log_interval: int = 10,
     tb_writer: Any | None = None,
     global_step_offset: int = 0,
@@ -418,6 +417,11 @@ def train_segment_value_head(
     processed per-completion within each mini-batch (variable-length sequences
     cannot be stacked without padding).
 
+    Both obs and traj losses are per-completion averages: obs uses MSE over
+    the batch, traj computes per-completion MSE across all curvature timesteps
+    and then averages across completions. This keeps the two loss terms at
+    comparable scales.
+
     Args:
         value_head: SegmentValueHead instance.
         optimizer: Optimizer for the value head parameters.
@@ -426,8 +430,6 @@ def train_segment_value_head(
         g_traj_list: Per-completion G(s_traj_j) tensors.
         num_epochs: Number of training epochs over the data.
         batch_size: Mini-batch size (default 64).
-        max_traj_samples_per_completion: Sub-sample trajectory tokens to prevent
-            them from dominating the loss.
         log_interval: Log to display every N steps (default 10).
         tb_writer: Optional TensorBoard SummaryWriter for scalar logging.
         global_step_offset: Starting global step for TensorBoard (allows
@@ -465,15 +467,15 @@ def train_segment_value_head(
             obs_pred = value_head(h_obs_batch, level=SegmentValueHead.LEVEL_OBS)
             loss_obs = F.mse_loss(obs_pred, g_obs_batch)
 
-            # --- Traj-level loss (sub-sampled at curvature positions) ---
+            # --- Traj-level loss (all curvature positions) ---
             # Trajectory tokens come in (acceleration, curvature) pairs per timestep.
             # We evaluate V only at curvature positions (idx % 2 == 1) because:
             # (1) the curvature token has seen both components of the timestep,
             # (2) rewards are per-timestep, so the value function is naturally
             #     timestep-level rather than token-level.
-            # Variable-length sequences require per-completion processing.
-            traj_preds = []
-            traj_targets = []
+            # Per-completion MSE is averaged across completions so that each
+            # completion contributes equally regardless of trajectory length.
+            traj_losses = []
             for i_local in idx.tolist():
                 h_traj = segment_hidden_stash[i_local]["h_traj"]
                 g_traj = g_traj_list[i_local]
@@ -481,25 +483,16 @@ def train_segment_value_head(
                     continue
                 T_t = h_traj.shape[0]
                 curvature_idx = torch.arange(1, T_t, 2)
-                n_timesteps = len(curvature_idx)
-                n_keep = min(n_timesteps, max_traj_samples_per_completion)
-                if n_keep < n_timesteps:
-                    sel = curvature_idx[torch.randperm(n_timesteps)[:n_keep]]
-                else:
-                    sel = curvature_idx
-                h_sub = h_traj[sel].to(vh_device)
-                g_sub = g_traj[sel].to(vh_device)
-                traj_pos = (sel // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0).to(vh_device)
+                h_sub = h_traj[curvature_idx].to(vh_device)
+                g_sub = g_traj[curvature_idx].to(vh_device)
+                traj_pos = (curvature_idx // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0).to(vh_device)
                 v = value_head(
                     h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos
                 ).squeeze(0)
-                traj_preds.append(v)
-                traj_targets.append(g_sub)
+                traj_losses.append(F.mse_loss(v, g_sub))
 
-            if traj_preds:
-                traj_pred_t = torch.cat(traj_preds)
-                traj_target_t = torch.cat(traj_targets)
-                loss_traj = F.mse_loss(traj_pred_t, traj_target_t)
+            if traj_losses:
+                loss_traj = torch.stack(traj_losses).mean()
             else:
                 loss_traj = torch.tensor(0.0, device=vh_device)
 
