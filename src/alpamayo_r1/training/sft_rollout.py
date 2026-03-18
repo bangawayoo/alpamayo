@@ -79,6 +79,7 @@ class RolloutEngine:
         self.expert_diffusion_steps = int(rollout_cfg.get("expert_diffusion_steps", 10))
         self.expert_non_causal = bool(rollout_cfg.get("expert_non_causal", True))
         self.use_adv_conditioning = bool(rollout_cfg.get("use_adv_conditioning", False))
+        self.scene_batch_size = int(rollout_cfg.get("scene_batch_size", 1))
 
         # Model constants
         self.traj_token_start_idx = full_model.future_token_start_idx
@@ -136,12 +137,14 @@ class RolloutEngine:
                 len(clip_ids),
             )
 
-        # Dispatch per-scene generation method based on mode
+        # Dispatch generation method based on mode
         use_expert = self.mode == "expert"
-        generate_fn = (
+        single_fn = (
             self._generate_for_scene_expert if use_expert else self._generate_for_scene_vlm_only
         )
-        logger.info("Rollout mode: %s", self.mode)
+        batch_fn = self._generate_batch_expert if use_expert else self._generate_batch_vlm_only
+        S = self.scene_batch_size
+        logger.info("Rollout mode: %s, scene_batch_size: %d", self.mode, S)
 
         # Ensure VLM is on the target device for generation
         self.full_model.vlm.to(device)
@@ -152,27 +155,36 @@ class RolloutEngine:
         if use_expert:
             self._move_expert_to_device(device)
 
-        # Pre-fetch first scene so it's ready when the loop starts
-        if local_clip_ids:
-            self.data_cache.prefetch(local_clip_ids[0], t0_us)
+        # Pre-fetch first chunk so it's ready when the loop starts
+        for cid in local_clip_ids[:S]:
+            self.data_cache.prefetch(cid, t0_us)
 
         rollout_start = time.time()
         with torch.no_grad():
-            for scene_idx, clip_id in enumerate(local_clip_ids):
-                # Kick off prefetch for the next scene while this one generates
-                if scene_idx + 1 < n_local:
-                    self.data_cache.prefetch(local_clip_ids[scene_idx + 1], t0_us)
-                if scene_idx % max(1, n_local // 10) == 0 or scene_idx == n_local - 1:
+            for chunk_start in range(0, n_local, S):
+                chunk_ids = local_clip_ids[chunk_start : chunk_start + S]
+                chunk_end = chunk_start + len(chunk_ids)
+
+                # Prefetch next chunk
+                for cid in local_clip_ids[chunk_end : chunk_end + S]:
+                    self.data_cache.prefetch(cid, t0_us)
+
+                # Progress logging at chunk boundaries
+                if chunk_start % max(1, (n_local // 10) * S) == 0 or chunk_end >= n_local:
                     elapsed = time.time() - rollout_start
-                    mem_alloc = torch.cuda.memory_allocated(device) / 1e9 if device.type == "cuda" else 0
-                    mem_reserved = torch.cuda.memory_reserved(device) / 1e9 if device.type == "cuda" else 0
-                    scenes_per_sec = (scene_idx + 1) / max(elapsed, 0.001)
-                    eta = (n_local - scene_idx - 1) / max(scenes_per_sec, 0.001)
+                    mem_alloc = (
+                        torch.cuda.memory_allocated(device) / 1e9 if device.type == "cuda" else 0
+                    )
+                    mem_reserved = (
+                        torch.cuda.memory_reserved(device) / 1e9 if device.type == "cuda" else 0
+                    )
+                    scenes_per_sec = chunk_end / max(elapsed, 0.001)
+                    eta = (n_local - chunk_end) / max(scenes_per_sec, 0.001)
                     logger.info(
                         "[Rank %d] Rollout progress: %d/%d scenes (%d completions, %d failed) "
                         "| %.1fs elapsed, ETA %.0fs | GPU mem: %.1f/%.1f GB",
                         rank,
-                        scene_idx + 1,
+                        chunk_end,
                         n_local,
                         len(results),
                         n_failed,
@@ -181,27 +193,54 @@ class RolloutEngine:
                         mem_alloc,
                         mem_reserved,
                     )
+
                 try:
-                    scene_start = time.time()
-                    scene_results = generate_fn(
-                        clip_id,
-                        t0_us,
-                        G,
-                        device,
-                        traj_future_end_id,
-                        traj_future_start_id,
-                    )
-                    results.extend(scene_results)
+                    chunk_start_time = time.time()
+                    if len(chunk_ids) > 1:
+                        chunk_results = batch_fn(
+                            chunk_ids,
+                            t0_us,
+                            G,
+                            device,
+                            traj_future_end_id,
+                            traj_future_start_id,
+                        )
+                    else:
+                        chunk_results = single_fn(
+                            chunk_ids[0],
+                            t0_us,
+                            G,
+                            device,
+                            traj_future_end_id,
+                            traj_future_start_id,
+                        )
+                    results.extend(chunk_results)
                     logger.debug(
-                        "Scene %s: %d completions in %.2fs",
-                        clip_id,
-                        len(scene_results),
-                        time.time() - scene_start,
+                        "Chunk %s: %d completions in %.2fs",
+                        chunk_ids,
+                        len(chunk_results),
+                        time.time() - chunk_start_time,
                     )
                 except Exception as e:
-                    n_failed += 1
-                    logger.warning("Generation failed for %s: %s", clip_id, e)
-                    continue
+                    logger.warning(
+                        "Batch generation failed for %d scenes, falling back to per-scene: %s",
+                        len(chunk_ids),
+                        e,
+                    )
+                    for clip_id in chunk_ids:
+                        try:
+                            scene_results = single_fn(
+                                clip_id,
+                                t0_us,
+                                G,
+                                device,
+                                traj_future_end_id,
+                                traj_future_start_id,
+                            )
+                            results.extend(scene_results)
+                        except Exception as e2:
+                            n_failed += 1
+                            logger.warning("Generation failed for %s: %s", clip_id, e2)
 
         if use_expert:
             self._move_expert_to_cpu()
@@ -461,9 +500,7 @@ class RolloutEngine:
 
         # Disable gradient checkpointing for all teacher-forced forwards + adv injection
         vlm = self.full_model.vlm
-        gc_modules = [
-            m for m in vlm.modules() if getattr(m, "gradient_checkpointing", False)
-        ]
+        gc_modules = [m for m in vlm.modules() if getattr(m, "gradient_checkpointing", False)]
         for m in gc_modules:
             m.gradient_checkpointing = False
 
@@ -487,9 +524,7 @@ class RolloutEngine:
                     continue
 
                 coc_tokens = raw_completion[:traj_start_pos]
-                coc_text = self.tokenizer.decode(
-                    coc_tokens, skip_special_tokens=True
-                ).strip()
+                coc_text = self.tokenizer.decode(coc_tokens, skip_special_tokens=True).strip()
                 completion_prefix_ids = coc_tokens + [traj_future_start_id]
 
                 # ---- Teacher-forced VLM forward to reconstruct KV cache ----
@@ -532,9 +567,7 @@ class RolloutEngine:
                 # ---- Inject <adv_traj_pos> into KV cache (optional) ----
                 if self.use_adv_conditioning and "adv_traj_pos" in self.adv_token_ids:
                     adv_traj_id = self.adv_token_ids["adv_traj_pos"]
-                    adv_tensor = torch.tensor(
-                        [[adv_traj_id]], device=device, dtype=torch.long
-                    )
+                    adv_tensor = torch.tensor([[adv_traj_id]], device=device, dtype=torch.long)
                     with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
                         adv_out = vlm(
                             input_ids=adv_tensor,
@@ -552,9 +585,7 @@ class RolloutEngine:
                 # ---- Build expert position_ids and attention_mask ----
                 t_diff = time.time()
                 position_ids = torch.arange(n_diffusion_tokens, device=device)
-                position_ids = einops.repeat(
-                    position_ids, "l -> 3 b l", b=b_star
-                ).clone()
+                position_ids = einops.repeat(position_ids, "l -> 3 b l", b=b_star).clone()
                 delta = rope_deltas + offset[:, None]
                 position_ids += delta.to(position_ids.device)
 
@@ -577,9 +608,7 @@ class RolloutEngine:
                     b = x.shape[0]
                     future_token_embeds = self.action_in_proj(x, t)
                     if future_token_embeds.dim() == 2:
-                        future_token_embeds = future_token_embeds.view(
-                            b, n_diffusion_tokens, -1
-                        )
+                        future_token_embeds = future_token_embeds.view(b, n_diffusion_tokens, -1)
                     expert_out = self.expert(
                         inputs_embeds=future_token_embeds,
                         position_ids=position_ids,
@@ -615,20 +644,13 @@ class RolloutEngine:
                 pred_xyz, pred_rot = self.action_space.action_to_traj(
                     sampled_action, hist_xyz, hist_rot
                 )
-                discrete_tokens = self.traj_tokenizer.encode(
-                    hist_xyz, hist_rot, pred_xyz, pred_rot
-                )
+                discrete_tokens = self.traj_tokenizer.encode(hist_xyz, hist_rot, pred_xyz, pred_rot)
                 discrete_tokens = discrete_tokens.clamp(0, self.traj_vocab_size - 1)
-                traj_token_ids = (
-                    (discrete_tokens + self.traj_token_start_idx).squeeze(0).tolist()
-                )
+                traj_token_ids = (discrete_tokens + self.traj_token_start_idx).squeeze(0).tolist()
 
                 # ---- Build completion_ids and result dict ----
                 completion_ids = (
-                    coc_tokens
-                    + [traj_future_start_id]
-                    + traj_token_ids
-                    + [traj_future_end_id]
+                    coc_tokens + [traj_future_start_id] + traj_token_ids + [traj_future_end_id]
                 )
 
                 pred_traj = pred_xyz[0].cpu().numpy().flatten().tolist()
@@ -687,6 +709,652 @@ class RolloutEngine:
         self.action_in_proj.cpu()
         self.action_out_proj.cpu()
         self.action_space.cpu()
+
+    # ------------------------------------------------------------------
+    # Batched generation methods (scene_batch_size > 1)
+    # ------------------------------------------------------------------
+
+    def _prepare_scene_batch(
+        self,
+        clip_ids: list[str],
+        t0_us: int,
+        device: torch.device,
+    ) -> tuple[dict, list[dict]]:
+        """Load S scenes, pad/stack inputs into batched tensors.
+
+        Returns:
+            batched_inputs: {input_ids, attention_mask, pixel_values, image_grid_thw}
+            per_scene_meta: list of per-scene metadata dicts
+        """
+        scenes = []
+        for clip_id in clip_ids:
+            model_inputs, ego_future_xyz = self.data_cache.get(clip_id, t0_us, device)
+            tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
+            input_ids = tokenized.pop("input_ids")  # (1, L_s)
+            traj_data = {
+                "ego_history_xyz": model_inputs["ego_history_xyz"],
+                "ego_history_rot": model_inputs["ego_history_rot"],
+            }
+            input_ids = self.full_model.fuse_traj_tokens(input_ids, traj_data)
+            scenes.append(
+                {
+                    "input_ids": input_ids,
+                    "tokenized": tokenized,
+                    "ego_future_xyz": ego_future_xyz,
+                    "hist_xyz": model_inputs["ego_history_xyz"][:, -1],  # (1, T, 3)
+                    "hist_rot": model_inputs["ego_history_rot"][:, -1],  # (1, T, 3, 3)
+                    "clip_id": clip_id,
+                }
+            )
+
+        S = len(scenes)
+        prompt_lens = [s["input_ids"].shape[1] for s in scenes]
+        max_prompt_len = max(prompt_lens)
+
+        # Left-pad input_ids and attention_mask to max_prompt_len
+        padded_input_ids = torch.full(
+            (S, max_prompt_len),
+            self.pad_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        padded_attention_mask = torch.zeros(
+            S,
+            max_prompt_len,
+            dtype=torch.long,
+            device=device,
+        )
+        for i, (scene, plen) in enumerate(zip(scenes, prompt_lens)):
+            offset = max_prompt_len - plen
+            padded_input_ids[i, offset:] = scene["input_ids"][0]
+            if "attention_mask" in scene["tokenized"]:
+                padded_attention_mask[i, offset:] = scene["tokenized"]["attention_mask"][0]
+            else:
+                padded_attention_mask[i, offset:] = 1
+
+        batched_inputs: dict[str, torch.Tensor] = {
+            "input_ids": padded_input_ids,
+            "attention_mask": padded_attention_mask,
+        }
+
+        # Concatenate pixel_values and image_grid_thw across scenes
+        # Qwen3-VL format: pixel_values (N_patches, C), image_grid_thw (N_images, 3)
+        pv_list = [s["tokenized"].get("pixel_values") for s in scenes]
+        igt_list = [s["tokenized"].get("image_grid_thw") for s in scenes]
+
+        if all(pv is not None for pv in pv_list):
+            batched_inputs["pixel_values"] = torch.cat(pv_list, dim=0)
+        if all(igt is not None for igt in igt_list):
+            batched_inputs["image_grid_thw"] = torch.cat(igt_list, dim=0)
+
+        per_scene_meta = []
+        for i, scene in enumerate(scenes):
+            gt_traj = scene["ego_future_xyz"][0, 0].numpy().flatten().tolist()
+            per_scene_meta.append(
+                {
+                    "prompt_len": prompt_lens[i],
+                    "prompt_ids": scene["input_ids"][0].cpu().tolist(),
+                    "gt_xyz": gt_traj,
+                    "clip_id": scene["clip_id"],
+                    "hist_xyz": scene["hist_xyz"],  # (1, T, 3) on device
+                    "hist_rot": scene["hist_rot"],  # (1, T, 3, 3) on device
+                    "pixel_values": pv_list[i],
+                    "image_grid_thw": igt_list[i],
+                }
+            )
+
+        return batched_inputs, per_scene_meta
+
+    def _expand_for_generation(
+        self,
+        batched_inputs: dict[str, torch.Tensor],
+        per_scene_meta: list[dict],
+        G: int,
+    ) -> dict[str, torch.Tensor]:
+        """Expand S-scene batch to S*G for generate() with num_return_sequences=1.
+
+        HF's internal expansion via repeat_interleave on concatenated pixel_values
+        interleaves individual patch *rows* G times rather than repeating each
+        scene's *block* of patches G times — producing garbled vision embeddings
+        for multi-scene batches. We expand manually to avoid this.
+
+        Output ordering: [s0_g0, s0_g1, ..., s0_gG-1, s1_g0, ...] matching
+        the order HF would produce with num_return_sequences=G.
+        """
+        expanded: dict[str, torch.Tensor] = {}
+
+        # input_ids / attention_mask: standard repeat_interleave along batch dim
+        expanded["input_ids"] = batched_inputs["input_ids"].repeat_interleave(G, dim=0)
+        expanded["attention_mask"] = batched_inputs["attention_mask"].repeat_interleave(G, dim=0)
+
+        # pixel_values: repeat each scene's patch block G times (not interleave rows)
+        if "pixel_values" in batched_inputs:
+            pv_parts = []
+            for meta in per_scene_meta:
+                pv = meta["pixel_values"]
+                if pv is not None:
+                    # pv shape: (N_patches, C) — repeat gives G copies of the full block
+                    pv_parts.append(pv.repeat(G, *([1] * (pv.dim() - 1))))
+            if pv_parts:
+                expanded["pixel_values"] = torch.cat(pv_parts, dim=0)
+
+        # image_grid_thw: repeat each scene's grid entries G times
+        if "image_grid_thw" in batched_inputs:
+            igt_parts = []
+            for meta in per_scene_meta:
+                igt = meta["image_grid_thw"]
+                if igt is not None:
+                    igt_parts.append(igt.repeat(G, 1))
+            if igt_parts:
+                expanded["image_grid_thw"] = torch.cat(igt_parts, dim=0)
+
+        return expanded
+
+    def _generate_batch_vlm_only(
+        self,
+        clip_ids: list[str],
+        t0_us: int,
+        G: int,
+        device: torch.device,
+        traj_future_end_id: int,
+        traj_future_start_id: int,
+    ) -> list[dict]:
+        """Generate G completions for S scenes using batched VLM-only rollout."""
+        S = len(clip_ids)
+        timings: dict[str, float] = {}
+
+        # 1. Prepare batched inputs
+        t_ = time.time()
+        batched_inputs, per_scene_meta = self._prepare_scene_batch(clip_ids, t0_us, device)
+        max_prompt_len = batched_inputs["input_ids"].shape[1]
+        timings["prepare_batch"] = time.time() - t_
+
+        # 2. Batched VLM generation: S scenes × G completions
+        # Manually expand to S*G with num_return_sequences=1 to avoid HF's
+        # repeat_interleave garbling concatenated pixel_values across scenes.
+        t_ = time.time()
+        expanded = self._expand_for_generation(batched_inputs, per_scene_meta, G)
+        gen_config = GenerationConfig(
+            do_sample=True,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            num_return_sequences=1,
+            max_new_tokens=self.max_generation_length + self.tokens_per_future_traj + 10,
+            pad_token_id=self.pad_token_id,
+        )
+        stopping = StoppingCriteriaList([StopAfterEOS(eos_token_id=traj_future_end_id)])
+
+        gen_kwargs = {
+            k: expanded[k]
+            for k in ("attention_mask", "pixel_values", "image_grid_thw")
+            if k in expanded
+        }
+        with torch.autocast(str(device), dtype=torch.bfloat16):
+            vlm_output = self.full_model.vlm.generate(
+                input_ids=expanded["input_ids"],
+                generation_config=gen_config,
+                stopping_criteria=stopping,
+                **gen_kwargs,
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        timings["vlm_generate"] = time.time() - t_
+
+        # vlm_output: (S*G, max_seq_len). Generated tokens start at max_prompt_len.
+        generated_seqs = vlm_output[:, max_prompt_len:]
+
+        # 3. Batched trajectory extraction and decoding
+        t_ = time.time()
+        traj_tokens = extract_traj_tokens(
+            vlm_output,
+            self.special_token_ids,
+            self.tokens_per_future_traj,
+            self.traj_token_start_idx,
+            self.traj_vocab_size,
+        )
+
+        # Build batched hist_xyz/hist_rot: each scene's history repeated G times
+        hist_xyz_list = []
+        hist_rot_list = []
+        for meta in per_scene_meta:
+            hist_xyz_list.append(meta["hist_xyz"].expand(G, -1, -1))  # (G, T, 3)
+            hist_rot_list.append(meta["hist_rot"].expand(G, -1, -1, -1))  # (G, T, 3, 3)
+        hist_xyz_batch = torch.cat(hist_xyz_list, dim=0)  # (S*G, T, 3)
+        hist_rot_batch = torch.cat(hist_rot_list, dim=0)  # (S*G, T, 3, 3)
+
+        with torch.no_grad():
+            pred_xyz_tensor, pred_rot_tensor, _ = self.traj_tokenizer.decode(
+                hist_xyz_batch,
+                hist_rot_batch,
+                traj_tokens,
+            )
+        timings["traj_decode"] = time.time() - t_
+
+        # 4. Build per-completion result dicts
+        t_ = time.time()
+        results = []
+        for s_idx, meta in enumerate(per_scene_meta):
+            for g_idx in range(G):
+                flat_idx = s_idx * G + g_idx
+                raw_completion = generated_seqs[flat_idx].cpu().tolist()
+
+                # Trim to traj_future_end
+                completion_ids: list[int] = []
+                for tid in raw_completion:
+                    completion_ids.append(tid)
+                    if tid == traj_future_end_id:
+                        break
+                if traj_future_end_id not in completion_ids:
+                    while completion_ids and completion_ids[-1] == self.pad_token_id:
+                        completion_ids.pop()
+                if not completion_ids:
+                    completion_ids = [self.processor.tokenizer.eos_token_id]
+
+                # Extract CoC text
+                try:
+                    traj_start_pos = raw_completion.index(traj_future_start_id)
+                except ValueError:
+                    traj_start_pos = len(raw_completion)
+                coc_text = self.tokenizer.decode(
+                    raw_completion[:traj_start_pos],
+                    skip_special_tokens=True,
+                ).strip()
+
+                # Completion prefix for expert KV cache
+                try:
+                    prefix_end = raw_completion.index(traj_future_start_id) + 1
+                except ValueError:
+                    prefix_end = len(raw_completion)
+
+                pred_traj = pred_xyz_tensor[flat_idx].cpu().numpy().flatten().tolist()
+
+                results.append(
+                    {
+                        "prompt_ids": meta["prompt_ids"],
+                        "completion_ids": completion_ids,
+                        "pred_xyz": pred_traj,
+                        "gt_xyz": meta["gt_xyz"],
+                        "coc_text": coc_text,
+                        "clip_id": meta["clip_id"],
+                        "t0_us": t0_us,
+                        "completion_prefix": raw_completion[:prefix_end],
+                        "hist_xyz": meta["hist_xyz"][0].cpu(),
+                        "hist_rot": meta["hist_rot"][0].cpu(),
+                    }
+                )
+        timings["postprocess"] = time.time() - t_
+
+        logger.info(
+            "[vlm_only_batch] S=%d, G=%d (%d results) timings: %s | total=%.2fs",
+            S,
+            G,
+            len(results),
+            ", ".join(f"{k}={v:.3f}s" for k, v in timings.items()),
+            sum(timings.values()),
+        )
+        return results
+
+    def _generate_batch_expert(
+        self,
+        clip_ids: list[str],
+        t0_us: int,
+        G: int,
+        device: torch.device,
+        traj_future_end_id: int,
+        traj_future_start_id: int,
+    ) -> list[dict]:
+        """Generate G completions for S scenes using batched expert pipeline.
+
+        Phases:
+        1. Batched VLM CoC generation (S scenes × G completions)
+        2. Batched teacher-forced VLM forward (valid completions only)
+        3. Batched expert diffusion sampling
+        4. Batched trajectory encoding
+        """
+        S = len(clip_ids)
+        timings: dict[str, float] = {}
+
+        # Phase 1a: Prepare batched inputs
+        t_ = time.time()
+        batched_inputs, per_scene_meta = self._prepare_scene_batch(clip_ids, t0_us, device)
+        max_prompt_len = batched_inputs["input_ids"].shape[1]
+
+        # Optionally append <adv_obs_pos> to input_ids
+        if self.use_adv_conditioning and "adv_obs_pos" in self.adv_token_ids:
+            adv_obs_id = self.adv_token_ids["adv_obs_pos"]
+            adv_col = torch.full(
+                (S, 1),
+                adv_obs_id,
+                device=device,
+                dtype=batched_inputs["input_ids"].dtype,
+            )
+            batched_inputs["input_ids"] = torch.cat(
+                [batched_inputs["input_ids"], adv_col],
+                dim=1,
+            )
+            adv_mask = torch.ones(S, 1, device=device, dtype=torch.long)
+            batched_inputs["attention_mask"] = torch.cat(
+                [batched_inputs["attention_mask"], adv_mask],
+                dim=1,
+            )
+            max_prompt_len = batched_inputs["input_ids"].shape[1]
+
+        timings["prepare_batch"] = time.time() - t_
+
+        # Phase 1b: Batched VLM CoC generation
+        # Manually expand to S*G with num_return_sequences=1 to avoid HF's
+        # repeat_interleave garbling concatenated pixel_values across scenes.
+        t_ = time.time()
+        expanded = self._expand_for_generation(batched_inputs, per_scene_meta, G)
+        gen_config = GenerationConfig(
+            do_sample=True,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            num_return_sequences=1,
+            max_new_tokens=self.max_generation_length + 10,
+            pad_token_id=self.pad_token_id,
+        )
+        logits_processor = LogitsProcessorList(
+            [
+                ExpertLogitsProcessor(
+                    traj_token_offset=self.traj_token_start_idx,
+                    traj_vocab_size=self.traj_vocab_size,
+                )
+            ]
+        )
+        stopping = StoppingCriteriaList([StopAfterEOS(eos_token_id=traj_future_start_id)])
+
+        gen_kwargs = {
+            k: expanded[k]
+            for k in ("attention_mask", "pixel_values", "image_grid_thw")
+            if k in expanded
+        }
+        with torch.autocast(str(device), dtype=torch.bfloat16):
+            vlm_output = self.full_model.vlm.generate(
+                input_ids=expanded["input_ids"],
+                generation_config=gen_config,
+                stopping_criteria=stopping,
+                logits_processor=logits_processor,
+                **gen_kwargs,
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        generated_seqs = vlm_output[:, max_prompt_len:]
+        timings["vlm_coc_generate"] = time.time() - t_
+
+        # Parse completions and filter to valid ones (those with <traj_future_start>)
+        valid_items: list[dict] = []
+        for s_idx in range(S):
+            meta = per_scene_meta[s_idx]
+            for g_idx in range(G):
+                flat_idx = s_idx * G + g_idx
+                raw = generated_seqs[flat_idx].cpu().tolist()
+                while raw and raw[-1] == self.pad_token_id:
+                    raw.pop()
+                try:
+                    traj_pos = raw.index(traj_future_start_id)
+                except ValueError:
+                    logger.warning(
+                        "No <traj_future_start> in batch output for %s sample %d, skipping",
+                        meta["clip_id"],
+                        g_idx,
+                    )
+                    continue
+                coc_tokens = raw[:traj_pos]
+                valid_items.append(
+                    {
+                        "scene_idx": s_idx,
+                        "coc_tokens": coc_tokens,
+                        "coc_prefix": coc_tokens + [traj_future_start_id],
+                        "coc_text": self.tokenizer.decode(
+                            coc_tokens,
+                            skip_special_tokens=True,
+                        ).strip(),
+                    }
+                )
+
+        if not valid_items:
+            logger.warning("No valid completions in batch of %d scenes", S)
+            return []
+
+        n_valid = len(valid_items)
+
+        # Phase 2: Batched teacher-forced VLM forward
+        t_ = time.time()
+        n_diffusion_tokens = self.action_space.get_action_space_dims()[0]  # 64
+        vlm = self.full_model.vlm
+
+        # Build right-padded full sequences for each valid completion
+        # Right-padding keeps position IDs starting at 0, matching un-padded behavior
+        full_lens = []
+        for item in valid_items:
+            s_idx = item["scene_idx"]
+            meta = per_scene_meta[s_idx]
+            full_len = meta["prompt_len"] + len(item["coc_prefix"])
+            full_lens.append(full_len)
+
+        max_full_len = max(full_lens)
+        tf_input_ids = torch.full(
+            (n_valid, max_full_len),
+            self.pad_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        tf_attention_mask = torch.zeros(
+            n_valid,
+            max_full_len,
+            dtype=torch.long,
+            device=device,
+        )
+
+        for i, item in enumerate(valid_items):
+            s_idx = item["scene_idx"]
+            meta = per_scene_meta[s_idx]
+            prompt = torch.tensor(meta["prompt_ids"], device=device, dtype=torch.long)
+            prefix = torch.tensor(item["coc_prefix"], device=device, dtype=torch.long)
+            actual_len = prompt.shape[0] + prefix.shape[0]
+            tf_input_ids[i, : prompt.shape[0]] = prompt
+            tf_input_ids[i, prompt.shape[0] : actual_len] = prefix
+            tf_attention_mask[i, :actual_len] = 1
+
+        # Replicate pixel_values and image_grid_thw for valid items
+        tf_kwargs: dict[str, torch.Tensor] = {"attention_mask": tf_attention_mask}
+        pv_parts = []
+        igt_parts = []
+        for item in valid_items:
+            meta = per_scene_meta[item["scene_idx"]]
+            if meta["pixel_values"] is not None:
+                pv_parts.append(meta["pixel_values"])
+            if meta["image_grid_thw"] is not None:
+                igt_parts.append(meta["image_grid_thw"])
+        if pv_parts:
+            tf_kwargs["pixel_values"] = torch.cat(pv_parts, dim=0)
+        if igt_parts:
+            tf_kwargs["image_grid_thw"] = torch.cat(igt_parts, dim=0)
+
+        # Disable gradient checkpointing for TF forward
+        gc_modules = [m for m in vlm.modules() if getattr(m, "gradient_checkpointing", False)]
+        for m in gc_modules:
+            m.gradient_checkpointing = False
+
+        try:
+            with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
+                tf_out = vlm(
+                    input_ids=tf_input_ids,
+                    use_cache=True,
+                    **tf_kwargs,
+                )
+
+            prompt_cache = tf_out.past_key_values
+            _inner = vlm.model
+            if not hasattr(_inner, "rope_deltas"):
+                _inner = _inner.model
+            rope_deltas = _inner.rope_deltas  # (n_valid,)
+            prefill_seq_len = prompt_cache.get_seq_length()
+
+            # Per-sample offsets = actual sequence lengths
+            offsets = torch.tensor(full_lens, device=device)  # (n_valid,)
+
+            # Optional: inject <adv_traj_pos> into KV cache
+            if self.use_adv_conditioning and "adv_traj_pos" in self.adv_token_ids:
+                adv_traj_id = self.adv_token_ids["adv_traj_pos"]
+                adv_tensor = torch.full(
+                    (n_valid, 1),
+                    adv_traj_id,
+                    device=device,
+                    dtype=torch.long,
+                )
+                with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
+                    adv_out = vlm(
+                        input_ids=adv_tensor,
+                        past_key_values=prompt_cache,
+                        use_cache=True,
+                    )
+                prompt_cache = adv_out.past_key_values
+                prefill_seq_len = prompt_cache.get_seq_length()
+                offsets = offsets + 1
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            timings["teacher_forced"] = time.time() - t_
+
+            # Phase 3: Batched expert diffusion
+            t_ = time.time()
+            position_ids = torch.arange(n_diffusion_tokens, device=device)
+            position_ids = einops.repeat(
+                position_ids,
+                "l -> 3 b l",
+                b=n_valid,
+            ).clone()
+            delta = rope_deltas + offsets[:, None]  # (n_valid, 1)
+            position_ids += delta.to(position_ids.device)
+
+            # Expert attention mask: attend to real prefix + diffusion tokens, mask padding
+            expert_attn_mask = torch.zeros(
+                (n_valid, 1, n_diffusion_tokens, prefill_seq_len + n_diffusion_tokens),
+                dtype=torch.float32,
+                device=device,
+            )
+            min_val = torch.finfo(expert_attn_mask.dtype).min
+            for i in range(n_valid):
+                # Mask padding region in KV cache (between real prefix and diffusion tokens)
+                expert_attn_mask[i, :, :, offsets[i] : -n_diffusion_tokens] = min_val
+
+            forward_kwargs = {}
+            if self.expert_non_causal:
+                forward_kwargs["is_causal"] = False
+
+            def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+                b = x.shape[0]
+                future_token_embeds = self.action_in_proj(x, t)
+                if future_token_embeds.dim() == 2:
+                    future_token_embeds = future_token_embeds.view(
+                        b,
+                        n_diffusion_tokens,
+                        -1,
+                    )
+                expert_out = self.expert(
+                    inputs_embeds=future_token_embeds,
+                    position_ids=position_ids,
+                    past_key_values=prompt_cache,  # noqa: F821
+                    attention_mask=expert_attn_mask,
+                    use_cache=True,
+                    **forward_kwargs,
+                )
+                prompt_cache.crop(prefill_seq_len)  # noqa: F821
+                last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
+                return self.action_out_proj(last_hidden).view(
+                    -1,
+                    *self.action_space.get_action_space_dims(),
+                )
+
+            diffusion_kwargs = {}
+            if self.expert_diffusion_steps != 10:
+                diffusion_kwargs["num_steps"] = self.expert_diffusion_steps
+
+            with torch.autocast(str(device), dtype=torch.bfloat16):
+                sampled_action = self.diffusion.sample(
+                    batch_size=n_valid,
+                    step_fn=step_fn,
+                    device=device,
+                    return_all_steps=False,
+                    **diffusion_kwargs,
+                )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            timings["diffusion"] = time.time() - t_
+
+            del prompt_cache
+
+            # Phase 4: Batched trajectory encoding
+            t_ = time.time()
+            # Build batched hist_xyz/hist_rot for valid items
+            hist_xyz_list = []
+            hist_rot_list = []
+            for item in valid_items:
+                meta = per_scene_meta[item["scene_idx"]]
+                hist_xyz_list.append(meta["hist_xyz"])  # (1, T, 3)
+                hist_rot_list.append(meta["hist_rot"])  # (1, T, 3, 3)
+            hist_xyz_batch = torch.cat(hist_xyz_list, dim=0)  # (n_valid, T, 3)
+            hist_rot_batch = torch.cat(hist_rot_list, dim=0)  # (n_valid, T, 3, 3)
+
+            pred_xyz, pred_rot = self.action_space.action_to_traj(
+                sampled_action,
+                hist_xyz_batch,
+                hist_rot_batch,
+            )
+            discrete_tokens = self.traj_tokenizer.encode(
+                hist_xyz_batch,
+                hist_rot_batch,
+                pred_xyz,
+                pred_rot,
+            )
+            discrete_tokens = discrete_tokens.clamp(0, self.traj_vocab_size - 1)
+            # discrete_tokens: (n_valid, n_traj_tokens)
+
+            # Build result dicts
+            results = []
+            for i, item in enumerate(valid_items):
+                meta = per_scene_meta[item["scene_idx"]]
+                traj_token_ids = (discrete_tokens[i] + self.traj_token_start_idx).tolist()
+                completion_ids = (
+                    item["coc_tokens"]
+                    + [traj_future_start_id]
+                    + traj_token_ids
+                    + [traj_future_end_id]
+                )
+                pred_traj = pred_xyz[i].cpu().numpy().flatten().tolist()
+
+                results.append(
+                    {
+                        "prompt_ids": meta["prompt_ids"],
+                        "completion_ids": completion_ids,
+                        "pred_xyz": pred_traj,
+                        "gt_xyz": meta["gt_xyz"],
+                        "coc_text": item["coc_text"],
+                        "clip_id": meta["clip_id"],
+                        "t0_us": t0_us,
+                        "completion_prefix": item["coc_prefix"],
+                        "hist_xyz": meta["hist_xyz"][0].cpu(),
+                        "hist_rot": meta["hist_rot"][0].cpu(),
+                    }
+                )
+            timings["traj_encode"] = time.time() - t_
+
+        finally:
+            for m in gc_modules:
+                m.gradient_checkpointing = True
+
+        logger.info(
+            "[expert_batch] S=%d, G=%d (%d valid, %d results) timings: %s | total=%.2fs",
+            S,
+            G,
+            n_valid,
+            len(results),
+            ", ".join(f"{k}={v:.3f}s" for k, v in timings.items()),
+            sum(timings.values()),
+        )
+        return results
 
     def extract_segment_hidden(
         self,

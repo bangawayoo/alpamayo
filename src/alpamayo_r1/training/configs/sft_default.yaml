@@ -121,3 +121,4 @@ rollout:
   expert_diffusion_steps: 10    # Euler steps for flow matching (expert mode only)
   expert_non_causal: true       # non-causal attention for expert transformer
   use_adv_conditioning: false   # inject positive adv tokens during rollout (enable after pre-training)
+  scene_batch_size: 2           # scenes batched per generate() call (S*G total sequences)
