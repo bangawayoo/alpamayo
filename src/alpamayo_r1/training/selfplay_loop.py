@@ -17,6 +17,7 @@ See docs/advantage-conditioning.md for the full design specification.
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
@@ -27,6 +28,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from physical_ai_av import PhysicalAIAVDatasetInterface
 from transformers import TrainingArguments
 
@@ -870,8 +872,6 @@ class SelfPlayLoop:
         #    First, free the old model's GPU memory (VLM stays on GPU after rollout/evaluate)
         if self.full_model is not None:
             self.full_model.vlm.cpu()
-            import gc
-
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -904,11 +904,18 @@ class SelfPlayLoop:
             else:
                 logger.info("Reusing existing model for iteration %d", iteration)
 
+            # Clean up stale peft_config left by merge_and_unload() to prevent
+            # PEFT from seeing "multiple adapters" on the next get_peft_model()
+            if hasattr(full_model.vlm, "peft_config"):
+                delattr(full_model.vlm, "peft_config")
+
             # Merge expert LoRA if present (prevents double-wrapping when
             # _setup_expert applies fresh LoRA in the next training phase)
             if hasattr(full_model.expert, "merge_and_unload"):
                 full_model.expert = full_model.expert.merge_and_unload()
                 logger.info("Merged previous expert LoRA weights into base model")
+            if hasattr(full_model.expert, "peft_config"):
+                delattr(full_model.expert, "peft_config")
 
         prepare_vlm_for_training(full_model)
 
@@ -997,6 +1004,19 @@ class SelfPlayLoop:
         trainer.save_model(str(output_dir / "final"))
         self.current_policy_path = str(output_dir / "final")
         logger.info("Saved pi_%d to %s", iteration + 1, self.current_policy_path)
+
+        # 8. Synchronize NCCL state across ranks before the next iteration.
+        if dist.is_initialized():
+            dist.barrier()
+            logger.debug("Post-training barrier complete")
+
+        # Explicitly delete the Trainer (and its DDP wrapper) so the old
+        # NCCL state is fully released before the next iteration creates
+        # a new DDP.
+        del trainer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Update the full_model reference for next iteration's rollouts
         self.full_model = full_model
