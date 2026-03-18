@@ -398,6 +398,25 @@ class SelfPlayLoop:
         # Replay ratio: fraction of training data from historical replay buffer
         self.replay_ratio = float(adv_cfg.get("replay_ratio", 0.3))
 
+        # Value head TensorBoard logging
+        self._tb_writer = None
+        self._vh_global_step = 0
+
+    def _get_tb_writer(self):
+        """Lazily create a TensorBoard SummaryWriter for value head metrics."""
+        if self._tb_writer is not None:
+            return self._tb_writer
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            output_dir = self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond")
+            log_dir = str(Path(output_dir) / "logs" / "value_head")
+            self._tb_writer = SummaryWriter(log_dir=log_dir)
+            logger.info("Value head TensorBoard logging at %s", log_dir)
+        except ImportError:
+            logger.debug("tensorboard not installed — value head TB logging disabled")
+        return self._tb_writer
+
     def run(self) -> None:
         """Run all iterations of the self-play loop.
 
@@ -493,6 +512,7 @@ class SelfPlayLoop:
         )
 
         # Train value head
+        vh_log_interval = int(vh_cfg.get("log_interval", 10))
         value_head = self._get_or_create_value_head()
         metrics = train_segment_value_head(
             value_head=value_head,
@@ -502,7 +522,11 @@ class SelfPlayLoop:
             g_coc_list=g_coc,
             g_traj_list=g_traj,
             num_epochs=num_epochs,
+            log_interval=vh_log_interval,
+            tb_writer=self._get_tb_writer(),
+            global_step_offset=self._vh_global_step,
         )
+        self._vh_global_step += num_epochs
 
         # Save only the value head after pre-training — the VLM and expert
         # are unchanged during Stage 0, so no need to save them.
@@ -665,8 +689,8 @@ class SelfPlayLoop:
                 completion_segment_map=completion_segment_map,
                 reward_weights=reward_weights,
             )
-            vh_cfg = self.cfg.get("value_head", {})
             vh_train_epochs = int(vh_cfg.get("train_epochs", 10))
+            vh_log_interval = int(vh_cfg.get("log_interval", 10))
             train_segment_value_head(
                 value_head=value_head,
                 optimizer=self._value_head_optimizer,
@@ -675,7 +699,11 @@ class SelfPlayLoop:
                 g_coc_list=g_coc,
                 g_traj_list=g_traj,
                 num_epochs=vh_train_epochs,
+                log_interval=vh_log_interval,
+                tb_writer=self._get_tb_writer(),
+                global_step_offset=self._vh_global_step,
             )
+            self._vh_global_step += vh_train_epochs
 
             # 4. Compute per-segment advantages using converged value head
             advantages = compute_segment_advantages_from_rollouts(
@@ -752,7 +780,15 @@ class SelfPlayLoop:
             import gc
 
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                logger.info(
+                    "GPU cleanup after evaluate: %.1f/%.1f GB allocated/reserved",
+                    torch.cuda.memory_allocated() / 1e9,
+                    torch.cuda.memory_reserved() / 1e9,
+                )
 
         if reset_to_base:
             # RECAP-style: reload base model from scratch every iteration
@@ -848,6 +884,12 @@ class SelfPlayLoop:
         )
 
         # 6. Train
+        if torch.cuda.is_available():
+            logger.info(
+                "GPU mem before trainer.train(): %.1f/%.1f GB allocated/reserved",
+                torch.cuda.memory_allocated() / 1e9,
+                torch.cuda.memory_reserved() / 1e9,
+            )
         logger.info("Starting SFT iteration %d: %d samples", iteration, len(train_dataset))
         trainer.train()
 
