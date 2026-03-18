@@ -881,6 +881,12 @@ class SelfPlayLoop:
 
         # 1. Load model for this iteration
         #    First, free the old model's GPU memory (VLM stays on GPU after rollout/evaluate)
+        #    Detach advantage embedding hooks BEFORE freeing the old model so
+        #    stale hook handles don't keep the old embedding layer (and thus
+        #    the entire old VLM) alive.
+        if hasattr(self, "adv_embedding"):
+            self.adv_embedding.detach()
+
         if self.full_model is not None:
             self.full_model.vlm.cpu()
             gc.collect()
@@ -902,9 +908,6 @@ class SelfPlayLoop:
             # Reuse existing model; at iteration 0 the VLM is not a PeftModel
             # so merge_and_unload is a no-op (hasattr check is False).
             full_model = self.full_model
-            # Detach advantage embedding hooks before merge
-            if hasattr(self, "adv_embedding"):
-                self.adv_embedding.detach()
             if hasattr(full_model.vlm, "merge_and_unload"):
                 logger.info(
                     "Continuing from iteration %d checkpoint (merge previous LoRA)",
@@ -1026,7 +1029,27 @@ class SelfPlayLoop:
         # a new DDP.
         del trainer
 
-        # Move expert components back to CPU
+        # Merge LoRA back into the base model so the next rollout uses a
+        # raw HF model, not a PeftModel.  PeftModel.generate() creates
+        # many small intermediate tensors (per LoRA adapter, per layer,
+        # per token) that fragment PyTorch's caching allocator.  With a
+        # raw model the allocation pattern matches iteration-0's rollout
+        # and generation succeeds reliably.
+        # The checkpoint was already saved above, so LoRA weights are safe.
+        if hasattr(full_model.vlm, "merge_and_unload"):
+            full_model.vlm = full_model.vlm.merge_and_unload()
+            logger.info("Merged VLM LoRA into base model for clean rollout")
+        if hasattr(full_model.vlm, "peft_config"):
+            delattr(full_model.vlm, "peft_config")
+        if hasattr(full_model.expert, "merge_and_unload"):
+            full_model.expert = full_model.expert.merge_and_unload()
+            logger.info("Merged expert LoRA into base model")
+        if hasattr(full_model.expert, "peft_config"):
+            delattr(full_model.expert, "peft_config")
+
+        # Move ALL model components to CPU so gc.collect + empty_cache
+        # can fully reclaim GPU memory.
+        full_model.vlm.cpu()
         full_model.expert.cpu()
         full_model.action_in_proj.cpu()
         full_model.action_out_proj.cpu()
@@ -1035,6 +1058,11 @@ class SelfPlayLoop:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            logger.info(
+                "GPU cleanup after training: %.1f/%.1f GB allocated/reserved",
+                torch.cuda.memory_allocated() / 1e9,
+                torch.cuda.memory_reserved() / 1e9,
+            )
 
         # Update the full_model reference for next iteration's rollouts
         self.full_model = full_model

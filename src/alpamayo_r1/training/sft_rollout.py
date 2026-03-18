@@ -227,6 +227,12 @@ class RolloutEngine:
                         len(chunk_ids),
                         e,
                     )
+                    # The failed batch leaves partially-allocated tensors in
+                    # PyTorch's caching allocator.  Without releasing them the
+                    # cache grows (e.g. 22 GB → 41 GB reserved) and later
+                    # per-scene attempts OOM on fragmented memory.
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
                     for clip_id in chunk_ids:
                         try:
                             scene_results = single_fn(
@@ -241,6 +247,8 @@ class RolloutEngine:
                         except Exception as e2:
                             n_failed += 1
                             logger.warning("Generation failed for %s: %s", clip_id, e2)
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
 
         if use_expert:
             self._move_expert_to_cpu()
