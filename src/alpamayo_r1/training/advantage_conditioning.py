@@ -363,12 +363,18 @@ def train_segment_value_head(
     g_coc_list: list[float],
     g_traj_list: list[torch.Tensor],
     num_epochs: int = 10,
+    batch_size: int = 64,
     max_traj_samples_per_completion: int = 8,
+    log_interval: int = 10,
+    tb_writer: Any | None = None,
+    global_step_offset: int = 0,
 ) -> dict[str, float]:
     """Train the three-level value head on returns-to-go targets.
 
-    Runs multiple epochs over the provided data to train V toward convergence
-    before advantages are computed (per the design doc's "separate loop" schedule).
+    Uses mini-batch SGD with shuffled indices each epoch. Obs and CoC hidden
+    states are pre-stacked for efficient batched forward passes; traj tokens
+    are processed per-completion within each mini-batch (variable-length
+    sequences cannot be stacked without padding).
 
     Args:
         value_head: SegmentValueHead instance.
@@ -378,116 +384,146 @@ def train_segment_value_head(
         g_coc_list: Per-completion G(s_coc) targets.
         g_traj_list: Per-completion G(s_traj_j) tensors.
         num_epochs: Number of training epochs over the data.
+        batch_size: Mini-batch size (default 64).
         max_traj_samples_per_completion: Sub-sample trajectory tokens to prevent
             them from dominating the loss.
+        log_interval: Log to display every N steps (default 10).
+        tb_writer: Optional TensorBoard SummaryWriter for scalar logging.
+        global_step_offset: Starting global step for TensorBoard (allows
+            monotonically increasing steps across pretrain + iterations).
 
     Returns:
-        Dict of final-epoch metrics: {loss, loss_obs, loss_coc, loss_traj,
-        pred_obs_mean, target_obs_mean}.
+        Dict of final-step metrics: {loss, loss_obs, loss_coc, loss_traj,
+        pred_obs_mean, target_obs_mean, total_steps}.
     """
     from alpamayo_r1.training.value_head import SegmentValueHead
 
     B = len(g_obs_list)
     if B == 0 or num_epochs <= 0:
         return {"loss": 0.0, "loss_obs": 0.0, "loss_coc": 0.0, "loss_traj": 0.0,
-                "pred_obs_mean": 0.0, "target_obs_mean": 0.0}
+                "pred_obs_mean": 0.0, "target_obs_mean": 0.0, "total_steps": 0}
 
     vh_device = next(value_head.parameters()).device
+
+    # Pre-stack obs and coc into (B, D) / (B,) tensors on CPU for efficient indexing
+    h_obs_all = torch.cat([segment_hidden_stash[i]["h_obs"] for i in range(B)], dim=0)
+    g_obs_all = torch.tensor(g_obs_list, dtype=torch.float32)
+    h_coc_all = torch.cat([segment_hidden_stash[i]["h_coc"] for i in range(B)], dim=0)
+    g_coc_all = torch.tensor(g_coc_list, dtype=torch.float32)
+
     metrics = {}
+    global_step = 0
 
     for epoch in range(num_epochs):
-        # --- Obs-level loss ---
-        obs_preds = []
-        for i in range(B):
-            h_obs = segment_hidden_stash[i]["h_obs"].to(vh_device)
-            v = value_head(h_obs, level=SegmentValueHead.LEVEL_OBS)
-            obs_preds.append(v)
-        obs_pred_t = torch.cat(obs_preds)
-        obs_target_t = torch.tensor(g_obs_list, device=vh_device, dtype=torch.float32)
-        loss_obs = F.mse_loss(obs_pred_t, obs_target_t)
+        perm = torch.randperm(B)
 
-        # --- CoC-level loss ---
-        coc_preds = []
-        for i in range(B):
-            h_coc = segment_hidden_stash[i]["h_coc"].to(vh_device)
-            v = value_head(h_coc, level=SegmentValueHead.LEVEL_COC)
-            coc_preds.append(v)
-        coc_pred_t = torch.cat(coc_preds)
-        coc_target_t = torch.tensor(g_coc_list, device=vh_device, dtype=torch.float32)
-        loss_coc = F.mse_loss(coc_pred_t, coc_target_t)
+        for batch_start in range(0, B, batch_size):
+            idx = perm[batch_start : batch_start + batch_size]
 
-        # --- Traj-level loss (sub-sampled at curvature positions) ---
-        # Trajectory tokens come in (acceleration, curvature) pairs per timestep.
-        # We evaluate V only at curvature positions (idx % 2 == 1) because:
-        # (1) the curvature token has seen both components of the timestep,
-        # (2) rewards are per-timestep, so the value function is naturally
-        #     timestep-level rather than token-level.
-        traj_preds = []
-        traj_targets = []
-        for i in range(B):
-            h_traj = segment_hidden_stash[i]["h_traj"]
-            g_traj = g_traj_list[i]
-            if h_traj.shape[0] == 0:
-                continue
-            T_t = h_traj.shape[0]
-            curvature_idx = torch.arange(1, T_t, 2)  # [1, 3, 5, ...]
-            n_timesteps = len(curvature_idx)
-            n_keep = min(n_timesteps, max_traj_samples_per_completion)
-            if n_keep < n_timesteps:
-                sel = curvature_idx[torch.randperm(n_timesteps)[:n_keep]]
+            # --- Obs-level loss ---
+            h_obs_batch = h_obs_all[idx].to(vh_device)
+            g_obs_batch = g_obs_all[idx].to(vh_device)
+            obs_pred = value_head(h_obs_batch, level=SegmentValueHead.LEVEL_OBS)
+            loss_obs = F.mse_loss(obs_pred, g_obs_batch)
+
+            # --- CoC-level loss ---
+            h_coc_batch = h_coc_all[idx].to(vh_device)
+            g_coc_batch = g_coc_all[idx].to(vh_device)
+            coc_pred = value_head(h_coc_batch, level=SegmentValueHead.LEVEL_COC)
+            loss_coc = F.mse_loss(coc_pred, g_coc_batch)
+
+            # --- Traj-level loss (sub-sampled at curvature positions) ---
+            # Trajectory tokens come in (acceleration, curvature) pairs per timestep.
+            # We evaluate V only at curvature positions (idx % 2 == 1) because:
+            # (1) the curvature token has seen both components of the timestep,
+            # (2) rewards are per-timestep, so the value function is naturally
+            #     timestep-level rather than token-level.
+            # Variable-length sequences require per-completion processing.
+            traj_preds = []
+            traj_targets = []
+            for i_local in idx.tolist():
+                h_traj = segment_hidden_stash[i_local]["h_traj"]
+                g_traj = g_traj_list[i_local]
+                if h_traj.shape[0] == 0:
+                    continue
+                T_t = h_traj.shape[0]
+                curvature_idx = torch.arange(1, T_t, 2)
+                n_timesteps = len(curvature_idx)
+                n_keep = min(n_timesteps, max_traj_samples_per_completion)
+                if n_keep < n_timesteps:
+                    sel = curvature_idx[torch.randperm(n_timesteps)[:n_keep]]
+                else:
+                    sel = curvature_idx
+                h_sub = h_traj[sel].to(vh_device)
+                g_sub = g_traj[sel].to(vh_device)
+                traj_pos = (sel // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0).to(vh_device)
+                v = value_head(
+                    h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos
+                ).squeeze(0)
+                traj_preds.append(v)
+                traj_targets.append(g_sub)
+
+            if traj_preds:
+                traj_pred_t = torch.cat(traj_preds)
+                traj_target_t = torch.cat(traj_targets)
+                loss_traj = F.mse_loss(traj_pred_t, traj_target_t)
             else:
-                sel = curvature_idx
-            h_sub = h_traj[sel].to(vh_device)
-            g_sub = g_traj[sel].to(vh_device)
-            # RoPE positions: timestep index (sel // 2) + traj offset
-            traj_pos = (sel // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0).to(vh_device)
-            v = value_head(
-                h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos
-            ).squeeze(0)
-            traj_preds.append(v)
-            traj_targets.append(g_sub)
+                loss_traj = torch.tensor(0.0, device=vh_device)
 
-        if traj_preds:
-            traj_pred_t = torch.cat(traj_preds)
-            traj_target_t = torch.cat(traj_targets)
-            loss_traj = F.mse_loss(traj_pred_t, traj_target_t)
-        else:
-            loss_traj = torch.tensor(0.0, device=vh_device)
+            # --- Combined loss ---
+            total_loss = (loss_obs + loss_coc + loss_traj) / 3.0
 
-        # --- Combined loss ---
-        total_loss = (loss_obs + loss_coc + loss_traj) / 3.0
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
 
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+            metrics = {
+                "loss": total_loss.item(),
+                "loss_obs": loss_obs.item(),
+                "loss_coc": loss_coc.item(),
+                "loss_traj": loss_traj.item(),
+                "pred_obs_mean": obs_pred.detach().mean().item(),
+                "target_obs_mean": g_obs_batch.mean().item(),
+            }
 
-        metrics = {
-            "loss": total_loss.item(),
-            "loss_obs": loss_obs.item(),
-            "loss_coc": loss_coc.item(),
-            "loss_traj": loss_traj.item(),
-            "pred_obs_mean": obs_pred_t.detach().mean().item(),
-            "target_obs_mean": obs_target_t.mean().item(),
-        }
+            # TensorBoard: log every step
+            if tb_writer is not None:
+                step = global_step_offset + global_step
+                for key, val in metrics.items():
+                    tb_writer.add_scalar(f"value_head/{key}", val, step)
 
-        # Log every 10 epochs or on first/last epoch
-        if epoch == 0 or epoch == num_epochs - 1 or (epoch + 1) % 10 == 0:
-            logger.info(
-                "  Value head epoch %d/%d: loss=%.4f (obs=%.4f coc=%.4f traj=%.4f)",
-                epoch + 1,
-                num_epochs,
-                metrics["loss"],
-                metrics["loss_obs"],
-                metrics["loss_coc"],
-                metrics["loss_traj"],
-            )
+            # Display: log every log_interval steps or at epoch boundaries
+            at_epoch_start = (batch_start == 0)
+            at_log_interval = (global_step + 1) % max(1, log_interval) == 0
+            if global_step == 0 or at_log_interval or at_epoch_start:
+                logger.info(
+                    "  Value head step %d (epoch %d/%d): "
+                    "loss=%.4f (obs=%.4f coc=%.4f traj=%.4f)",
+                    global_step + 1,
+                    epoch + 1,
+                    num_epochs,
+                    metrics["loss"],
+                    metrics["loss_obs"],
+                    metrics["loss_coc"],
+                    metrics["loss_traj"],
+                )
+
+            global_step += 1
+
+    total_steps = global_step
+    metrics["total_steps"] = total_steps
+
+    if tb_writer is not None:
+        tb_writer.flush()
 
     logger.info(
-        "Value head training: %d epochs, %d samples | "
+        "Value head training: %d epochs, %d steps, %d samples (batch_size=%d) | "
         "loss=%.4f (obs=%.4f, coc=%.4f, traj=%.4f) | "
         "pred_obs=%.3f target_obs=%.3f",
         num_epochs,
+        total_steps,
         B,
+        batch_size,
         metrics["loss"],
         metrics["loss_obs"],
         metrics["loss_coc"],

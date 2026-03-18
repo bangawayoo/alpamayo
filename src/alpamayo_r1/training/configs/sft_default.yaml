@@ -67,8 +67,10 @@ value_head:
   load_path: null               # pre-trained value head checkpoint (skips pre-training if provided)
   segment_level: true
   train_epochs: 1              # epochs to train value head per iteration (before advantage computation)
+  batch_size: 64                 # mini-batch size for value head training
   pretrain_scenes: 500           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)
   pretrain_epochs: 1           # epochs for Stage 0 pre-training
+  log_interval: 10               # log to display every N steps (TensorBoard logs every step)
 
 # Action expert finetuning (CFM / flow matching)
 # Uses deferred GPU scheduling: expert step runs after VLM SFT backward

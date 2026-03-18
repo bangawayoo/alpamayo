@@ -513,6 +513,7 @@ class SelfPlayLoop:
 
         # Train value head
         vh_log_interval = int(vh_cfg.get("log_interval", 10))
+        vh_batch_size = int(vh_cfg.get("batch_size", 64))
         value_head = self._get_or_create_value_head()
         metrics = train_segment_value_head(
             value_head=value_head,
@@ -522,11 +523,12 @@ class SelfPlayLoop:
             g_coc_list=g_coc,
             g_traj_list=g_traj,
             num_epochs=num_epochs,
+            batch_size=vh_batch_size,
             log_interval=vh_log_interval,
             tb_writer=self._get_tb_writer(),
             global_step_offset=self._vh_global_step,
         )
-        self._vh_global_step += num_epochs
+        self._vh_global_step += metrics.get("total_steps", 0)
 
         # Save only the value head after pre-training — the VLM and expert
         # are unchanged during Stage 0, so no need to save them.
@@ -691,7 +693,8 @@ class SelfPlayLoop:
             )
             vh_train_epochs = int(vh_cfg.get("train_epochs", 10))
             vh_log_interval = int(vh_cfg.get("log_interval", 10))
-            train_segment_value_head(
+            vh_batch_size = int(vh_cfg.get("batch_size", 64))
+            vh_metrics = train_segment_value_head(
                 value_head=value_head,
                 optimizer=self._value_head_optimizer,
                 segment_hidden_stash=segment_hidden_stash,
@@ -699,11 +702,12 @@ class SelfPlayLoop:
                 g_coc_list=g_coc,
                 g_traj_list=g_traj,
                 num_epochs=vh_train_epochs,
+                batch_size=vh_batch_size,
                 log_interval=vh_log_interval,
                 tb_writer=self._get_tb_writer(),
                 global_step_offset=self._vh_global_step,
             )
-            self._vh_global_step += vh_train_epochs
+            self._vh_global_step += vh_metrics.get("total_steps", 0)
 
             # 4. Compute per-segment advantages using converged value head
             advantages = compute_segment_advantages_from_rollouts(
