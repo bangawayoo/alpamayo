@@ -82,7 +82,7 @@ We introduce four new special tokens, two per segment level:
 <|adv_traj_pos|>   <|adv_traj_neg|>    # Traj-level: was the trajectory accurate given the reasoning?
 ```
 
-These are added to the tokenizer vocabulary and their embeddings are trained from scratch during SFT.
+These are **not** added to the tokenizer vocabulary. Instead, they use sentinel IDs just past the VLM's `vocab_size` boundary. A small trainable `AdvantageEmbedding` module (4 × hidden_size parameters) intercepts these sentinel IDs via forward hooks on the VLM's input embedding layer — a pre-hook clamps them to safe values before `embed_tokens`, and a post-hook replaces those positions with learned embeddings. This avoids `resize_token_embeddings()`, which would create random rows frozen by LoRA.
 
 > **Why not a CoC-level token?** The CoC advantage would be computed at state s_coc — after the full reasoning trace is generated but before the first trajectory token. Since V(s_coc) and V(s_traj_0) see nearly identical information (observation + complete CoC text), A_coc and A_traj at j=0 would be redundant. The trajectory-level advantage already captures whether the CoC set up good conditions for the trajectory — a positive A_traj implicitly reflects good reasoning.
 
@@ -400,9 +400,10 @@ G(s_traj_t) = w_traj · Σ_{k=t}^{T} r_k + w_consist · R_consistency           
 
 ### Phase 1: Token and Data Infrastructure
 
-1. **Add special tokens** to the tokenizer:
+1. **Assign sentinel token IDs** via `compute_advantage_token_ids(vocab_size)`:
    - `<|adv_obs_pos|>`, `<|adv_obs_neg|>`, `<|adv_traj_pos|>`, `<|adv_traj_neg|>`
-   - Resize model embeddings accordingly
+   - IDs are `vocab_size + 0..3` — no tokenizer modification or embedding resize needed
+   - `AdvantageEmbedding` (trainable `nn.Embedding(4, hidden_size)`) is attached to the VLM's embed_tokens layer via forward hooks, ensuring gradients flow through the advantage token embeddings even when LoRA freezes the base model
 
 2. **Rollout data structure**: Extend the rollout output to include per-segment advantage labels alongside existing rewards and log-probs.
 
@@ -465,7 +466,8 @@ G(s_traj_t) = w_traj · Σ_{k=t}^{T} r_k + w_consist · R_consistency           
 │  Advantage math   ─── return-minus-baseline, binarization        │
 ├──────────────────────────────────────────────────────────────────┤
 │                    New (advantage conditioning)                   │
-│  Special tokens   ─── 4 new tokens in tokenizer                 │
+│  Sentinel tokens  ─── 4 IDs past vocab_size (no tokenizer mod)  │
+│  AdvantageEmbed   ─── trainable side embedding via fwd hooks     │
 │  Prompt builder   ─── prepend conditioning tokens to completion  │
 │  Training loop    ─── dual SFT loss with conditioning dropout    │
 │  Inference        ─── CFG with all-positive conditioning         │
