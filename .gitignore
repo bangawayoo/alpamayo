@@ -221,3 +221,7 @@ outputs/
 notes/
 evaluation_results/
 verification-report.md
+
+.claude
+notes.md
+.vscode
