@@ -437,9 +437,17 @@ class SelfPlayLoop:
         self._vh_global_step = 0
 
     def _get_tb_writer(self):
-        """Lazily create a TensorBoard SummaryWriter for value head metrics."""
+        """Lazily create a TensorBoard SummaryWriter for value head metrics.
+
+        Only rank 0 creates a writer to avoid duplicate/garbled data when
+        running under DDP.
+        """
         if self._tb_writer is not None:
             return self._tb_writer
+        # Only rank 0 should write TensorBoard logs
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank != 0:
+            return None
         try:
             from torch.utils.tensorboard import SummaryWriter
 
@@ -468,6 +476,9 @@ class SelfPlayLoop:
             logger.info("SELF-PLAY ITERATION %d / %d", i + 1, self.num_iterations)
             logger.info("=" * 60)
             self.run_iteration(i)
+
+        if self._tb_writer is not None:
+            self._tb_writer.close()
 
     def pretrain_value_head(
         self,
@@ -1014,6 +1025,13 @@ class SelfPlayLoop:
         # NCCL state is fully released before the next iteration creates
         # a new DDP.
         del trainer
+
+        # Move expert components back to CPU
+        full_model.expert.cpu()
+        full_model.action_in_proj.cpu()
+        full_model.action_out_proj.cpu()
+        full_model.action_space.cpu()
+
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
