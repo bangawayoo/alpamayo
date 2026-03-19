@@ -31,6 +31,159 @@ from alpamayo_r1.training.rollout_utils import ClipDataCache
 logger = logging.getLogger(__name__)
 
 
+def run_batched_expert_diffusion(
+    model: AlpamayoR1,
+    tf_input_ids: torch.Tensor,
+    tf_attention_mask: torch.Tensor,
+    full_lens: list[int],
+    pixel_values: torch.Tensor | None = None,
+    image_grid_thw: torch.Tensor | None = None,
+    adv_traj_token_id: int | None = None,
+    expert_non_causal: bool = True,
+    diffusion_steps: int | None = None,
+) -> torch.Tensor:
+    """Run batched teacher-forced VLM forward + optional adv_traj injection + expert diffusion.
+
+    Shared implementation used by ``RolloutEngine._generate_batch_expert`` (training)
+    and ``evaluate_test_set._evaluate_expert_with_adv_traj`` (evaluation).
+
+    Takes right-padded teacher-forced input sequences, runs a single batched VLM
+    forward to build the KV cache, optionally injects adv_traj conditioning tokens,
+    then runs batched expert diffusion sampling.
+
+    Args:
+        model: AlpamayoR1 instance with VLM, expert, action projections on the
+            appropriate devices.
+        tf_input_ids: Right-padded token sequences, ``(n_valid, max_full_len)``.
+        tf_attention_mask: Attention mask for tf_input_ids, ``(n_valid, max_full_len)``.
+        full_lens: Actual (unpadded) sequence length for each sample.
+        pixel_values: Concatenated pixel patches for all samples.
+        image_grid_thw: Image grid dimensions for all samples.
+        adv_traj_token_id: If set, inject this advantage conditioning token
+            into the KV cache after teacher-forcing.
+        expert_non_causal: Whether to use non-causal attention in expert.
+        diffusion_steps: Override default diffusion step count (default 10).
+
+    Returns:
+        Diffusion-sampled actions, ``(n_valid, *action_dims)``.
+    """
+    device = tf_input_ids.device
+    n_valid = tf_input_ids.shape[0]
+    n_diffusion_tokens = model.action_space.get_action_space_dims()[0]  # 64
+    vlm = model.vlm
+
+    tf_kwargs: dict[str, torch.Tensor] = {"attention_mask": tf_attention_mask}
+    if pixel_values is not None:
+        tf_kwargs["pixel_values"] = pixel_values
+    if image_grid_thw is not None:
+        tf_kwargs["image_grid_thw"] = image_grid_thw
+
+    # Disable gradient checkpointing for TF forward + adv injection
+    gc_modules = [m for m in vlm.modules() if getattr(m, "gradient_checkpointing", False)]
+    for m in gc_modules:
+        m.gradient_checkpointing = False
+
+    try:
+        # Batched teacher-forced VLM forward
+        with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
+            tf_out = vlm(
+                input_ids=tf_input_ids,
+                use_cache=True,
+                **tf_kwargs,
+            )
+
+        prompt_cache = tf_out.past_key_values
+        # Navigate through PeftModel wrapper for rope_deltas
+        _inner = vlm.model
+        if not hasattr(_inner, "rope_deltas"):
+            _inner = _inner.model
+        rope_deltas = _inner.rope_deltas  # (n_valid,)
+        prefill_seq_len = prompt_cache.get_seq_length()
+
+        # Per-sample offsets = actual sequence lengths
+        offsets = torch.tensor(full_lens, device=device)  # (n_valid,)
+
+        # Inject adv_traj into KV cache (optional)
+        if adv_traj_token_id is not None:
+            adv_tensor = torch.full(
+                (n_valid, 1), adv_traj_token_id, device=device, dtype=torch.long
+            )
+            with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
+                adv_out = vlm(
+                    input_ids=adv_tensor,
+                    past_key_values=prompt_cache,
+                    use_cache=True,
+                )
+            prompt_cache = adv_out.past_key_values
+            prefill_seq_len = prompt_cache.get_seq_length()
+            offsets = offsets + 1
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+        # Build expert position_ids and attention_mask
+        position_ids = torch.arange(n_diffusion_tokens, device=device)
+        position_ids = einops.repeat(position_ids, "l -> 3 b l", b=n_valid).clone()
+        delta = rope_deltas + offsets[:, None]  # (n_valid, 1)
+        position_ids += delta.to(position_ids.device)
+
+        expert_attn_mask = torch.zeros(
+            (n_valid, 1, n_diffusion_tokens, prefill_seq_len + n_diffusion_tokens),
+            dtype=torch.float32,
+            device=device,
+        )
+        min_val = torch.finfo(expert_attn_mask.dtype).min
+        for i in range(n_valid):
+            # Mask padding region in KV cache (between real prefix and diffusion tokens)
+            expert_attn_mask[i, :, :, offsets[i] : -n_diffusion_tokens] = min_val
+
+        forward_kwargs = {}
+        if expert_non_causal:
+            forward_kwargs["is_causal"] = False
+
+        def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            b = x.shape[0]
+            future_token_embeds = model.action_in_proj(x, t)
+            if future_token_embeds.dim() == 2:
+                future_token_embeds = future_token_embeds.view(b, n_diffusion_tokens, -1)
+            expert_out = model.expert(
+                inputs_embeds=future_token_embeds,
+                position_ids=position_ids,
+                past_key_values=prompt_cache,  # noqa: F821
+                attention_mask=expert_attn_mask,
+                use_cache=True,
+                **forward_kwargs,
+            )
+            prompt_cache.crop(prefill_seq_len)  # noqa: F821
+            last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
+            return model.action_out_proj(last_hidden).view(
+                -1, *model.action_space.get_action_space_dims()
+            )
+
+        diff_kwargs = {}
+        if diffusion_steps is not None and diffusion_steps != 10:
+            diff_kwargs["num_steps"] = diffusion_steps
+
+        with torch.autocast(str(device), dtype=torch.bfloat16):
+            sampled_action = model.diffusion.sample(
+                batch_size=n_valid,
+                step_fn=step_fn,
+                device=device,
+                return_all_steps=False,
+                **diff_kwargs,
+            )
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+        del prompt_cache
+        return sampled_action
+
+    finally:
+        for m in gc_modules:
+            m.gradient_checkpointing = True
+
+
 class RolloutEngine:
     """Generate completions and extract segment hidden states for SFT.
 
@@ -1127,13 +1280,8 @@ class RolloutEngine:
 
         n_valid = len(valid_items)
 
-        # Phase 2: Batched teacher-forced VLM forward
+        # Phase 2: Build right-padded TF sequences
         t_ = time.time()
-        n_diffusion_tokens = self.action_space.get_action_space_dims()[0]  # 64
-        vlm = self.full_model.vlm
-
-        # Build right-padded full sequences for each valid completion
-        # Right-padding keeps position IDs starting at 0, matching un-padded behavior
         full_lens = []
         for item in valid_items:
             s_idx = item["scene_idx"]
@@ -1166,7 +1314,6 @@ class RolloutEngine:
             tf_attention_mask[i, :actual_len] = 1
 
         # Replicate pixel_values and image_grid_thw for valid items
-        tf_kwargs: dict[str, torch.Tensor] = {"attention_mask": tf_attention_mask}
         pv_parts = []
         igt_parts = []
         for item in valid_items:
@@ -1175,183 +1322,83 @@ class RolloutEngine:
                 pv_parts.append(meta["pixel_values"])
             if meta["image_grid_thw"] is not None:
                 igt_parts.append(meta["image_grid_thw"])
-        if pv_parts:
-            tf_kwargs["pixel_values"] = torch.cat(pv_parts, dim=0)
-        if igt_parts:
-            tf_kwargs["image_grid_thw"] = torch.cat(igt_parts, dim=0)
+        pv_tensor = torch.cat(pv_parts, dim=0) if pv_parts else None
+        igt_tensor = torch.cat(igt_parts, dim=0) if igt_parts else None
+        timings["build_tf_inputs"] = time.time() - t_
 
-        # Disable gradient checkpointing for TF forward
-        gc_modules = [m for m in vlm.modules() if getattr(m, "gradient_checkpointing", False)]
-        for m in gc_modules:
-            m.gradient_checkpointing = False
+        # Phase 3: Batched TF forward + adv_traj injection + expert diffusion
+        t_ = time.time()
+        adv_traj_id = None
+        if self.use_adv_conditioning and "adv_traj_pos" in self.adv_token_ids:
+            adv_traj_id = self.adv_token_ids["adv_traj_pos"]
 
-        try:
-            with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
-                tf_out = vlm(
-                    input_ids=tf_input_ids,
-                    use_cache=True,
-                    **tf_kwargs,
-                )
+        sampled_action = run_batched_expert_diffusion(
+            model=self.full_model,
+            tf_input_ids=tf_input_ids,
+            tf_attention_mask=tf_attention_mask,
+            full_lens=full_lens,
+            pixel_values=pv_tensor,
+            image_grid_thw=igt_tensor,
+            adv_traj_token_id=adv_traj_id,
+            expert_non_causal=self.expert_non_causal,
+            diffusion_steps=self.expert_diffusion_steps,
+        )
+        timings["tf_diffusion"] = time.time() - t_
 
-            prompt_cache = tf_out.past_key_values
-            _inner = vlm.model
-            if not hasattr(_inner, "rope_deltas"):
-                _inner = _inner.model
-            rope_deltas = _inner.rope_deltas  # (n_valid,)
-            prefill_seq_len = prompt_cache.get_seq_length()
+        # Phase 4: Batched trajectory encoding
+        t_ = time.time()
+        # Build batched hist_xyz/hist_rot for valid items
+        hist_xyz_list = []
+        hist_rot_list = []
+        for item in valid_items:
+            meta = per_scene_meta[item["scene_idx"]]
+            hist_xyz_list.append(meta["hist_xyz"])  # (1, T, 3)
+            hist_rot_list.append(meta["hist_rot"])  # (1, T, 3, 3)
+        hist_xyz_batch = torch.cat(hist_xyz_list, dim=0)  # (n_valid, T, 3)
+        hist_rot_batch = torch.cat(hist_rot_list, dim=0)  # (n_valid, T, 3, 3)
 
-            # Per-sample offsets = actual sequence lengths
-            offsets = torch.tensor(full_lens, device=device)  # (n_valid,)
+        pred_xyz, pred_rot = self.action_space.action_to_traj(
+            sampled_action,
+            hist_xyz_batch,
+            hist_rot_batch,
+        )
+        discrete_tokens = self.traj_tokenizer.encode(
+            hist_xyz_batch,
+            hist_rot_batch,
+            pred_xyz,
+            pred_rot,
+        )
+        discrete_tokens = discrete_tokens.clamp(0, self.traj_vocab_size - 1)
+        # discrete_tokens: (n_valid, n_traj_tokens)
 
-            # Optional: inject <adv_traj_pos> into KV cache
-            if self.use_adv_conditioning and "adv_traj_pos" in self.adv_token_ids:
-                adv_traj_id = self.adv_token_ids["adv_traj_pos"]
-                adv_tensor = torch.full(
-                    (n_valid, 1),
-                    adv_traj_id,
-                    device=device,
-                    dtype=torch.long,
-                )
-                with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
-                    adv_out = vlm(
-                        input_ids=adv_tensor,
-                        past_key_values=prompt_cache,
-                        use_cache=True,
-                    )
-                prompt_cache = adv_out.past_key_values
-                prefill_seq_len = prompt_cache.get_seq_length()
-                offsets = offsets + 1
-
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            timings["teacher_forced"] = time.time() - t_
-
-            # Phase 3: Batched expert diffusion
-            t_ = time.time()
-            position_ids = torch.arange(n_diffusion_tokens, device=device)
-            position_ids = einops.repeat(
-                position_ids,
-                "l -> 3 b l",
-                b=n_valid,
-            ).clone()
-            delta = rope_deltas + offsets[:, None]  # (n_valid, 1)
-            position_ids += delta.to(position_ids.device)
-
-            # Expert attention mask: attend to real prefix + diffusion tokens, mask padding
-            expert_attn_mask = torch.zeros(
-                (n_valid, 1, n_diffusion_tokens, prefill_seq_len + n_diffusion_tokens),
-                dtype=torch.float32,
-                device=device,
+        # Build result dicts
+        results = []
+        for i, item in enumerate(valid_items):
+            meta = per_scene_meta[item["scene_idx"]]
+            traj_token_ids = (discrete_tokens[i] + self.traj_token_start_idx).tolist()
+            completion_ids = (
+                item["coc_tokens"]
+                + [traj_future_start_id]
+                + traj_token_ids
+                + [traj_future_end_id]
             )
-            min_val = torch.finfo(expert_attn_mask.dtype).min
-            for i in range(n_valid):
-                # Mask padding region in KV cache (between real prefix and diffusion tokens)
-                expert_attn_mask[i, :, :, offsets[i] : -n_diffusion_tokens] = min_val
+            pred_traj = pred_xyz[i].cpu().numpy().flatten().tolist()
 
-            forward_kwargs = {}
-            if self.expert_non_causal:
-                forward_kwargs["is_causal"] = False
-
-            def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-                b = x.shape[0]
-                future_token_embeds = self.action_in_proj(x, t)
-                if future_token_embeds.dim() == 2:
-                    future_token_embeds = future_token_embeds.view(
-                        b,
-                        n_diffusion_tokens,
-                        -1,
-                    )
-                expert_out = self.expert(
-                    inputs_embeds=future_token_embeds,
-                    position_ids=position_ids,
-                    past_key_values=prompt_cache,  # noqa: F821
-                    attention_mask=expert_attn_mask,
-                    use_cache=True,
-                    **forward_kwargs,
-                )
-                prompt_cache.crop(prefill_seq_len)  # noqa: F821
-                last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
-                return self.action_out_proj(last_hidden).view(
-                    -1,
-                    *self.action_space.get_action_space_dims(),
-                )
-
-            diffusion_kwargs = {}
-            if self.expert_diffusion_steps != 10:
-                diffusion_kwargs["num_steps"] = self.expert_diffusion_steps
-
-            with torch.autocast(str(device), dtype=torch.bfloat16):
-                sampled_action = self.diffusion.sample(
-                    batch_size=n_valid,
-                    step_fn=step_fn,
-                    device=device,
-                    return_all_steps=False,
-                    **diffusion_kwargs,
-                )
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            timings["diffusion"] = time.time() - t_
-
-            del prompt_cache
-
-            # Phase 4: Batched trajectory encoding
-            t_ = time.time()
-            # Build batched hist_xyz/hist_rot for valid items
-            hist_xyz_list = []
-            hist_rot_list = []
-            for item in valid_items:
-                meta = per_scene_meta[item["scene_idx"]]
-                hist_xyz_list.append(meta["hist_xyz"])  # (1, T, 3)
-                hist_rot_list.append(meta["hist_rot"])  # (1, T, 3, 3)
-            hist_xyz_batch = torch.cat(hist_xyz_list, dim=0)  # (n_valid, T, 3)
-            hist_rot_batch = torch.cat(hist_rot_list, dim=0)  # (n_valid, T, 3, 3)
-
-            pred_xyz, pred_rot = self.action_space.action_to_traj(
-                sampled_action,
-                hist_xyz_batch,
-                hist_rot_batch,
+            results.append(
+                {
+                    "prompt_ids": meta["prompt_ids"],
+                    "completion_ids": completion_ids,
+                    "pred_xyz": pred_traj,
+                    "gt_xyz": meta["gt_xyz"],
+                    "coc_text": item["coc_text"],
+                    "clip_id": meta["clip_id"],
+                    "t0_us": t0_us,
+                    "completion_prefix": item["coc_prefix"],
+                    "hist_xyz": meta["hist_xyz"][0].cpu(),
+                    "hist_rot": meta["hist_rot"][0].cpu(),
+                }
             )
-            discrete_tokens = self.traj_tokenizer.encode(
-                hist_xyz_batch,
-                hist_rot_batch,
-                pred_xyz,
-                pred_rot,
-            )
-            discrete_tokens = discrete_tokens.clamp(0, self.traj_vocab_size - 1)
-            # discrete_tokens: (n_valid, n_traj_tokens)
-
-            # Build result dicts
-            results = []
-            for i, item in enumerate(valid_items):
-                meta = per_scene_meta[item["scene_idx"]]
-                traj_token_ids = (discrete_tokens[i] + self.traj_token_start_idx).tolist()
-                completion_ids = (
-                    item["coc_tokens"]
-                    + [traj_future_start_id]
-                    + traj_token_ids
-                    + [traj_future_end_id]
-                )
-                pred_traj = pred_xyz[i].cpu().numpy().flatten().tolist()
-
-                results.append(
-                    {
-                        "prompt_ids": meta["prompt_ids"],
-                        "completion_ids": completion_ids,
-                        "pred_xyz": pred_traj,
-                        "gt_xyz": meta["gt_xyz"],
-                        "coc_text": item["coc_text"],
-                        "clip_id": meta["clip_id"],
-                        "t0_us": t0_us,
-                        "completion_prefix": item["coc_prefix"],
-                        "hist_xyz": meta["hist_xyz"][0].cpu(),
-                        "hist_rot": meta["hist_rot"][0].cpu(),
-                    }
-                )
-            timings["traj_encode"] = time.time() - t_
-
-        finally:
-            for m in gc_modules:
-                m.gradient_checkpointing = True
+        timings["traj_encode"] = time.time() - t_
 
         logger.info(
             "[expert_batch] S=%d, G=%d (%d valid, %d results) timings: %s | total=%.2fs",

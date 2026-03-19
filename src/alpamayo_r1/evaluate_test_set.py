@@ -6,6 +6,7 @@ Optimized evaluation script with batched processing and parallel data loading.
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -24,7 +25,9 @@ from tqdm import tqdm
 
 from alpamayo_r1 import helper
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
-from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1, ExpertLogitsProcessor
+from alpamayo_r1.models.token_utils import StopAfterEOS, extract_traj_tokens
+from alpamayo_r1.training.advantage_conditioning import compute_advantage_token_ids
 
 # Pin to avoid breaking changes when the upstream HF dataset is updated.
 # Must match the revision in training/configs/grpo_default.yaml.
@@ -110,6 +113,329 @@ def compute_minFDE(pred_xyz: torch.Tensor, gt_xyz: torch.Tensor) -> float:
     return float(min_fde)
 
 
+logger = logging.getLogger(__name__)
+
+
+def _evaluate_expert_with_adv_traj(
+    model: AlpamayoR1,
+    model_inputs: dict,
+    num_traj_samples: int,
+    temperature: float,
+    top_p: float,
+    adv_traj_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Evaluate with expert mode + adv_traj injection via batched pipeline.
+
+    Uses ``run_batched_expert_diffusion`` from sft_rollout for the shared
+    TF forward + adv_traj injection + expert diffusion phases.
+    """
+    from transformers import GenerationConfig, StoppingCriteriaList
+    from transformers.generation.logits_process import LogitsProcessorList
+
+    from alpamayo_r1.training.sft_rollout import run_batched_expert_diffusion
+
+    device = next(model.vlm.parameters()).device
+
+    # 1. Fuse history trajectory tokens
+    tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
+    input_ids = tokenized.pop("input_ids")
+    traj_data = {
+        "ego_history_xyz": model_inputs["ego_history_xyz"],
+        "ego_history_rot": model_inputs["ego_history_rot"],
+    }
+    input_ids = model.fuse_traj_tokens(input_ids, traj_data)
+    prompt_len = input_ids.shape[1]
+
+    hist_xyz = model_inputs["ego_history_xyz"][:, -1]  # (1, T, 3)
+    hist_rot = model_inputs["ego_history_rot"][:, -1]  # (1, T, 3, 3)
+
+    # 2. Batch AR CoC generation
+    traj_future_start_id = model.special_token_ids["traj_future_start"]
+    pad_token_id = model.tokenizer.pad_token_id
+
+    gen_config = GenerationConfig(
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        num_return_sequences=num_traj_samples,
+        max_new_tokens=256 + 10,
+        pad_token_id=pad_token_id,
+    )
+    logits_processor = LogitsProcessorList(
+        [
+            ExpertLogitsProcessor(
+                traj_token_offset=model.config.traj_token_start_idx,
+                traj_vocab_size=model.config.traj_vocab_size,
+            )
+        ]
+    )
+    stopping = StoppingCriteriaList([StopAfterEOS(eos_token_id=traj_future_start_id)])
+
+    vlm_output = model.vlm.generate(
+        input_ids=input_ids,
+        generation_config=gen_config,
+        stopping_criteria=stopping,
+        logits_processor=logits_processor,
+        **tokenized,
+    )
+    generated_seqs = vlm_output[:, prompt_len:]
+
+    # 3. Parse valid completions
+    valid_items: list[dict] = []
+    for sample_idx in range(num_traj_samples):
+        raw = generated_seqs[sample_idx].cpu().tolist()
+        while raw and raw[-1] == pad_token_id:
+            raw.pop()
+        try:
+            traj_pos = raw.index(traj_future_start_id)
+        except ValueError:
+            logger.warning("No <traj_future_start> in sample %d, skipping", sample_idx)
+            continue
+        coc_tokens = raw[:traj_pos]
+        valid_items.append(
+            {
+                "coc_tokens": coc_tokens,
+                "coc_prefix": coc_tokens + [traj_future_start_id],
+                "coc_text": model.tokenizer.decode(
+                    coc_tokens, skip_special_tokens=True
+                ).strip(),
+            }
+        )
+
+    if not valid_items:
+        raise RuntimeError("All trajectory samples failed (no <traj_future_start> found)")
+
+    n_valid = len(valid_items)
+
+    # 4. Build right-padded TF sequences
+    full_lens = [prompt_len + len(item["coc_prefix"]) for item in valid_items]
+    max_full_len = max(full_lens)
+
+    tf_input_ids = torch.full(
+        (n_valid, max_full_len), pad_token_id, dtype=torch.long, device=device
+    )
+    tf_attention_mask = torch.zeros(n_valid, max_full_len, dtype=torch.long, device=device)
+
+    for i, item in enumerate(valid_items):
+        prefix = torch.tensor(item["coc_prefix"], device=device, dtype=torch.long)
+        actual_len = prompt_len + prefix.shape[0]
+        tf_input_ids[i, :prompt_len] = input_ids[0]
+        tf_input_ids[i, prompt_len:actual_len] = prefix
+        tf_attention_mask[i, :actual_len] = 1
+
+    # Replicate pixel_values and image_grid_thw for each valid completion
+    pv = tokenized.get("pixel_values")
+    igt = tokenized.get("image_grid_thw")
+    pv_tensor = pv.repeat(n_valid, *([1] * (pv.dim() - 1))) if pv is not None else None
+    igt_tensor = igt.repeat(n_valid, 1) if igt is not None else None
+
+    # 5. Run batched TF + adv_traj injection + expert diffusion
+    sampled_action = run_batched_expert_diffusion(
+        model=model,
+        tf_input_ids=tf_input_ids,
+        tf_attention_mask=tf_attention_mask,
+        full_lens=full_lens,
+        pixel_values=pv_tensor,
+        image_grid_thw=igt_tensor,
+        adv_traj_token_id=adv_traj_token_id,
+        expert_non_causal=model.config.expert_non_causal_attention,
+    )
+
+    # 6. Batched action_to_traj
+    hist_xyz_batch = hist_xyz.expand(n_valid, -1, -1)  # (n_valid, T, 3)
+    hist_rot_batch = hist_rot.expand(n_valid, -1, -1, -1)  # (n_valid, T, 3, 3)
+
+    pred_xyz, pred_rot = model.action_space.action_to_traj(
+        sampled_action, hist_xyz_batch, hist_rot_batch
+    )
+
+    # Reshape: (n_valid, T, 3) -> (1, 1, n_valid, T, 3)
+    pred_xyz = pred_xyz.unsqueeze(0).unsqueeze(0)
+    pred_rot = pred_rot.unsqueeze(0).unsqueeze(0)
+
+    coc_texts = [item["coc_text"] for item in valid_items]
+    extra = {"cot": np.array(coc_texts).reshape(1, 1, -1)}
+    return pred_xyz, pred_rot, extra
+
+
+def _evaluate_vlm_only_with_adv_traj(
+    model: AlpamayoR1,
+    model_inputs: dict,
+    num_traj_samples: int,
+    temperature: float,
+    top_p: float,
+    adv_traj_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Evaluate with VLM-only mode + adv_traj injection via teacher-forced KV cache.
+
+    1. Fuse history tokens, batch AR CoC generation (StopAfterEOS at traj_future_start)
+    2. Per-sample: teacher-force [input_ids + CoC + adv_traj] to rebuild KV cache
+    3. Per-sample: continue AR from TFS with KV cache (StopAfterEOS at traj_future_end)
+    4. Extract trajectory tokens, decode to continuous xyz/rot
+    """
+    from transformers import GenerationConfig, StoppingCriteriaList
+
+    device = next(model.vlm.parameters()).device
+
+    # 1. Fuse history trajectory tokens
+    tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
+    input_ids = tokenized.pop("input_ids")
+    traj_data = {
+        "ego_history_xyz": model_inputs["ego_history_xyz"],
+        "ego_history_rot": model_inputs["ego_history_rot"],
+    }
+    input_ids = model.fuse_traj_tokens(input_ids, traj_data)
+    prompt_len = input_ids.shape[1]
+
+    hist_xyz = model_inputs["ego_history_xyz"][:, -1]  # (1, T, 3)
+    hist_rot = model_inputs["ego_history_rot"][:, -1]  # (1, T, 3, 3)
+
+    # 2. Batch AR CoC generation (stop at traj_future_start)
+    traj_future_start_id = model.special_token_ids["traj_future_start"]
+    traj_future_end_id = model.special_token_ids["traj_future_end"]
+    tokens_per_future_traj = model.config.tokens_per_future_traj
+    pad_token_id = model.tokenizer.pad_token_id
+
+    gen_config = GenerationConfig(
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        num_return_sequences=num_traj_samples,
+        max_new_tokens=256 + 10,
+        pad_token_id=pad_token_id,
+    )
+    stopping = StoppingCriteriaList([StopAfterEOS(eos_token_id=traj_future_start_id)])
+
+    vlm_output = model.vlm.generate(
+        input_ids=input_ids,
+        generation_config=gen_config,
+        stopping_criteria=stopping,
+        **tokenized,
+    )
+    generated_seqs = vlm_output[:, prompt_len:]
+
+    # 3. Per-sample: teacher-forced + adv_traj + continued AR
+    pred_xyz_list = []
+    pred_rot_list = []
+    coc_texts = []
+    vlm = model.vlm
+
+    # Disable gradient checkpointing for teacher-forced forwards
+    gc_modules = [m for m in vlm.modules() if getattr(m, "gradient_checkpointing", False)]
+    for m in gc_modules:
+        m.gradient_checkpointing = False
+
+    try:
+        for sample_idx in range(num_traj_samples):
+            raw_completion = generated_seqs[sample_idx].cpu().tolist()
+
+            # Strip padding
+            while raw_completion and raw_completion[-1] == pad_token_id:
+                raw_completion.pop()
+
+            # Find <traj_future_start>
+            try:
+                traj_start_pos = raw_completion.index(traj_future_start_id)
+            except ValueError:
+                logger.warning(
+                    "No <traj_future_start> in sample %d, skipping", sample_idx
+                )
+                continue
+
+            coc_tokens = raw_completion[:traj_start_pos]
+            coc_text = model.tokenizer.decode(coc_tokens, skip_special_tokens=True).strip()
+            coc_texts.append(coc_text)
+
+            # Teacher-forced: [input_ids + CoC + adv_traj]
+            # We include adv_traj before TFS so the KV cache has the conditioning
+            completion_prefix_ids = coc_tokens + [adv_traj_token_id]
+            prefix_tensor = torch.tensor(
+                [completion_prefix_ids], device=device, dtype=torch.long
+            )
+            full_ids = torch.cat([input_ids, prefix_tensor], dim=1)
+
+            tf_kwargs = {}
+            if "attention_mask" in tokenized:
+                orig_mask = tokenized["attention_mask"]
+                prefix_mask = torch.ones(
+                    1, len(completion_prefix_ids), device=device, dtype=orig_mask.dtype
+                )
+                tf_kwargs["attention_mask"] = torch.cat([orig_mask, prefix_mask], dim=1)
+            for k in ("pixel_values", "image_grid_thw"):
+                if k in tokenized:
+                    tf_kwargs[k] = tokenized[k]
+
+            with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
+                tf_out = vlm(
+                    input_ids=full_ids,
+                    use_cache=True,
+                    **tf_kwargs,
+                )
+
+            prompt_cache = tf_out.past_key_values
+
+            # Continue AR from TFS token using KV cache
+            tfs_tensor = torch.tensor(
+                [[traj_future_start_id]], device=device, dtype=torch.long
+            )
+            cont_gen_config = GenerationConfig(
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                num_return_sequences=1,
+                max_new_tokens=tokens_per_future_traj + 10,
+                pad_token_id=pad_token_id,
+            )
+            cont_stopping = StoppingCriteriaList(
+                [StopAfterEOS(eos_token_id=traj_future_end_id)]
+            )
+
+            with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
+                cont_output = vlm.generate(
+                    input_ids=tfs_tensor,
+                    past_key_values=prompt_cache,
+                    generation_config=cont_gen_config,
+                    stopping_criteria=cont_stopping,
+                )
+            # cont_output: (1, 1 + generated_len) — starts with TFS
+
+            # Build full sequence for traj token extraction:
+            # [... traj_future_start, <traj_tokens>, traj_future_end]
+            full_seq = cont_output  # already starts with traj_future_start_id
+
+            traj_tokens = extract_traj_tokens(
+                full_seq,
+                model.special_token_ids,
+                tokens_per_future_traj,
+                model.future_token_start_idx,
+                model.config.traj_vocab_size,
+            )
+
+            pred_xyz, pred_rot, _ = model.traj_tokenizer.decode(
+                hist_xyz, hist_rot, traj_tokens
+            )
+            pred_xyz_list.append(pred_xyz)
+            pred_rot_list.append(pred_rot)
+
+            del prompt_cache
+
+    finally:
+        for m in gc_modules:
+            m.gradient_checkpointing = True
+
+    if not pred_xyz_list:
+        raise RuntimeError("All trajectory samples failed (no <traj_future_start> found)")
+
+    # Stack: (1, 1, num_ok_samples, T, 3) / (1, 1, num_ok_samples, T, 3, 3)
+    pred_xyz = torch.stack(pred_xyz_list, dim=0).unsqueeze(0).unsqueeze(0)
+    pred_rot = torch.stack(pred_rot_list, dim=0).unsqueeze(0).unsqueeze(0)
+    pred_xyz = pred_xyz.squeeze(3)
+    pred_rot = pred_rot.squeeze(3)
+
+    extra = {"cot": np.array(coc_texts).reshape(1, 1, -1) if coc_texts else None}
+    return pred_xyz, pred_rot, extra
+
+
 def evaluate_batch(
     model: AlpamayoR1,
     processor,
@@ -120,6 +446,8 @@ def evaluate_batch(
     device: str,
     t0_us: int = 5_100_000,
     traj_mode: str = "expert",
+    adv_obs_token_id: int | None = None,
+    adv_traj_token_id: int | None = None,
 ) -> list:
     """Evaluate a batch of samples.
 
@@ -127,6 +455,9 @@ def evaluate_batch(
         traj_mode: Trajectory generation mode.
             ``"expert"`` uses the full VLM + Expert + Diffusion pipeline.
             ``"vlm"`` uses VLM-only discrete trajectory token generation.
+        adv_obs_token_id: If set, append this token to input_ids before generation.
+        adv_traj_token_id: If set, inject this token between CoC and trajectory
+            via teacher-forced KV cache rebuild (per-sample processing).
     """
     results = []
 
@@ -149,9 +480,44 @@ def evaluate_batch(
             # Prepare inputs
             model_inputs = helper.prepare_model_inputs(sample, processor, device)
 
+            # Append adv_obs token to input_ids if requested
+            if adv_obs_token_id is not None:
+                input_ids = model_inputs["tokenized_data"]["input_ids"]
+                adv_obs_tensor = torch.tensor(
+                    [[adv_obs_token_id]], device=input_ids.device, dtype=input_ids.dtype
+                )
+                model_inputs["tokenized_data"]["input_ids"] = torch.cat(
+                    [input_ids, adv_obs_tensor], dim=1
+                )
+                if "attention_mask" in model_inputs["tokenized_data"]:
+                    attn = model_inputs["tokenized_data"]["attention_mask"]
+                    model_inputs["tokenized_data"]["attention_mask"] = torch.cat(
+                        [attn, torch.ones(1, 1, device=attn.device, dtype=attn.dtype)], dim=1
+                    )
+
             # Run inference with the selected trajectory generation mode
             with torch.autocast(device, dtype=torch.bfloat16):
-                if traj_mode == "vlm":
+                if adv_traj_token_id is not None:
+                    # Per-sample teacher-forced generation with adv_traj injection
+                    if traj_mode == "vlm":
+                        pred_xyz, pred_rot, extra = _evaluate_vlm_only_with_adv_traj(
+                            model=model,
+                            model_inputs=model_inputs,
+                            num_traj_samples=num_traj_samples,
+                            temperature=temperature,
+                            top_p=top_p,
+                            adv_traj_token_id=adv_traj_token_id,
+                        )
+                    else:
+                        pred_xyz, pred_rot, extra = _evaluate_expert_with_adv_traj(
+                            model=model,
+                            model_inputs=model_inputs,
+                            num_traj_samples=num_traj_samples,
+                            temperature=temperature,
+                            top_p=top_p,
+                            adv_traj_token_id=adv_traj_token_id,
+                        )
+                elif traj_mode == "vlm":
                     pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_only(
                         data=model_inputs,
                         top_p=top_p,
@@ -308,6 +674,16 @@ def main():
         default=None,
         help="Self-play iteration index to load (0-based). Merges VLM LoRA from iter_0 through iter_N.",
     )
+    parser.add_argument(
+        "--adv-obs",
+        action="store_true",
+        help="Inject positive obs advantage token. Requires --iteration-dir.",
+    )
+    parser.add_argument(
+        "--adv-traj",
+        action="store_true",
+        help="Inject positive traj advantage token. Requires --iteration-dir.",
+    )
 
     args = parser.parse_args()
 
@@ -317,6 +693,8 @@ def main():
         parser.error("--iteration-dir and --iteration must be used together")
     if args.shard_id is not None and args.shard_id >= args.num_shards:
         parser.error("--shard-id must be less than --num-shards")
+    if (args.adv_obs or args.adv_traj) and args.iteration_dir is None:
+        parser.error("--adv-obs/--adv-traj require --iteration-dir")
 
     # Set random seed
     torch.manual_seed(args.seed)
@@ -369,7 +747,27 @@ def main():
             print("  Value head: loaded")
         if result.get("adv_embedding"):
             print("  Advantage embedding: loaded")
+
+        # Attach advantage embedding if conditioning is requested
+        adv_obs_token_id = None
+        adv_traj_token_id = None
+        if args.adv_obs or args.adv_traj:
+            adv_emb = result.get("adv_embedding")
+            if adv_emb is None:
+                parser.error("No adv_embedding checkpoint found in iteration dir")
+            vocab_size = model.vlm.config.text_config.vocab_size
+            adv_token_ids = compute_advantage_token_ids(vocab_size)
+            adv_emb.to(model.vlm.device)
+            adv_emb.attach(model.vlm)
+            if args.adv_obs:
+                adv_obs_token_id = adv_token_ids["adv_obs_pos"]
+                print(f"  adv_obs conditioning: enabled (token_id={adv_obs_token_id})")
+            if args.adv_traj:
+                adv_traj_token_id = adv_token_ids["adv_traj_pos"]
+                print(f"  adv_traj conditioning: enabled (token_id={adv_traj_token_id})")
     else:
+        adv_obs_token_id = None
+        adv_traj_token_id = None
         model_path = Path(args.model_name)
         is_lora = (model_path / "adapter_config.json").exists()
         if is_lora:
@@ -456,6 +854,8 @@ def main():
                 device=args.device,
                 t0_us=args.t0_us,
                 traj_mode=args.traj_mode,
+                adv_obs_token_id=adv_obs_token_id,
+                adv_traj_token_id=adv_traj_token_id,
             )
             all_results.extend(results)
 
@@ -503,6 +903,8 @@ def main():
                 "num_workers": args.num_workers,
                 "prefetch_factor": args.prefetch_factor,
                 "compile_model": args.compile_model,
+                "adv_obs": args.adv_obs,
+                "adv_traj": args.adv_traj,
             },
         }
 
