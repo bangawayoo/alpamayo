@@ -2,12 +2,12 @@
 # Full test set evaluation (~61,599 valid test clips from PhysicalAI-AV)
 #
 # Usage:
-#   ./evaluate_full_test.sh                      # single GPU
+#   ./evaluate_full_test.sh                      # auto-detect GPUs
 #   ./evaluate_full_test.sh --num-gpus 4         # multi-GPU data parallelism
 
 set -euo pipefail
 
-NUM_GPUS=1
+NUM_GPUS=""
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -22,6 +22,18 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Auto-detect GPU count if not specified
+if [[ -z "$NUM_GPUS" ]]; then
+    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+    else
+        NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+    fi
+    if [[ "$NUM_GPUS" -lt 1 ]]; then
+        NUM_GPUS=1
+    fi
+fi
 
 OUTPUT_DIR="evaluation_results/full_test_set"
 

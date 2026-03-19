@@ -2,7 +2,7 @@
 # Curated test set evaluation (1,181 clips from notebooks/clip_ids.parquet)
 #
 # Usage:
-#   ./evaluate_quick_test.sh                          # single GPU
+#   ./evaluate_quick_test.sh                          # auto-detect GPUs
 #   ./evaluate_quick_test.sh --num-gpus 4             # multi-GPU data parallelism (1 trial)
 #   ./evaluate_quick_test.sh --seed 123               # custom seed
 #   ./evaluate_quick_test.sh --temperature 0          # greedy decoding
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-NUM_GPUS=1
+NUM_GPUS=""
 MODEL="nvidia/Alpamayo-R1-10B"
 SEED=42
 OUTPUT_DIR=""
@@ -81,6 +81,18 @@ done
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="evaluation_results/curated_set-$(basename "$MODEL")"
 fi
+# Auto-detect GPU count if not specified
+if [[ -z "$NUM_GPUS" ]]; then
+    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+    else
+        NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+    fi
+    if [[ "$NUM_GPUS" -lt 1 ]]; then
+        NUM_GPUS=1
+    fi
+fi
+
 export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN env var}"
 
 echo "Running curated test set evaluation (1,181 clips)..."
