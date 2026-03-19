@@ -230,47 +230,67 @@ def load_value_head_checkpoint(
 def load_expert_checkpoint(
     full_model: Any,
     path: str | Path,
-    expert_lora_cfg: dict | None = None,
 ) -> Any:
     """Load expert + projection weights from a checkpoint.
 
-    Handles both full-state and LoRA-only checkpoints. When the checkpoint
-    contains only LoRA weights (``expert_lora: True``), the caller must
-    supply ``expert_lora_cfg`` so that LoRA layers can be created before
-    the weights are loaded.
+    Supports two layouts:
+
+    * **New (PEFT)**: ``expert_adapter/`` directory alongside the checkpoint,
+      saved via ``PeftModel.save_pretrained``.  Loaded with
+      ``PeftModel.from_pretrained`` — config is embedded in adapter_config.json.
+    * **Legacy**: All weights (full or LoRA) inside ``expert_checkpoint.pt``.
+
+    Projection layers (``action_in_proj``, ``action_out_proj``) are always
+    loaded from ``expert_checkpoint.pt``.
 
     Args:
         full_model: AlpamayoR1 instance (mutated in place).
         path: Path to ``expert_checkpoint.pt``.
-        expert_lora_cfg: LoRA config dict (``r``, ``alpha``, ``target_modules``, …).
-            Required when loading a LoRA-only checkpoint.
 
     Returns:
         The same ``full_model`` reference (mutated).
     """
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    is_lora = checkpoint.get("expert_lora", False)
 
-    if is_lora:
-        if expert_lora_cfg is None:
-            raise ValueError(
-                "Checkpoint at %s is LoRA-only but no expert_lora_cfg was provided" % path
+    adapter_dir = Path(path).parent / "expert_adapter"
+    if adapter_dir.exists():
+        # New format: PEFT adapter saved via save_pretrained
+        from peft import PeftModel
+
+        full_model.expert = PeftModel.from_pretrained(full_model.expert, str(adapter_dir))
+        logger.info("Loaded expert LoRA adapter from %s", adapter_dir)
+    elif checkpoint.get("expert_lora", False):
+        # Legacy format: LoRA weights embedded in expert_checkpoint.pt.
+        # Read config from resolved_config.yaml in the output directory.
+        # remove this after next training run
+        import yaml
+
+        config_path = Path(path).parent.parent.parent / "resolved_config.yaml"
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Legacy expert LoRA checkpoint at {path} requires "
+                f"resolved_config.yaml at {config_path} for LoRA config"
             )
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        expert_lora_cfg = cfg.get("expert_finetune", {}).get("expert_lora", {})
+
         from peft import LoraConfig, get_peft_model
 
         lora_config = LoraConfig(
-            r=int(expert_lora_cfg.get("r", 4)),
-            lora_alpha=int(expert_lora_cfg.get("alpha", 32)),
+            r=int(expert_lora_cfg["r"]),
+            lora_alpha=int(expert_lora_cfg["alpha"]),
             lora_dropout=float(expert_lora_cfg.get("dropout", 0.0)),
-            target_modules=list(
-                expert_lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
-            ),
+            target_modules=list(expert_lora_cfg["target_modules"]),
             task_type="FEATURE_EXTRACTION",
         )
         full_model.expert = get_peft_model(full_model.expert, lora_config)
         full_model.expert.load_state_dict(checkpoint["expert"], strict=False)
-        logger.info("Loaded expert LoRA weights from %s", path)
-    else:
+        logger.info(
+            "Loaded legacy expert LoRA weights from %s (r=%d, alpha=%d)",
+            path, lora_config.r, lora_config.lora_alpha,
+        )
+    elif "expert" in checkpoint:
         full_model.expert.load_state_dict(checkpoint["expert"], strict=False)
         logger.info("Loaded full expert weights from %s", path)
 
@@ -280,28 +300,75 @@ def load_expert_checkpoint(
     return full_model
 
 
+def load_adv_embedding_checkpoint(
+    full_model: Any,
+    path: str | Path,
+) -> Any:
+    """Load AdvantageEmbedding from a saved .pt checkpoint.
+
+    Args:
+        full_model: AlpamayoR1 instance (used to derive vocab_size/hidden_size).
+        path: Path to the ``adv_embedding.pt`` file.
+
+    Returns:
+        AdvantageEmbedding module with loaded weights.
+    """
+    from alpamayo_r1.training.advantage_conditioning import (
+        AdvantageEmbedding,
+        compute_advantage_token_ids,
+    )
+
+    vocab_size = full_model.vlm.config.text_config.vocab_size
+    hidden_size = full_model.vlm.config.text_config.hidden_size
+    adv_token_ids = compute_advantage_token_ids(vocab_size)
+    adv_embedding = AdvantageEmbedding(hidden_size, adv_token_ids)
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    adv_embedding.load_state_dict(state)
+    logger.info("Loaded advantage embedding from %s", path)
+    return adv_embedding
+
+
+def _is_expert_lora_checkpoint(iter_dir: Path) -> bool:
+    """Check whether an iteration directory has an expert LoRA checkpoint.
+
+    Checks for the new ``expert_adapter/`` dir first, then falls back to the
+    ``expert_lora`` flag inside ``expert_checkpoint.pt``.
+    """
+    if (iter_dir / "expert_adapter" / "adapter_config.json").exists():
+        return True
+    pt_path = iter_dir / "expert_checkpoint.pt"
+    if pt_path.exists():
+        probe = torch.load(pt_path, map_location="cpu", weights_only=False)
+        return probe.get("expert_lora", False)
+    return False
+
+
 def load_vlm_from_iterations(
     base_model_name: str,
     output_dir: str | Path,
     up_to_iteration: int,
-    expert_lora_cfg: dict | None = None,
     dtype: torch.dtype = torch.bfloat16,
+    device_map: str | None = None,
 ) -> Any:
     """Reconstruct a model by iteratively merging per-iteration LoRA adapters.
 
     Starting from the base model, loads and merges VLM LoRA adapters from
-    ``iter_0/final/`` through ``iter_{up_to_iteration}/final/``. Also loads
-    the latest expert checkpoint and value head from the final iteration.
+    ``iter_0/final/`` through ``iter_{up_to_iteration}/final/``. Expert LoRA
+    checkpoints are also iteratively applied and merged; non-LoRA expert
+    checkpoints are loaded from the latest iteration only (they contain full
+    weights). Value head and advantage embedding are loaded from the final
+    iteration.
 
     Args:
         base_model_name: HuggingFace model name or path for the base AlpamayoR1.
         output_dir: Root output directory containing ``iter_*/final/`` subdirs.
         up_to_iteration: Last iteration index (inclusive) to merge.
-        expert_lora_cfg: Expert LoRA config dict (needed if expert checkpoint is LoRA-only).
         dtype: Model dtype.
+        device_map: Device map for model loading (e.g. ``"auto"``).
 
     Returns:
-        Dict with keys ``full_model``, ``value_head`` (or None).
+        Dict with keys ``full_model``, ``value_head`` (or None),
+        ``adv_embedding`` (or None).
     """
     from peft import PeftModel
 
@@ -310,37 +377,73 @@ def load_vlm_from_iterations(
     output_dir = Path(output_dir)
 
     logger.info("Loading base model from %s", base_model_name)
-    full_model = AlpamayoR1.from_pretrained(base_model_name, dtype=dtype)
+    kwargs = {}
+    if device_map is not None:
+        kwargs["device_map"] = device_map
+    full_model = AlpamayoR1.from_pretrained(base_model_name, dtype=dtype, **kwargs)
 
     # Iteratively apply and merge VLM LoRA adapters
     for i in range(up_to_iteration + 1):
         adapter_path = output_dir / f"iter_{i}" / "final"
         adapter_config = adapter_path / "adapter_config.json"
         if not adapter_config.exists():
-            logger.info("No VLM adapter at %s — skipping iteration %d", adapter_path, i)
-            continue
+            raise FileNotFoundError(
+                f"Expected VLM adapter at {adapter_path} for iteration {i}, "
+                f"but adapter_config.json not found"
+            )
         logger.info("Loading VLM LoRA adapter from %s", adapter_path)
         full_model.vlm = PeftModel.from_pretrained(full_model.vlm, str(adapter_path))
         full_model.vlm = full_model.vlm.merge_and_unload()
         logger.info("Merged VLM LoRA from iteration %d", i)
 
-    # Load expert checkpoint from the latest iteration
-    latest_expert = output_dir / f"iter_{up_to_iteration}" / "final" / "expert_checkpoint.pt"
-    if latest_expert.exists():
-        load_expert_checkpoint(full_model, latest_expert, expert_lora_cfg=expert_lora_cfg)
+    # Load expert checkpoint(s). For LoRA-based expert, iteratively apply and
+    # merge from each iteration (same stacking logic as VLM LoRA). For non-LoRA
+    # expert, just load the latest iteration's full weights.
+    latest_dir = output_dir / f"iter_{up_to_iteration}" / "final"
+    latest_expert = latest_dir / "expert_checkpoint.pt"
+    if not latest_expert.exists():
+        raise FileNotFoundError(
+            f"Expected expert checkpoint at {latest_expert} but file not found"
+        )
+    if _is_expert_lora_checkpoint(latest_dir):
+        # Expert uses LoRA — stack from iter_0 through iter_N
+        for i in range(up_to_iteration + 1):
+            iter_final = output_dir / f"iter_{i}" / "final"
+            expert_path = iter_final / "expert_checkpoint.pt"
+            if not expert_path.exists():
+                raise FileNotFoundError(
+                    f"Expected expert checkpoint at {expert_path} for iteration {i}, "
+                    f"but file not found"
+                )
+            load_expert_checkpoint(full_model, expert_path)
+            if hasattr(full_model.expert, "merge_and_unload"):
+                full_model.expert = full_model.expert.merge_and_unload()
+            if hasattr(full_model.expert, "peft_config"):
+                delattr(full_model.expert, "peft_config")
+            logger.info("Merged expert LoRA from iteration %d", i)
+    else:
+        # Non-LoRA expert — full weights from the latest iteration
+        load_expert_checkpoint(full_model, latest_expert)
 
     # Load value head from the latest iteration
     value_head = None
-    latest_vh = output_dir / f"iter_{up_to_iteration}" / "final" / "value_head.pt"
+    latest_vh = latest_dir / "value_head.pt"
     if latest_vh.exists():
         value_head = load_value_head_checkpoint(latest_vh)
 
+    # Load advantage embedding from the latest iteration
+    adv_embedding = None
+    latest_adv = latest_dir / "adv_embedding.pt"
+    if latest_adv.exists():
+        adv_embedding = load_adv_embedding_checkpoint(full_model, latest_adv)
+
     logger.info(
-        "Reconstructed model through iteration %d (VLM merged, expert loaded, vh=%s)",
+        "Reconstructed model through iteration %d (VLM merged, expert loaded, vh=%s, adv=%s)",
         up_to_iteration,
         value_head is not None,
+        adv_embedding is not None,
     )
-    return {"full_model": full_model, "value_head": value_head}
+    return {"full_model": full_model, "value_head": value_head, "adv_embedding": adv_embedding}
 
 
 # ---------------------------------------------------------------------------

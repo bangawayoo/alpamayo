@@ -296,11 +296,25 @@ def main():
         default=DEFAULT_DATASET_REVISION,
         help="HF dataset revision for PhysicalAI-AV (default: pinned revision)",
     )
+    parser.add_argument(
+        "--iteration-dir",
+        type=str,
+        default=None,
+        help="Path to self-play output directory containing iter_*/final/ subdirs",
+    )
+    parser.add_argument(
+        "--iteration",
+        type=int,
+        default=None,
+        help="Self-play iteration index to load (0-based). Merges VLM LoRA from iter_0 through iter_N.",
+    )
 
     args = parser.parse_args()
 
     if (args.shard_id is None) != (args.num_shards is None):
         parser.error("--shard-id and --num-shards must be used together")
+    if (args.iteration_dir is None) != (args.iteration is None):
+        parser.error("--iteration-dir and --iteration must be used together")
     if args.shard_id is not None and args.shard_id >= args.num_shards:
         parser.error("--shard-id must be less than --num-shards")
 
@@ -333,20 +347,43 @@ def main():
 
     # Load model
     print("\nLoading model...")
-    model_path = Path(args.model_name)
-    is_lora = (model_path / "adapter_config.json").exists()
-    if is_lora:
-        print(f"Detected LoRA adapter at {model_path}")
-        model = AlpamayoR1.from_pretrained_with_lora(
-            adapter_path=args.model_name,
+    if args.iteration_dir is not None:
+        import logging
+
+        logging.basicConfig(
+            level=logging.INFO, format="%(name)s - %(message)s", force=True
+        )
+        from alpamayo_r1.training.selfplay_loop import load_vlm_from_iterations
+
+        print(f"Loading self-play checkpoint: {args.iteration_dir} iter {args.iteration}")
+        result = load_vlm_from_iterations(
             base_model_name=args.base_model,
+            output_dir=args.iteration_dir,
+            up_to_iteration=args.iteration,
             dtype=torch.bfloat16,
             device_map="auto",
         )
+        model = result["full_model"]
+        print(f"Loaded self-play checkpoint through iteration {args.iteration}")
+        if result.get("value_head"):
+            print("  Value head: loaded")
+        if result.get("adv_embedding"):
+            print("  Advantage embedding: loaded")
     else:
-        model = AlpamayoR1.from_pretrained(
-            args.model_name, dtype=torch.bfloat16, device_map="auto"
-        )
+        model_path = Path(args.model_name)
+        is_lora = (model_path / "adapter_config.json").exists()
+        if is_lora:
+            print(f"Detected LoRA adapter at {model_path}")
+            model = AlpamayoR1.from_pretrained_with_lora(
+                adapter_path=args.model_name,
+                base_model_name=args.base_model,
+                dtype=torch.bfloat16,
+                device_map="auto",
+            )
+        else:
+            model = AlpamayoR1.from_pretrained(
+                args.model_name, dtype=torch.bfloat16, device_map="auto"
+            )
     model.eval()
     processor = helper.get_processor(model.tokenizer)
 

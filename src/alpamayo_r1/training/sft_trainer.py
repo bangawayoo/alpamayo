@@ -549,27 +549,27 @@ class AdvCondSFTTrainer(Trainer):
             is_lora = hasattr(expert, "peft_config")
 
             if is_lora:
-                expert_sd = {k: v for k, v in expert.state_dict().items() if "lora_" in k}
-            else:
-                expert_sd = expert.state_dict()
+                # Use PEFT's save_pretrained — saves adapter_config.json +
+                # adapter weights so load can use PeftModel.from_pretrained.
+                adapter_dir = Path(output_dir) / "expert_adapter"
+                expert.save_pretrained(str(adapter_dir))
+                logger.info("Saved expert LoRA adapter to %s", adapter_dir)
 
+            # expert_checkpoint.pt: full expert weights (non-LoRA) or just
+            # projections (LoRA — adapter handled by save_pretrained above).
             expert_state = {
-                "expert": expert_sd,
-                "expert_lora": is_lora,
                 "action_in_proj": self.full_model.action_in_proj.state_dict(),
                 "action_out_proj": self.full_model.action_out_proj.state_dict(),
             }
+            if not is_lora:
+                expert_state["expert"] = expert.state_dict()
+                expert_state["expert_lora"] = False
             if self._expert_optimizer is not None:
                 expert_state["optimizer"] = self._expert_optimizer.state_dict()
 
             expert_path = Path(output_dir) / "expert_checkpoint.pt"
             torch.save(expert_state, expert_path)
-            logger.info(
-                "Saved expert checkpoint to %s (lora_only=%s, keys=%d)",
-                expert_path,
-                is_lora,
-                len(expert_sd),
-            )
+            logger.info("Saved expert checkpoint to %s (lora=%s)", expert_path, is_lora)
 
         if self._value_head is not None:
             vh_path = Path(output_dir) / "value_head.pt"
