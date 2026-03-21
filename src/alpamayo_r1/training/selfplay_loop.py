@@ -855,9 +855,10 @@ class SelfPlayLoop:
 
         1. Compute rewards using reward functions
         2. Extract segment hidden states via teacher-forced VLM forward
-        3. Compute per-segment advantages using value head
-        4. Update the advantage buffer
-        5. Binarize advantages into conditioning labels
+        3. Compute per-segment advantages using CURRENT value head (before update)
+        4. Update value head on current rollout data (for next iteration)
+        5. Update the advantage buffer
+        6. Binarize advantages into conditioning labels
 
         Returns:
             List of dicts per completion: {i_obs, i_traj}
@@ -904,9 +905,22 @@ class SelfPlayLoop:
                 rollout_results
             )
 
-            # 3. Train value head to convergence on rollout data
             reward_weights = self._get_reward_weights()
             value_head = self._get_or_create_value_head()
+
+            # 3. Compute advantages using CURRENT value head (before update)
+            #    V(s) reflects expected returns from previous iterations, so
+            #    A = G - V(s) measures whether this rollout was better/worse
+            #    than expected.
+            advantages = compute_segment_advantages_from_rollouts(
+                segment_hidden_stash=segment_hidden_stash,
+                segment_reward_stash=reward_stash,
+                completion_segment_map=completion_segment_map,
+                value_head=value_head,
+                reward_weights=reward_weights,
+            )
+
+            # 4. THEN update value head on current data (for next iteration)
             g_obs, g_traj = compute_value_targets(
                 segment_reward_stash=reward_stash,
                 completion_segment_map=completion_segment_map,
@@ -928,15 +942,6 @@ class SelfPlayLoop:
                 global_step_offset=self._vh_global_step,
             )
             self._vh_global_step += vh_metrics.get("total_steps", 0)
-
-            # 4. Compute per-segment advantages using converged value head
-            advantages = compute_segment_advantages_from_rollouts(
-                segment_hidden_stash=segment_hidden_stash,
-                segment_reward_stash=reward_stash,
-                completion_segment_map=completion_segment_map,
-                value_head=value_head,
-                reward_weights=reward_weights,
-            )
         else:
             # Fallback: use composite reward as a_obs, no segment-level detail
             advantages = []
