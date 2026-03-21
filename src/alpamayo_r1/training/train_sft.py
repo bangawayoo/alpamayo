@@ -53,6 +53,22 @@ def main(cfg: DictConfig) -> None:
 
     logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
 
+    # Initialize distributed process group early (before rollout/evaluate phases)
+    # so that all_gather is available. accelerate sets RANK/WORLD_SIZE env vars
+    # but only Trainer calls dist.init_process_group — we need it sooner.
+    import os
+
+    import torch.distributed as dist
+
+    if not dist.is_initialized() and "RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        logger.info(
+            "Initialized distributed: rank %d/%d",
+            dist.get_rank(),
+            dist.get_world_size(),
+        )
+
     # Save resolved Hydra config
     output_dir = Path(cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
     output_dir.mkdir(parents=True, exist_ok=True)

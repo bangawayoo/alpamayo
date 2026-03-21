@@ -826,13 +826,28 @@ class SelfPlayLoop:
             adv_token_ids=self.adv_token_ids,
         )
 
-        # Generate completions
-        results = engine.generate_completions(fresh_scenes, t0_us, G)
-        logger.info(
-            "Rollout phase complete: %d completions from %d scenes",
-            len(results),
-            len(fresh_scenes),
-        )
+        # Generate completions (each rank processes its shard)
+        local_results = engine.generate_completions(fresh_scenes, t0_us, G)
+
+        # Gather results across all ranks so every rank has the full set
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local_results)
+            results = [r for rank_results in gathered for r in rank_results]
+            del gathered, local_results
+            logger.info(
+                "Rollout phase complete: %d completions from %d scenes (gathered from %d ranks)",
+                len(results),
+                len(fresh_scenes),
+                dist.get_world_size(),
+            )
+        else:
+            results = local_results
+            logger.info(
+                "Rollout phase complete: %d completions from %d scenes",
+                len(results),
+                len(fresh_scenes),
+            )
         return results
 
     def _evaluate_phase(self, rollout_results: list[dict]) -> list[dict]:
