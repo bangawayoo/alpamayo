@@ -37,6 +37,17 @@ from alpamayo_r1.models.token_utils import (
 )
 
 logger = logging.getLogger(__name__)
+# Ensure this logger emits to stdout even in subprocess/container environments
+# where the root logger may not be configured.
+if not logger.handlers:
+    import sys
+
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setLevel(logging.DEBUG)
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_h)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
 
 
 class ExpertLogitsProcessor(LogitsProcessor):
@@ -322,6 +333,19 @@ class AlpamayoR1(ReasoningVLA):
         )
         vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
 
+        # Log raw VLM generation for debugging
+        prompt_len = input_ids.shape[1]
+        for si in range(vlm_outputs.sequences.shape[0]):
+            gen_ids = vlm_outputs.sequences[si, prompt_len:].cpu().tolist()
+            while gen_ids and gen_ids[-1] == self.tokenizer.pad_token_id:
+                gen_ids.pop()
+            logger.info(
+                "[vlm_rollout] sample %d raw generation (%d tokens): %s",
+                si,
+                len(gen_ids),
+                self.tokenizer.decode(gen_ids, skip_special_tokens=False),
+            )
+
         # manually replace padding after EOS token
         vlm_outputs.sequences = replace_padding_after_eos(
             token_ids=vlm_outputs.sequences,
@@ -500,6 +524,19 @@ class AlpamayoR1(ReasoningVLA):
             **tokenized_data,
         )
         # vlm_output: (B * num_traj_samples, prompt_len + generated_len)
+
+        # Log raw VLM generation for debugging
+        prompt_len = input_ids.shape[1]
+        for si in range(vlm_output.shape[0]):
+            gen_ids = vlm_output[si, prompt_len:].cpu().tolist()
+            while gen_ids and gen_ids[-1] == self.tokenizer.pad_token_id:
+                gen_ids.pop()
+            logger.info(
+                "[vlm_only] sample %d raw generation (%d tokens): %s",
+                si,
+                len(gen_ids),
+                self.tokenizer.decode(gen_ids, skip_special_tokens=False),
+            )
 
         # Extract discrete trajectory tokens and decode to continuous xyz
         traj_tokens = extract_traj_tokens(

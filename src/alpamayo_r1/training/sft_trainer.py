@@ -445,12 +445,18 @@ class AdvCondSFTTrainer(Trainer):
 
             self._expert_metrics["expert_cfm/loss"].append(total_loss)
             self._expert_metrics["expert_cfm/valid_samples"].append(float(n_valid))
-            logger.debug(
-                "expert CFM step | loss=%.6f valid=%d/%d",
+            logger.info(
+                "expert CFM step %d | loss=%.6f valid=%d/%d",
+                self._sft_step_count,
                 total_loss,
                 n_valid,
                 len(cached_samples),
             )
+
+            # Log to TensorBoard
+            if self.state is not None:
+                step = self.state.global_step
+                self.log({"expert_cfm/loss": total_loss, "expert_cfm/valid_samples": float(n_valid)})
 
         # Move expert back to CPU, restore VLM to GPU for next training step
         # self.full_model.expert.cpu()

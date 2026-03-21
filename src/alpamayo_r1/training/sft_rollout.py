@@ -233,6 +233,7 @@ class RolloutEngine:
         self.expert_non_causal = bool(rollout_cfg.get("expert_non_causal", True))
         self.use_adv_conditioning = bool(rollout_cfg.get("use_adv_conditioning", False))
         self.scene_batch_size = int(rollout_cfg.get("scene_batch_size", 1))
+        self.use_artificial_data = bool(rollout_cfg.get("use_artificial_data", False))
 
         # Model constants
         self.traj_token_start_idx = full_model.future_token_start_idx
@@ -289,6 +290,19 @@ class RolloutEngine:
                 len(local_clip_ids),
                 len(clip_ids),
             )
+
+        # Artificial data mode: skip real generation entirely
+        if self.use_artificial_data:
+            logger.warning("ARTIFICIAL DATA MODE: replacing all rollouts with fixed data")
+            for clip_id in local_clip_ids:
+                try:
+                    scene_results = self._make_artificial_results(
+                        clip_id, t0_us, G, device, traj_future_end_id, traj_future_start_id
+                    )
+                    results.extend(scene_results)
+                except Exception as e:
+                    logger.warning("Artificial data failed for %s: %s", clip_id, e)
+            return results
 
         # Dispatch generation method based on mode
         use_expert = self.mode == "expert"
@@ -578,10 +592,10 @@ class RolloutEngine:
         1. Batch VLM CoC generation for all G samples at once (num_return_sequences=G)
         2. Per sample: teacher-forced VLM forward to reconstruct KV cache (fast, non-AR)
         3. Per sample: expert diffusion produces trajectory conditioned on KV cache
-        4. Encode trajectories into discrete tokens for training
 
         The batch generation avoids redundant image/prompt prefill across G samples.
         Teacher-forced KV reconstruction is a single forward pass (~1s) vs autoregressive
+        4. Encode trajectories into discrete tokens for training
         generation (~15-20s), giving ~3x overall speedup per scene.
         """
         t_scene = time.time()
@@ -608,10 +622,18 @@ class RolloutEngine:
             adv_obs_tensor = torch.tensor([[adv_obs_id]], device=device, dtype=input_ids.dtype)
             prompt_ids_list = input_ids[0].cpu().tolist()
             input_ids = torch.cat([input_ids, adv_obs_tensor], dim=1)
+            # Extend attention_mask to cover the adv_obs position
+            if "attention_mask" in tokenized:
+                adv_mask = torch.ones(1, 1, device=device, dtype=tokenized["attention_mask"].dtype)
+                tokenized["attention_mask"] = torch.cat(
+                    [tokenized["attention_mask"], adv_mask], dim=1
+                )
         else:
             prompt_ids_list = input_ids[0].cpu().tolist()
 
         prompt_len = input_ids.shape[1]
+        # Capture full VLM input (including adv_obs) for debug logging
+        vlm_input_ids_list = input_ids[0].cpu().tolist()
 
         hist_xyz = model_inputs["ego_history_xyz"][:, -1]  # (1, T, 3)
         hist_rot = model_inputs["ego_history_rot"][:, -1]  # (1, T, 3, 3)
@@ -821,6 +843,7 @@ class RolloutEngine:
                 results.append(
                     {
                         "prompt_ids": prompt_ids_list,
+                        "vlm_input_ids": vlm_input_ids_list,
                         "completion_ids": completion_ids,
                         "pred_xyz": pred_traj,
                         "gt_xyz": gt_traj,
@@ -854,6 +877,94 @@ class RolloutEngine:
             sum(per_sample_tf_times) / max(n_ok, 1),
             sum(per_sample_diffusion_times) / max(n_ok, 1),
             sum(per_sample_encode_times) / max(n_ok, 1),
+        )
+        return results
+
+    def _make_artificial_results(
+        self,
+        clip_id: str,
+        t0_us: int,
+        G: int,
+        device: torch.device,
+        traj_future_end_id: int,
+        traj_future_start_id: int,
+    ) -> list[dict]:
+        """Generate artificial rollout results for overfit sanity checking.
+
+        Produces a fixed CoC text and a straight-line trajectory (go forward
+        at 5 m/s for 4 seconds) so we can verify the training pipeline teaches
+        the model to reproduce known outputs.
+        """
+        import numpy as np
+
+        # Fixed CoC text → token IDs
+        artificial_coc = "Drive straight ahead at constant speed. No obstacles detected."
+        coc_token_ids = self.tokenizer.encode(artificial_coc, add_special_tokens=False)
+
+        # Fixed straight-line trajectory matching real data shape (64 waypoints)
+        # (x=forward, y=lateral, z=up) — go straight in x at 5 m/s
+        n_points = 64
+        dt = 4.0 / n_points
+        speed = 5.0
+        pred_xyz_np = np.zeros((1, n_points, 3), dtype=np.float32)
+        pred_xyz_np[0, :, 0] = np.arange(1, n_points + 1) * dt * speed  # x = forward
+
+        # Load real history for encoding context
+        model_inputs, ego_future_xyz = self.data_cache.get(clip_id, t0_us, device)
+        hist_xyz = model_inputs["ego_history_xyz"][:, -1].cpu()  # (1, T, 3)
+        hist_rot = model_inputs["ego_history_rot"][:, -1].cpu()  # (1, T, 3, 3)
+
+        # Encode artificial trajectory into discrete tokens
+        pred_xyz_t = torch.tensor(pred_xyz_np)
+        # Use identity rotation (contiguous for action_space internals)
+        pred_rot_t = (
+            torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, n_points, 3, 3).contiguous()
+        )
+        discrete_tokens = self.traj_tokenizer.encode(hist_xyz, hist_rot, pred_xyz_t, pred_rot_t)
+        discrete_tokens = discrete_tokens.clamp(0, self.traj_vocab_size - 1)
+        traj_token_ids = (discrete_tokens + self.traj_token_start_idx).squeeze(0).tolist()
+
+        # Build prompt_ids (same for all G completions)
+        tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
+        input_ids = tokenized.pop("input_ids")
+        traj_data = {
+            "ego_history_xyz": model_inputs["ego_history_xyz"],
+            "ego_history_rot": model_inputs["ego_history_rot"],
+        }
+        input_ids = self.full_model.fuse_traj_tokens(input_ids, traj_data)
+        prompt_ids_list = input_ids[0].cpu().tolist()
+
+        gt_traj = ego_future_xyz[0, 0].numpy().flatten().tolist()
+        pred_traj = pred_xyz_np.flatten().tolist()
+
+        completion_ids = (
+            coc_token_ids + [traj_future_start_id] + traj_token_ids + [traj_future_end_id]
+        )
+        completion_prefix_ids = coc_token_ids + [traj_future_start_id]
+
+        results = []
+        for _ in range(G):
+            results.append(
+                {
+                    "prompt_ids": prompt_ids_list,
+                    "completion_ids": completion_ids,
+                    "pred_xyz": pred_traj,
+                    "gt_xyz": gt_traj,
+                    "coc_text": artificial_coc,
+                    "clip_id": clip_id,
+                    "t0_us": t0_us,
+                    "completion_prefix": completion_prefix_ids,
+                    "hist_xyz": hist_xyz[0].cpu(),
+                    "hist_rot": hist_rot[0].cpu(),
+                }
+            )
+
+        logger.info(
+            "[artificial] Scene %s: %d completions, CoC=%r, traj_tokens=%d",
+            clip_id,
+            G,
+            artificial_coc[:50],
+            len(traj_token_ids),
         )
         return results
 
@@ -1377,10 +1488,7 @@ class RolloutEngine:
             meta = per_scene_meta[item["scene_idx"]]
             traj_token_ids = (discrete_tokens[i] + self.traj_token_start_idx).tolist()
             completion_ids = (
-                item["coc_tokens"]
-                + [traj_future_start_id]
-                + traj_token_ids
-                + [traj_future_end_id]
+                item["coc_tokens"] + [traj_future_start_id] + traj_token_ids + [traj_future_end_id]
             )
             pred_traj = pred_xyz[i].cpu().numpy().flatten().tolist()
 

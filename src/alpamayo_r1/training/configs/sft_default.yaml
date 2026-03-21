@@ -32,7 +32,7 @@ lora:
 # SFT training parameters (HF TrainingArguments, per-iteration inner loop)
 training:
   output_dir: outputs/sft_advcond
-  num_train_epochs: 1           # epochs per iteration
+  num_train_epochs: 3           # epochs per iteration
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 2
   learning_rate: 5e-6
@@ -55,6 +55,7 @@ advantage_conditioning:
   k_obs: 30                     # percentile threshold for obs-level binarization
   k_traj: 30                    # percentile threshold for traj-level binarization
   ema_alpha: 0.99               # EMA decay for obs-level baseline
+  adv_mode: embedding            # "embedding" (learned AdvantageEmbedding hooks) or "text" (plain-text phrases, no hooks)
   replay_ratio: 0.3             # fraction of training data from historical replay buffer
   replay_buffer_max_size: 50000
   reset_to_base: false          # true = reload pi_0 each iteration (RECAP), false = continue from previous iteration's weights
@@ -66,9 +67,9 @@ value_head:
   lr: 1e-5
   load_path: null               # pre-trained value head checkpoint (skips pre-training if provided)
   segment_level: true
-  train_epochs: 1              # epochs to train value head per iteration (before advantage computation)
-  batch_size: 64                 # mini-batch size for value head training
-  pretrain_scenes: 500           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)
+  train_epochs: 3              # epochs to train value head per iteration (before advantage computation)
+  batch_size: 16                 # mini-batch size for value head training
+  pretrain_scenes: 1000           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)
   pretrain_epochs: 1           # epochs for Stage 0 pre-training
   pretrain_batch_scenes: 4      # scenes per pretrain iteration (match GPU batch)
   log_interval: 10               # log to display every N steps (TensorBoard logs every step)
@@ -77,7 +78,7 @@ value_head:
 # Uses deferred GPU scheduling: expert step runs after VLM SFT backward
 expert_finetune:
   enabled: true
-  lr: 1e-4
+  lr: 1e-5
   weight_decay: 0.01
   num_noisy_samples: 1          # noise samples per GT action for CFM loss
   every_n_steps: 1              # run expert CFM step every N VLM SFT steps
@@ -112,7 +113,7 @@ rewards:
 # Rollout generation parameters
 rollout:
   mode: expert                  # "vlm_only" or "expert" — expert uses action expert + diffusion
-  temperature: 1.2              # higher than GRPO (0.6) for exploration
+  temperature: 0.8              # higher than GRPO (0.6) for exploration
   top_p: 0.98
   max_generation_length: 256
   logprob_mini_batch_size: 2
@@ -122,3 +123,4 @@ rollout:
   expert_non_causal: true       # non-causal attention for expert transformer
   use_adv_conditioning: false   # inject positive adv tokens during rollout (enable after pre-training)
   scene_batch_size: 2           # scenes batched per generate() call (S*G total sequences)
+  use_artificial_data: false    # replace rollouts with fixed CoC + straight-line trajectory (overfit sanity check)

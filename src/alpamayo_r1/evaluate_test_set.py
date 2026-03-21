@@ -180,6 +180,19 @@ def _evaluate_expert_with_adv_traj(
     )
     generated_seqs = vlm_output[:, prompt_len:]
 
+    # Log raw VLM generation for debugging
+    for si in range(generated_seqs.shape[0]):
+        raw_ids = generated_seqs[si].cpu().tolist()
+        # Strip padding for readable log
+        while raw_ids and raw_ids[-1] == pad_token_id:
+            raw_ids.pop()
+        logger.debug(
+            "[expert_adv_traj] sample %d raw generation (%d tokens): %s",
+            si,
+            len(raw_ids),
+            model.tokenizer.decode(raw_ids, skip_special_tokens=False),
+        )
+
     # 3. Parse valid completions
     valid_items: list[dict] = []
     for sample_idx in range(num_traj_samples):
@@ -200,6 +213,9 @@ def _evaluate_expert_with_adv_traj(
                     coc_tokens, skip_special_tokens=True
                 ).strip(),
             }
+        )
+        logger.debug(
+            f"[CoC generated] {model.tokenizer.decode(coc_tokens, skip_special_tokens=False)}"
         )
 
     if not valid_items:
@@ -313,6 +329,18 @@ def _evaluate_vlm_only_with_adv_traj(
         **tokenized,
     )
     generated_seqs = vlm_output[:, prompt_len:]
+
+    # Log raw VLM generation for debugging
+    for si in range(generated_seqs.shape[0]):
+        raw_ids = generated_seqs[si].cpu().tolist()
+        while raw_ids and raw_ids[-1] == pad_token_id:
+            raw_ids.pop()
+        logger.debug(
+            "[vlm_adv_traj] sample %d raw generation (%d tokens): %s",
+            si,
+            len(raw_ids),
+            model.tokenizer.decode(raw_ids, skip_special_tokens=False),
+        )
 
     # 3. Per-sample: teacher-forced + adv_traj + continued AR
     pred_xyz_list = []
@@ -448,6 +476,7 @@ def evaluate_batch(
     traj_mode: str = "expert",
     adv_obs_token_id: int | None = None,
     adv_traj_token_id: int | None = None,
+    output_dir: str | None = None,
 ) -> list:
     """Evaluate a batch of samples.
 
@@ -480,11 +509,17 @@ def evaluate_batch(
             # Prepare inputs
             model_inputs = helper.prepare_model_inputs(sample, processor, device)
 
-            # Append adv_obs token to input_ids if requested
+            # Append adv_obs token(s) to input_ids if requested
             if adv_obs_token_id is not None:
                 input_ids = model_inputs["tokenized_data"]["input_ids"]
+                # Support both single ID (sentinel) and list of IDs (text mode)
+                obs_ids = (
+                    [adv_obs_token_id]
+                    if isinstance(adv_obs_token_id, int)
+                    else list(adv_obs_token_id)
+                )
                 adv_obs_tensor = torch.tensor(
-                    [[adv_obs_token_id]], device=input_ids.device, dtype=input_ids.dtype
+                    [obs_ids], device=input_ids.device, dtype=input_ids.dtype
                 )
                 model_inputs["tokenized_data"]["input_ids"] = torch.cat(
                     [input_ids, adv_obs_tensor], dim=1
@@ -492,8 +527,51 @@ def evaluate_batch(
                 if "attention_mask" in model_inputs["tokenized_data"]:
                     attn = model_inputs["tokenized_data"]["attention_mask"]
                     model_inputs["tokenized_data"]["attention_mask"] = torch.cat(
-                        [attn, torch.ones(1, 1, device=attn.device, dtype=attn.dtype)], dim=1
+                        [
+                            attn,
+                            torch.ones(
+                                1, len(obs_ids), device=attn.device, dtype=attn.dtype
+                            ),
+                        ],
+                        dim=1,
                     )
+
+            # Log decoded prompt and verify adv token insertion
+            _ids = model_inputs["tokenized_data"]["input_ids"][0].tolist()
+            logger.debug(
+                "[%s] decoded input (%d tokens):\n%s",
+                sample["clip_id"],
+                len(_ids),
+                model.tokenizer.decode(_ids, skip_special_tokens=False),
+            )
+            if adv_obs_token_id is not None:
+                obs_ids = (
+                    [adv_obs_token_id]
+                    if isinstance(adv_obs_token_id, int)
+                    else list(adv_obs_token_id)
+                )
+                has_obs = any(tid in _ids for tid in obs_ids)
+                if not has_obs:
+                    logger.warning(
+                        "adv_obs token NOT found in input_ids for %s "
+                        "(expected one of %s in %d tokens)",
+                        sample["clip_id"],
+                        obs_ids,
+                        len(_ids),
+                    )
+            if adv_traj_token_id is not None:
+                traj_ids = (
+                    [adv_traj_token_id]
+                    if isinstance(adv_traj_token_id, int)
+                    else list(adv_traj_token_id)
+                )
+                # adv_traj is injected later (teacher-forced), not in input_ids
+                # Just log that it will be injected
+                logger.debug(
+                    "adv_traj injection enabled for %s (token_ids=%s)",
+                    sample["clip_id"],
+                    traj_ids,
+                )
 
             # Run inference with the selected trajectory generation mode
             with torch.autocast(device, dtype=torch.bfloat16):
@@ -536,15 +614,43 @@ def evaluate_batch(
                         return_extra=True,
                     )
 
+            # Log raw CoC from extra (all code paths)
+            try:
+                cot_arr = extra.get("cot")
+                if cot_arr is not None:
+                    for si, txt in enumerate(np.asarray(cot_arr).flat):
+                        logger.info(
+                            "[%s] sample %d CoC: %s",
+                            sample["clip_id"],
+                            si,
+                            txt if txt else "(empty)",
+                        )
+            except Exception:
+                pass
+
             # Compute metrics
             min_ade = compute_minADE(pred_xyz, sample["ego_future_xyz"])
             min_fde = compute_minFDE(pred_xyz, sample["ego_future_xyz"])
 
-            # Extract CoC
+            # Extract CoC — extra["cot"] may be np.array shaped (1, 1, n_samples)
             coc_text = None
-            if "cot" in extra and extra["cot"] is not None and len(extra["cot"]) > 0:
-                if len(extra["cot"][0]) > 0:
-                    coc_text = extra["cot"][0][0]
+            try:
+                cot = extra.get("cot")
+                if cot is not None:
+                    flat = np.asarray(cot).flat
+                    if len(flat) > 0:
+                        first = str(flat[0])
+                        if first:
+                            coc_text = first
+            except Exception:
+                pass
+
+            logger.debug(
+                "[%s] generated CoC (%d chars): %s",
+                sample["clip_id"],
+                len(coc_text) if coc_text is not None else 0,
+                coc_text,
+            )
 
             results.append(
                 {
@@ -628,6 +734,16 @@ def main():
         help="Use notebooks/clip_ids.parquet instead of full test set",
     )
     parser.add_argument(
+        "--clip-ids",
+        type=str,
+        default=None,
+        help=(
+            "Explicit clip IDs to evaluate. "
+            "Comma-separated UUIDs, or path to a .txt/.json/.jsonl file. "
+            "Overrides --use-clip-ids-file and --num-samples."
+        ),
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=4,
@@ -684,6 +800,13 @@ def main():
         action="store_true",
         help="Inject positive traj advantage token. Requires --iteration-dir.",
     )
+    parser.add_argument(
+        "--adv-mode",
+        type=str,
+        default="embedding",
+        choices=["embedding", "text"],
+        help="Advantage conditioning mode: 'embedding' (learned hooks) or 'text' (plain text).",
+    )
 
     args = parser.parse_args()
 
@@ -723,14 +846,53 @@ def main():
     print(f"Output directory: {output_dir}")
     print("=" * 80)
 
+    # Force unbuffered stdout (Kubeflow / container environments buffer aggressively)
+    import sys
+
+    os.environ["PYTHONUNBUFFERED"] = "1"
+
+    class FlushStreamHandler(logging.StreamHandler):
+        """StreamHandler that flushes after every emit (for Kubeflow/containers)."""
+
+        def emit(self, record):
+            super().emit(record)
+            self.flush()
+
+    class FlushFileHandler(logging.FileHandler):
+        """FileHandler that flushes after every emit."""
+
+        def emit(self, record):
+            super().emit(record)
+            self.flush()
+
+    # Set up our own logger (separate from transformers/root to avoid conflicts)
+    log_fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False  # don't let root logger (transformers) override us
+    logger.handlers.clear()
+    # Stdout handler (INFO+) — flush after every message
+    _sh = FlushStreamHandler(sys.stdout)
+    _sh.setLevel(logging.INFO)
+    _sh.setFormatter(log_fmt)
+    logger.addHandler(_sh)
+    # File handler (DEBUG+) — flush after every message
+    log_file = output_dir / "eval.log"
+    _fh = FlushFileHandler(str(log_file), mode="a")
+    _fh.setLevel(logging.DEBUG)
+    _fh.setFormatter(log_fmt)
+    logger.addHandler(_fh)
+    # Also attach handlers to the model logger so [vlm_rollout]/[vlm_only] logs appear
+    _model_logger = logging.getLogger("alpamayo_r1.models.alpamayo_r1")
+    _model_logger.setLevel(logging.DEBUG)
+    _model_logger.propagate = False
+    _model_logger.handlers.clear()
+    _model_logger.addHandler(_sh)
+    _model_logger.addHandler(_fh)
+    logger.info("Logging to %s", log_file)
+
     # Load model
     print("\nLoading model...")
     if args.iteration_dir is not None:
-        import logging
-
-        logging.basicConfig(
-            level=logging.INFO, format="%(name)s - %(message)s", force=True
-        )
         from alpamayo_r1.training.selfplay_loop import load_vlm_from_iterations
 
         print(f"Loading self-play checkpoint: {args.iteration_dir} iter {args.iteration}")
@@ -752,13 +914,23 @@ def main():
         adv_obs_token_id = None
         adv_traj_token_id = None
         if args.adv_obs or args.adv_traj:
-            adv_emb = result.get("adv_embedding")
-            if adv_emb is None:
-                parser.error("No adv_embedding checkpoint found in iteration dir")
-            vocab_size = model.vlm.config.text_config.vocab_size
-            adv_token_ids = compute_advantage_token_ids(vocab_size)
-            adv_emb.to(model.vlm.device)
-            adv_emb.attach(model.vlm)
+            adv_mode = getattr(args, "adv_mode", "embedding")
+            if adv_mode == "text":
+                # from alpamayo_r1.training.advantage_conditioning import (
+                #     compute_text_advantage_token_ids,
+                # )
+                # adv_token_ids = compute_text_advantage_token_ids(model.tokenizer)
+                # print("  adv_mode: text (plain-text indicators, no hooks)")
+                pass
+            else:
+                adv_emb = result.get("adv_embedding")
+                if adv_emb is None:
+                    parser.error("No adv_embedding checkpoint found in iteration dir")
+                vocab_size = model.vlm.config.text_config.vocab_size
+                adv_token_ids = compute_advantage_token_ids(vocab_size)
+                adv_emb.to(model.vlm.device)
+                adv_emb.attach(model.vlm)
+                print("  adv_mode: embedding (AdvantageEmbedding hooks)")
             if args.adv_obs:
                 adv_obs_token_id = adv_token_ids["adv_obs_pos"]
                 print(f"  adv_obs conditioning: enabled (token_id={adv_obs_token_id})")
@@ -794,7 +966,39 @@ def main():
 
     # Get clip IDs
     avdi = PhysicalAIAVDatasetInterface(revision=args.dataset_revision)
-    if args.use_clip_ids_file:
+    if args.clip_ids is not None:
+        # Explicit clip IDs: comma-separated or file path
+        clip_ids_arg = args.clip_ids
+        if os.path.isfile(clip_ids_arg):
+            ext = os.path.splitext(clip_ids_arg)[1].lower()
+            if ext == ".json":
+                with open(clip_ids_arg) as f:
+                    test_clips = json.load(f)
+            elif ext == ".jsonl":
+                test_clips = []
+                with open(clip_ids_arg) as f:
+                    for line in f:
+                        entry = json.loads(line)
+                        if isinstance(entry, str):
+                            test_clips.append(entry)
+                        elif isinstance(entry, dict) and "clip_id" in entry:
+                            test_clips.append(entry["clip_id"])
+            else:
+                # .txt or other: one clip ID per line
+                with open(clip_ids_arg) as f:
+                    test_clips = [line.strip() for line in f if line.strip()]
+        else:
+            test_clips = [c.strip() for c in clip_ids_arg.split(",") if c.strip()]
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for c in test_clips:
+            if c not in seen:
+                seen.add(c)
+                unique.append(c)
+        test_clips = unique
+        print(f"\nUsing {len(test_clips)} explicit clip IDs")
+    elif args.use_clip_ids_file:
         print("\nUsing clip_ids.parquet file (test split only)...")
         clip_ids_df = pd.read_parquet("notebooks/clip_ids.parquet")
         all_eval_ids = set(clip_ids_df["clip_id"].tolist())
@@ -809,8 +1013,8 @@ def main():
         test_clips = test_df.index.tolist()
         print(f"Found {len(test_clips)} valid test clips")
 
-    # Limit number of samples if specified
-    if args.num_samples is not None:
+    # Limit number of samples if specified (skipped when --clip-ids is used)
+    if args.num_samples is not None and args.clip_ids is None:
         test_clips = test_clips[: args.num_samples]
         print(f"Limiting evaluation to {len(test_clips)} samples")
 
@@ -856,6 +1060,7 @@ def main():
                 traj_mode=args.traj_mode,
                 adv_obs_token_id=adv_obs_token_id,
                 adv_traj_token_id=adv_traj_token_id,
+                output_dir=str(output_dir),
             )
             all_results.extend(results)
 
