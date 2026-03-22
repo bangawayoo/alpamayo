@@ -17,6 +17,8 @@
 #   pip install "trl[vllm]" datasets
 
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+set -a; source "$REPO_ROOT/.env" 2>/dev/null || true; set +a
 
 # ---------------------------------------------------------------
 # Defaults

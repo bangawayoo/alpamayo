@@ -6,6 +6,8 @@
 #   ./evaluate_full_test.sh --num-gpus 4         # multi-GPU data parallelism
 
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+set -a; source "$REPO_ROOT/.env" 2>/dev/null || true; set +a
 
 NUM_GPUS=""
 EXTRA_ARGS=()

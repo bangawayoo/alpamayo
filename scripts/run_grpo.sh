@@ -23,7 +23,9 @@
 #   ./scripts/run_grpo.sh --fsdp --accelerate-config path/to/config.yaml  # custom accelerate config
 
 set -euo pipefail
-export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN env var}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+set -a; source "$REPO_ROOT/.env" 2>/dev/null || true; set +a
+
 # ---------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------
@@ -96,7 +98,6 @@ done
 # ---------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-VENV_PYTHON="/home/jovyan/conda/.venv/bin/python"
 
 
 if [[ ! -x "$VENV_PYTHON" ]]; then

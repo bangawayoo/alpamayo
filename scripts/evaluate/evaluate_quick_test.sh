@@ -20,6 +20,8 @@
 #   within a single trial (original behavior).
 
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+set -a; source "$REPO_ROOT/.env" 2>/dev/null || true; set +a
 
 NUM_GPUS=""
 MODEL="nvidia/Alpamayo-R1-10B"
@@ -93,7 +95,7 @@ if [[ -z "$NUM_GPUS" ]]; then
     fi
 fi
 
-export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN env var}"
+
 
 echo "Running curated test set evaluation (1,181 clips)..."
 echo "  Model: ${MODEL}"
