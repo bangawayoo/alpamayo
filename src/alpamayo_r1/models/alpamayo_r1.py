@@ -142,48 +142,6 @@ class AlpamayoR1(ReasoningVLA):
 
         self.post_init()
 
-    def _prepare_vlm_generation(
-        self,
-        data: dict[str, Any],
-        top_p: float,
-        top_k: int | None,
-        temperature: float,
-        num_traj_samples: int,
-        max_new_tokens: int,
-    ) -> tuple[torch.Tensor, dict, torch.Tensor, torch.Tensor, int]:
-        """Prepare inputs and generation config shared by both trajectory methods.
-
-        Unpacks ``data``, fuses history trajectory tokens into ``input_ids``,
-        and configures the VLM generation settings.
-
-        Returns:
-            input_ids, tokenized_data (remaining), ego_history_xyz,
-            ego_history_rot, B (batch size).
-        """
-        ego_history_xyz = data["ego_history_xyz"]
-        ego_history_rot = data["ego_history_rot"]
-        B, n_traj_group, _, _ = ego_history_xyz.shape
-        assert n_traj_group == 1, "Only one trajectory group is supported for inference."
-
-        tokenized_data = data["tokenized_data"]
-        input_ids = tokenized_data.pop("input_ids")
-        traj_data_vlm = {
-            "ego_history_xyz": ego_history_xyz,
-            "ego_history_rot": ego_history_rot,
-        }
-        input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
-
-        generation_config = self.vlm.generation_config
-        generation_config.top_p = top_p
-        generation_config.temperature = temperature
-        generation_config.do_sample = True
-        generation_config.num_return_sequences = num_traj_samples
-        generation_config.max_new_tokens = max_new_tokens
-        generation_config.top_k = top_k
-        generation_config.pad_token_id = self.tokenizer.pad_token_id
-
-        return input_ids, tokenized_data, ego_history_xyz, ego_history_rot, B
-
     def _postprocess_trajectories(
         self,
         pred_xyz: torch.Tensor,
