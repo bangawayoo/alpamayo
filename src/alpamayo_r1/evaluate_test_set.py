@@ -10,6 +10,10 @@ import logging
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # Must be set before any CUDA import/init.  In MIG environments the default
 # CUDA caching allocator queries NVML for per-device free memory, which fails
 # with "NVML_SUCCESS == r INTERNAL ASSERT FAILED".  expandable_segments uses

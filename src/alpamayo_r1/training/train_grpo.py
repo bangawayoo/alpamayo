@@ -33,6 +33,10 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import hydra
 import numpy as np
 import torch

@@ -19,6 +19,10 @@ import logging
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import hydra
 import numpy as np
 import torch
