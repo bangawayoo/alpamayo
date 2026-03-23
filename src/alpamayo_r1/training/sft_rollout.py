@@ -897,9 +897,12 @@ class RolloutEngine:
         """
         import numpy as np
 
-        # Fixed CoC text → token IDs
-        artificial_coc = "Drive straight ahead at constant speed. No obstacles detected."
+        # Fixed CoC text → token IDs (include <cot_end> to match real VLM output format)
+        # Add leading space to match standard VLM generation which typically starts with a space
+        # after the <|cot_start|> trigger token.
+        artificial_coc = " Drive straight ahead at constant speed. No obstacles detected."
         coc_token_ids = self.tokenizer.encode(artificial_coc, add_special_tokens=False)
+        cot_end_id = self.special_token_ids["cot_end"]
 
         # Fixed straight-line trajectory matching real data shape (64 waypoints)
         # (x=forward, y=lateral, z=up) — go straight in x at 5 m/s
@@ -938,17 +941,24 @@ class RolloutEngine:
         pred_traj = pred_xyz_np.flatten().tolist()
 
         completion_ids = (
-            coc_token_ids + [traj_future_start_id] + traj_token_ids + [traj_future_end_id]
+            coc_token_ids
+            + [cot_end_id, traj_future_start_id]
+            + traj_token_ids
+            + [traj_future_end_id]
         )
-        completion_prefix_ids = coc_token_ids + [traj_future_start_id]
+        completion_prefix_ids = coc_token_ids + [cot_end_id, traj_future_start_id]
 
         results = []
-        for _ in range(G):
+        for g in range(G):
+            # Add small noise to pred_xyz so rewards vary across completions,
+            # preventing all advantages from collapsing to zero during binarization.
+            noise = np.random.normal(0, 0.05, size=pred_xyz_np.shape).astype(np.float32)
+            noisy_pred = (pred_xyz_np + noise).flatten().tolist()
             results.append(
                 {
                     "prompt_ids": prompt_ids_list,
                     "completion_ids": completion_ids,
-                    "pred_xyz": pred_traj,
+                    "pred_xyz": noisy_pred,
                     "gt_xyz": gt_traj,
                     "coc_text": artificial_coc,
                     "clip_id": clip_id,
