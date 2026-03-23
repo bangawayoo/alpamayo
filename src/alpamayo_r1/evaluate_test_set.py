@@ -120,6 +120,72 @@ def compute_minFDE(pred_xyz: torch.Tensor, gt_xyz: torch.Tensor) -> float:
 logger = logging.getLogger(__name__)
 
 
+def _plot_trajectories(
+    pred_xyz: torch.Tensor,
+    gt_xyz: torch.Tensor,
+    clip_id: str,
+    save_path: Path,
+    coc_text: str | None = None,
+    min_ade: float | None = None,
+    min_fde: float | None = None,
+) -> None:
+    """Plot predicted vs. ground-truth trajectories in BEV and save to disk.
+
+    Args:
+        pred_xyz: Predicted trajectories, shape ``(1, 1, N, T, 3)``.
+        gt_xyz: Ground-truth trajectory, shape ``(1, 1, T, 3)``.
+        clip_id: Clip identifier (used in title / filename).
+        save_path: Directory to save the plot.
+        coc_text: Optional Chain-of-Causation text to display.
+        min_ade: Optional minADE value to display.
+        min_fde: Optional minFDE value to display.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    gt_xy = gt_xyz.cpu()[0, 0, :, :2].T.numpy()
+    n_samples = pred_xyz.shape[2]
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+
+    # Plot predicted trajectories
+    cmap = plt.cm.tab10
+    for i in range(n_samples):
+        pred_xy = pred_xyz.cpu()[0, 0, i, :, :2].T.numpy()
+        # Rotate 90 CCW for BEV: (-y, x) so "forward" points up
+        ax.plot(-pred_xy[1], pred_xy[0], "o-", color=cmap(i), markersize=3,
+                label=f"Pred #{i + 1}", alpha=0.7)
+
+    ax.plot(-gt_xy[1], gt_xy[0], "r-", linewidth=2.5, label="Ground Truth")
+    ax.plot(0, 0, "k*", markersize=15, label="Ego (t=0)")
+
+    ax.set_xlabel("Lateral (m)")
+    ax.set_ylabel("Longitudinal (m)")
+    ax.set_aspect("equal")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    title = f"clip: {clip_id[:12]}..."
+    if min_ade is not None:
+        title += f"  |  minADE={min_ade:.3f}m"
+    if min_fde is not None:
+        title += f"  minFDE={min_fde:.3f}m"
+    ax.set_title(title, fontsize=10)
+
+    # Add CoC text below the plot
+    if coc_text:
+        wrapped = coc_text[:300] + ("..." if len(coc_text) > 300 else "")
+        fig.text(0.05, 0.01, f"CoC: {wrapped}", fontsize=7, wrap=True,
+                 verticalalignment="bottom", family="monospace")
+        fig.subplots_adjust(bottom=0.12)
+
+    save_path.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path / f"{clip_id}.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _evaluate_expert_with_adv_traj(
     model: AlpamayoR1,
     model_inputs: dict,
@@ -481,6 +547,7 @@ def evaluate_batch(
     adv_obs_token_id: int | None = None,
     adv_traj_token_id: int | None = None,
     output_dir: str | None = None,
+    visualize: bool = False,
 ) -> list:
     """Evaluate a batch of samples.
 
@@ -491,6 +558,7 @@ def evaluate_batch(
         adv_obs_token_id: If set, append this token to input_ids before generation.
         adv_traj_token_id: If set, inject this token between CoC and trajectory
             via teacher-forced KV cache rebuild (per-sample processing).
+        visualize: If True, save BEV trajectory plots to output_dir/plots/.
     """
     results = []
 
@@ -656,6 +724,20 @@ def evaluate_batch(
                 coc_text,
             )
 
+            if visualize and output_dir is not None:
+                try:
+                    _plot_trajectories(
+                        pred_xyz=pred_xyz,
+                        gt_xyz=sample["ego_future_xyz"],
+                        clip_id=sample["clip_id"],
+                        save_path=Path(output_dir) / "plots",
+                        coc_text=coc_text,
+                        min_ade=min_ade,
+                        min_fde=min_fde,
+                    )
+                except Exception as plot_err:
+                    logger.warning("Plot failed for %s: %s", sample["clip_id"], plot_err)
+
             results.append(
                 {
                     "clip_id": sample["clip_id"],
@@ -816,6 +898,11 @@ def main():
         choices=["embedding", "text"],
         help="Advantage conditioning mode: 'embedding' (learned hooks) or 'text' (plain text).",
     )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Save BEV trajectory plots (predicted vs. ground truth) to output_dir/plots/",
+    )
 
     args = parser.parse_args()
 
@@ -825,8 +912,6 @@ def main():
         parser.error("--iteration-dir and --iteration must be used together")
     if args.shard_id is not None and args.shard_id >= args.num_shards:
         parser.error("--shard-id must be less than --num-shards")
-    if (args.adv_obs or args.adv_traj) and args.iteration_dir is None:
-        parser.error("--adv-obs/--adv-traj require --iteration-dir")
 
     # Set random seed
     torch.manual_seed(args.seed)
@@ -1072,6 +1157,7 @@ def main():
                 adv_obs_token_id=adv_obs_token_id,
                 adv_traj_token_id=adv_traj_token_id,
                 output_dir=str(output_dir),
+                visualize=args.visualize,
             )
             all_results.extend(results)
 
@@ -1167,6 +1253,10 @@ def main():
         for error, count in error_counts.head(5).items():
             print(f"  - {error[:80]}: {count} samples")
 
+    if args.visualize:
+        plots_dir = output_dir / "plots"
+        n_plots = len(list(plots_dir.glob("*.png"))) if plots_dir.exists() else 0
+        print(f"\nTrajectory plots saved: {n_plots} PNGs in {plots_dir}")
     print("=" * 80)
     print("Evaluation complete!")
     print("=" * 80)
