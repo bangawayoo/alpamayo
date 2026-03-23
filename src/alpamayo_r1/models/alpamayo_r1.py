@@ -126,8 +126,11 @@ class AlpamayoR1(ReasoningVLA):
         model.vlm = PeftModel.from_pretrained(model.vlm, adapter_path)
 
         if merge:
-            logger.info("Merging LoRA weights into base model")
+            logger.info("Merging LoRA weights into base model (in float32 to avoid bf16 underflow)")
+            model.vlm = model.vlm.to(torch.float32)
             model.vlm = model.vlm.merge_and_unload()
+            model.vlm = model.vlm.to(dtype)
+
 
         return model
 
@@ -331,7 +334,11 @@ class AlpamayoR1(ReasoningVLA):
             logits_processor=logits_processor,
             **tokenized_data,
         )
-        vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
+        # Navigate through PeftModel wrapper if LoRA is unmerged
+        _inner = self.vlm.model
+        if not hasattr(_inner, "rope_deltas"):
+            _inner = _inner.model
+        vlm_outputs.rope_deltas = _inner.rope_deltas
 
         # Log raw VLM generation for debugging
         prompt_len = input_ids.shape[1]

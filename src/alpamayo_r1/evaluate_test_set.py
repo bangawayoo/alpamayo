@@ -795,6 +795,11 @@ def main():
         help="Self-play iteration index to load (0-based). Merges VLM LoRA from iter_0 through iter_N.",
     )
     parser.add_argument(
+        "--no-merge",
+        action="store_true",
+        help="Keep LoRA adapter unmerged (avoids bf16 underflow for small deltas).",
+    )
+    parser.add_argument(
         "--adv-obs",
         action="store_true",
         help="Inject positive obs advantage token. Requires --iteration-dir.",
@@ -906,6 +911,7 @@ def main():
             up_to_iteration=args.iteration,
             dtype=torch.bfloat16,
             device_map="auto",
+            merge=not args.no_merge,
         )
         model = result["full_model"]
         print(f"Loaded self-play checkpoint through iteration {args.iteration}")
@@ -953,6 +959,7 @@ def main():
                 base_model_name=args.base_model,
                 dtype=torch.bfloat16,
                 device_map="auto",
+                merge=not args.no_merge,
             )
         else:
             model = AlpamayoR1.from_pretrained(

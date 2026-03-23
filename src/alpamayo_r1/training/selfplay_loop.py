@@ -349,6 +349,7 @@ def load_vlm_from_iterations(
     up_to_iteration: int,
     dtype: torch.dtype = torch.bfloat16,
     device_map: str | None = None,
+    merge: bool = True,
 ) -> Any:
     """Reconstruct a model by iteratively merging per-iteration LoRA adapters.
 
@@ -393,8 +394,13 @@ def load_vlm_from_iterations(
             )
         logger.info("Loading VLM LoRA adapter from %s", adapter_path)
         full_model.vlm = PeftModel.from_pretrained(full_model.vlm, str(adapter_path))
-        full_model.vlm = full_model.vlm.merge_and_unload()
-        logger.info("Merged VLM LoRA from iteration %d", i)
+        if merge:
+            full_model.vlm = full_model.vlm.to(torch.float32)
+            full_model.vlm = full_model.vlm.merge_and_unload()
+            full_model.vlm = full_model.vlm.to(dtype)
+            logger.info("Merged VLM LoRA from iteration %d", i)
+        else:
+            logger.info("Loaded VLM LoRA from iteration %d (unmerged)", i)
 
     # Load expert checkpoint(s). For LoRA-based expert, iteratively apply and
     # merge from each iteration (same stacking logic as VLM LoRA). For non-LoRA
