@@ -415,7 +415,12 @@ def _evaluate_vlm_only_with_adv_traj(
 
             # Teacher-forced: [input_ids + CoC + adv_traj]
             # We include adv_traj before TFS so the KV cache has the conditioning
-            completion_prefix_ids = coc_tokens + [adv_traj_token_id]
+            traj_ids = (
+                [adv_traj_token_id]
+                if isinstance(adv_traj_token_id, int)
+                else list(adv_traj_token_id)
+            )
+            completion_prefix_ids = coc_tokens + traj_ids
             prefix_tensor = torch.tensor(
                 [completion_prefix_ids], device=device, dtype=torch.long
             )
@@ -855,12 +860,19 @@ def main():
     parser.add_argument(
         "--adv-obs",
         action="store_true",
-        help="Inject positive obs advantage token. Requires --iteration-dir.",
+        help="Inject positive obs advantage token.",
     )
     parser.add_argument(
         "--adv-traj",
         action="store_true",
-        help="Inject positive traj advantage token. Requires --iteration-dir.",
+        help="Inject positive traj advantage token.",
+    )
+    parser.add_argument(
+        "--adv-mode",
+        choices=["embedding", "text"],
+        default="embedding",
+        help="Advantage conditioning mode: 'embedding' uses learned AdvantageEmbedding "
+        "hooks, 'text' uses plain-text tokens the VLM already understands.",
     )
     parser.add_argument(
         "--adv-mode",
@@ -995,41 +1007,55 @@ def main():
             )
         adv_emb_from_result = None
 
-    # Attach advantage embedding if conditioning is requested
+    # Attach advantage conditioning if requested
     adv_obs_token_id = None
     adv_traj_token_id = None
     if args.adv_obs or args.adv_traj:
-        from alpamayo_r1.training.advantage_conditioning import AdvantageEmbedding
+        adv_mode = args.adv_mode
+        print(f"  adv_mode: {adv_mode}")
 
-        vocab_size = model.vlm.config.text_config.vocab_size
-        adv_token_ids = compute_advantage_token_ids(vocab_size)
+        if adv_mode == "text":
+            from alpamayo_r1.training.advantage_conditioning import (
+                compute_text_advantage_token_ids,
+            )
 
-        if adv_emb_from_result is not None:
-            # Loaded from iteration dir checkpoint
-            adv_emb = adv_emb_from_result
-            adv_emb.to(model.vlm.device)
-            adv_emb.attach(model.vlm)
-            print("  Loaded advantage embedding from iteration checkpoint")
+            adv_token_ids = compute_text_advantage_token_ids(model.tokenizer)
         else:
-            # Look for adv_embedding.pt alongside or above the model path
-            model_path = Path(args.model_name) if args.model_name else None
-            adv_emb_path = None
-            if model_path is not None:
-                for candidate in [model_path / "adv_embedding.pt",
-                                  model_path.parent / "adv_embedding.pt"]:
-                    if candidate.exists():
-                        adv_emb_path = candidate
-                        break
-            if adv_emb_path is not None:
-                hidden_size = model.vlm.config.text_config.hidden_size
-                adv_emb = AdvantageEmbedding(hidden_size, adv_token_ids)
-                adv_emb.load_state_dict(torch.load(adv_emb_path, map_location="cpu"))
+            from alpamayo_r1.training.advantage_conditioning import AdvantageEmbedding
+
+            vocab_size = model.vlm.config.text_config.vocab_size
+            adv_token_ids = compute_advantage_token_ids(vocab_size)
+
+            if adv_emb_from_result is not None:
+                adv_emb = adv_emb_from_result
                 adv_emb.to(model.vlm.device)
                 adv_emb.attach(model.vlm)
-                print(f"  Loaded advantage embedding from {adv_emb_path}")
+                print("  Loaded advantage embedding from iteration checkpoint")
             else:
-                print("  WARNING: No adv_embedding found, "
-                      "advantage tokens will use uninitialized embeddings")
+                model_path = Path(args.model_name) if args.model_name else None
+                adv_emb_path = None
+                if model_path is not None:
+                    for candidate in [
+                        model_path / "adv_embedding.pt",
+                        model_path.parent / "adv_embedding.pt",
+                    ]:
+                        if candidate.exists():
+                            adv_emb_path = candidate
+                            break
+                if adv_emb_path is not None:
+                    hidden_size = model.vlm.config.text_config.hidden_size
+                    adv_emb = AdvantageEmbedding(hidden_size, adv_token_ids)
+                    adv_emb.load_state_dict(
+                        torch.load(adv_emb_path, map_location="cpu")
+                    )
+                    adv_emb.to(model.vlm.device)
+                    adv_emb.attach(model.vlm)
+                    print(f"  Loaded advantage embedding from {adv_emb_path}")
+                else:
+                    print(
+                        "  WARNING: No adv_embedding found, "
+                        "advantage tokens will use uninitialized embeddings"
+                    )
 
         if args.adv_obs:
             adv_obs_token_id = adv_token_ids["adv_obs_pos"]

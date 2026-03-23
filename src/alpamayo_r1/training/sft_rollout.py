@@ -32,7 +32,7 @@ def run_batched_expert_diffusion(
     full_lens: list[int],
     pixel_values: torch.Tensor | None = None,
     image_grid_thw: torch.Tensor | None = None,
-    adv_traj_token_id: int | None = None,
+    adv_traj_token_id: int | list[int] | None = None,
     expert_non_causal: bool = True,
     diffusion_steps: int | None = None,
 ) -> torch.Tensor:
@@ -99,9 +99,14 @@ def run_batched_expert_diffusion(
 
         # Inject adv_traj into KV cache (optional)
         if adv_traj_token_id is not None:
-            adv_tensor = torch.full(
-                (n_valid, 1), adv_traj_token_id, device=device, dtype=torch.long
+            traj_ids = (
+                [adv_traj_token_id]
+                if isinstance(adv_traj_token_id, int)
+                else list(adv_traj_token_id)
             )
+            adv_tensor = torch.tensor(
+                [traj_ids] * n_valid, device=device, dtype=torch.long
+            )  # (n_valid, n_traj_tokens)
             with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
                 adv_out = vlm(
                     input_ids=adv_tensor,
@@ -110,7 +115,7 @@ def run_batched_expert_diffusion(
                 )
             prompt_cache = adv_out.past_key_values
             prefill_seq_len = prompt_cache.get_seq_length()
-            offsets = offsets + 1
+            offsets = offsets + len(traj_ids)
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -807,21 +812,18 @@ class RolloutEngine:
 
         # Optionally append <adv_obs_pos> to input_ids
         if self.use_adv_conditioning and "adv_obs_pos" in self.adv_token_ids:
-            adv_obs_id = self.adv_token_ids["adv_obs_pos"]
-            adv_col = torch.full(
-                (S, 1),
-                adv_obs_id,
-                device=device,
-                dtype=batched_inputs["input_ids"].dtype,
-            )
+            adv_obs_tokens = self.adv_token_ids["adv_obs_pos"]
+            adv_obs_tokens = [adv_obs_tokens] if isinstance(adv_obs_tokens, int) else list(adv_obs_tokens)
+            n_obs = len(adv_obs_tokens)
+            adv_col = torch.tensor(
+                [adv_obs_tokens] * S, device=device, dtype=batched_inputs["input_ids"].dtype
+            )  # (S, n_obs)
             batched_inputs["input_ids"] = torch.cat(
-                [batched_inputs["input_ids"], adv_col],
-                dim=1,
+                [batched_inputs["input_ids"], adv_col], dim=1
             )
-            adv_mask = torch.ones(S, 1, device=device, dtype=torch.long)
+            adv_mask = torch.ones(S, n_obs, device=device, dtype=torch.long)
             batched_inputs["attention_mask"] = torch.cat(
-                [batched_inputs["attention_mask"], adv_mask],
-                dim=1,
+                [batched_inputs["attention_mask"], adv_mask], dim=1
             )
             max_prompt_len = batched_inputs["input_ids"].shape[1]
 

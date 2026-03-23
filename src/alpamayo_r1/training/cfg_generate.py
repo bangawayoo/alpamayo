@@ -67,11 +67,12 @@ def cfg_generate(
 
     # Build conditioning tokens (all positive, obs level only — traj token
     # is inserted mid-generation after CoC, not at the start)
-    obs_cond_token = [adv_token_ids["adv_obs_pos"]]
+    adv_obs_token = adv_token_ids["adv_obs_pos"]
+    adv_obs_token = [adv_obs_token] if isinstance(adv_obs_token, int) else list(adv_obs_token)
 
     # Build two input sequences (adv_obs_pos prepended for conditioned pass)
     uncond_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    cond_ids = torch.tensor([prompt_ids + obs_cond_token], dtype=torch.long, device=device)
+    cond_ids = torch.tensor([prompt_ids + adv_obs_token], dtype=torch.long, device=device)
 
     # Batched input: [unconditional, conditional]
     # Pad shorter sequence to match length

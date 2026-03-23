@@ -55,6 +55,37 @@ def compute_advantage_token_ids(vocab_size: int) -> dict[str, int]:
     return {name: vocab_size + i for i, name in enumerate(ADV_TOKEN_NAMES)}
 
 
+# Plain-text labels for text-mode advantage conditioning.
+# Each advantage token is replaced by a short phrase that the tokenizer
+# encodes into multiple real token IDs (no learned embeddings needed).
+ADV_TEXT_LABELS = {
+    "adv_obs_pos": "Observation advantage: Positive.",
+    "adv_obs_neg": "Observation advantage: Negative.",
+    "adv_traj_pos": "Trajectory advantage: Positive.",
+    "adv_traj_neg": "Trajectory advantage: Negative.",
+}
+
+
+def compute_text_advantage_token_ids(tokenizer) -> dict[str, list[int]]:
+    """Compute real token IDs for text-mode advantage conditioning.
+
+    Instead of out-of-range sentinel IDs with learned embeddings, this
+    tokenizes plain-text labels into sequences of real token IDs that
+    the VLM already understands.
+
+    Args:
+        tokenizer: The VLM tokenizer.
+
+    Returns:
+        Dict mapping token name -> list of token IDs, e.g.
+        {"adv_obs_pos": [12, 345, 67], "adv_obs_neg": [12, 345, 89], ...}
+    """
+    return {
+        name: tokenizer.encode(text, add_special_tokens=False)
+        for name, text in ADV_TEXT_LABELS.items()
+    }
+
+
 class AdvantageEmbedding(torch.nn.Module):
     """Small trainable embedding for advantage conditioning tokens.
 
@@ -567,7 +598,7 @@ def build_conditioned_sequence(
     completion_ids: list[int],
     i_obs: bool,
     i_traj: bool,
-    adv_token_ids: dict[str, int],
+    adv_token_ids: dict[str, int | list[int]],
     traj_future_start_id: int | None = None,
     p_drop: float = 0.3,
 ) -> dict[str, Any]:
@@ -586,7 +617,8 @@ def build_conditioned_sequence(
         completion_ids: Tokenized completion (CoC + trajectory tokens).
         i_obs: Binarized observation advantage (True=positive).
         i_traj: Binarized trajectory advantage (True=positive).
-        adv_token_ids: Dict mapping token name -> ID.
+        adv_token_ids: Dict mapping token name -> ID (embedding mode) or
+            list of IDs (text mode).
         traj_future_start_id: Token ID of <|traj_future_start|> used to find
             the CoC/trajectory boundary. If None, adv_traj is placed at the
             end of the completion (fallback).
@@ -620,8 +652,13 @@ def build_conditioned_sequence(
     else:
         # Conditional path: split placement
         # adv_obs goes after prompt (before CoC)
-        obs_token = adv_token_ids["adv_obs_pos" if i_obs else "adv_obs_neg"]
-        traj_token = adv_token_ids["adv_traj_pos" if i_traj else "adv_traj_neg"]
+        adv_obs_token = adv_token_ids["adv_obs_pos" if i_obs else "adv_obs_neg"]
+        adv_traj_token = adv_token_ids["adv_traj_pos" if i_traj else "adv_traj_neg"]
+
+        # Normalize to list for uniform handling (int for embedding mode,
+        # list[int] for text mode)
+        adv_obs_token = [adv_obs_token] if isinstance(adv_obs_token, int) else list(adv_obs_token)
+        adv_traj_token = [adv_traj_token] if isinstance(adv_traj_token, int) else list(adv_traj_token)
 
         # Find CoC/trajectory boundary in completion_ids
         traj_boundary = len(completion_ids)  # fallback: end of completion
@@ -634,12 +671,12 @@ def build_conditioned_sequence(
         coc_part = completion_ids[:traj_boundary]
         traj_part = completion_ids[traj_boundary:]
 
-        # [prompt] [adv_obs] [CoC tokens...] [adv_traj] [trajectory tokens...]
-        input_ids = prompt_ids + [obs_token] + coc_part + [traj_token] + traj_part
+        # [prompt] [adv_obs...] [CoC tokens...] [adv_traj...] [trajectory tokens...]
+        input_ids = prompt_ids + adv_obs_token + coc_part + adv_traj_token + traj_part
         labels = (
-            [IGNORE_INDEX] * (len(prompt_ids) + 1)  # prompt + adv_obs
+            [IGNORE_INDEX] * (len(prompt_ids) + len(adv_obs_token))  # prompt + adv_obs
             + coc_part  # CoC tokens (supervised)
-            + [IGNORE_INDEX]  # adv_traj
+            + [IGNORE_INDEX] * len(adv_traj_token)  # adv_traj
             + traj_part  # trajectory tokens (supervised)
         )
 

@@ -532,13 +532,24 @@ class SelfPlayLoop:
         )
         self.current_policy_path = self.base_model_path
 
-        # Advantage conditioning: compute token IDs and trainable side embedding
+        # Advantage conditioning: compute token IDs and (optionally) trainable embedding
         self.adv_enabled = bool(adv_cfg.get("enabled", True))
+        self.adv_mode = adv_cfg.get("adv_mode", "embedding")
         if self.adv_enabled:
-            vocab_size = full_model.vlm.config.text_config.vocab_size
-            self.adv_token_ids = compute_advantage_token_ids(vocab_size)
-            hidden_size = full_model.vlm.config.text_config.hidden_size
-            self.adv_embedding = AdvantageEmbedding(hidden_size, self.adv_token_ids)
+            if self.adv_mode == "text":
+                from alpamayo_r1.training.advantage_conditioning import (
+                    compute_text_advantage_token_ids,
+                )
+
+                self.adv_token_ids = compute_text_advantage_token_ids(full_model.tokenizer)
+                self.adv_embedding = None
+                logger.info("Advantage conditioning: text mode (plain-text tokens)")
+            else:
+                vocab_size = full_model.vlm.config.text_config.vocab_size
+                self.adv_token_ids = compute_advantage_token_ids(vocab_size)
+                hidden_size = full_model.vlm.config.text_config.hidden_size
+                self.adv_embedding = AdvantageEmbedding(hidden_size, self.adv_token_ids)
+                logger.info("Advantage conditioning: embedding mode (learned hooks)")
         else:
             self.adv_token_ids = None
             self.adv_embedding = None
