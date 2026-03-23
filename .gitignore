@@ -1,5 +1,5 @@
-./outputs/*
-./eval_results/*
+outputs/*
+eval_results/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
