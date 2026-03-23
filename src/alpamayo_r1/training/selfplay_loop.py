@@ -1160,7 +1160,27 @@ class SelfPlayLoop:
         trainer.train()
 
         # 7. Save
-        trainer.save_model(str(output_dir / "final"))
+        # Save the adapter first (standard PEFT behavior)
+        final_save_dir = output_dir / "final"
+        trainer.save_model(str(final_save_dir))
+        
+        # ALSO: Save the ENTIRE model to confirm if loading/resizing is the issue.
+        logger.info("Merging LoRA weights and saving full AlpamayoR1 model to %s", final_save_dir / "full_model")
+        
+        # 1. Merge LoRA weights in-place temporarily for saving
+        if hasattr(self.full_model.vlm, "merge_and_unload"):
+            self.full_model.vlm = self.full_model.vlm.merge_and_unload()
+        if hasattr(self.full_model.expert, "merge_and_unload"):
+            self.full_model.expert = self.full_model.expert.merge_and_unload()
+
+        # 2. Save the full AlpamayoR1 instance
+        # This saves config.json (model_type: alpamayo_r1) and all submodule weights
+        self.full_model.save_pretrained(str(final_save_dir / "full_model"))
+        self.processor.save_pretrained(str(final_save_dir / "full_model"))
+        
+        # 3. Reload LoRA for the next iteration (since SelfPlayLoop continues using this model)
+        # Note: In RECAP mode (reset_to_base=True), this doesn't matter as it reloads anyway.
+        # If not resetting, we would need to re-apply the adapter here.
         self.current_policy_path = str(output_dir / "final")
         logger.info("Saved pi_%d to %s", iteration + 1, self.current_policy_path)
 
