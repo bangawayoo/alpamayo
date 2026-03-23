@@ -17,8 +17,24 @@ import logging
 
 import torch
 from transformers import AutoTokenizer, StoppingCriteria
+from transformers.generation.logits_process import LogitsProcessor
 
 logger = logging.getLogger(__name__)
+
+
+class ExpertLogitsProcessor(LogitsProcessor):
+    """Masks out the logits for discrete trajectory tokens."""
+
+    def __init__(self, traj_token_offset: int, traj_vocab_size: int):
+        super().__init__()
+        self.traj_token_offset = traj_token_offset
+        self.traj_vocab_size = traj_vocab_size
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        scores[:, self.traj_token_offset : self.traj_token_offset + self.traj_vocab_size] = float(
+            "-inf"
+        )
+        return scores
 
 
 def to_special_token(token: str) -> str:

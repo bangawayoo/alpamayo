@@ -12,8 +12,7 @@ from typing import Literal
 import torch
 from transformers import GenerationConfig, LogitsProcessorList, StoppingCriteriaList
 
-from alpamayo_r1.models.alpamayo_r1 import ExpertLogitsProcessor
-from alpamayo_r1.models.token_utils import StopAfterEOS, extract_traj_tokens
+from alpamayo_r1.models.token_utils import ExpertLogitsProcessor, StopAfterEOS, extract_traj_tokens
 
 
 def prepare_vlm_inputs(

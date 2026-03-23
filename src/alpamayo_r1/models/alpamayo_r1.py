@@ -21,19 +21,17 @@ import einops
 import hydra.utils as hyu
 import numpy as np
 import torch
-from transformers import AutoConfig, AutoModel, StoppingCriteriaList
-from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
+from transformers import AutoConfig, AutoModel
 
 from alpamayo_r1.action_space import ActionSpace
 from alpamayo_r1.models.base_model import ReasoningVLA
 from alpamayo_r1.config import AlpamayoR1Config
 from alpamayo_r1.diffusion.base import BaseDiffusion
+from alpamayo_r1.inference import decode_vlm_trajectories, generate_coc, prepare_vlm_inputs
 from alpamayo_r1.models.token_utils import (
-    StopAfterEOS,
+    ExpertLogitsProcessor,  # noqa: F401 — re-exported for backwards compat
     extract_text_tokens,
-    extract_traj_tokens,
     replace_padding_after_eos,
-    to_special_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,38 +46,6 @@ if not logger.handlers:
     logger.addHandler(_h)
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
-
-
-class ExpertLogitsProcessor(LogitsProcessor):
-    """Masks out the logits for discrete trajectory tokens."""
-
-    def __init__(self, traj_token_offset: int, traj_vocab_size: int):
-        """Initialize the ExpertLogitsProcessor.
-
-        Args:
-            traj_token_offset: The offset of the trajectory tokens.
-            traj_vocab_size: The vocabulary size of the trajectory tokens.
-        """
-        super().__init__()
-        self.traj_token_offset = traj_token_offset
-        self.traj_vocab_size = traj_vocab_size
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        """Call the ExpertLogitsProcessor to mask out the logits for discrete trajectory tokens.
-
-        The discrete trajectory tokens are not used for the expert model thus masking them out for
-        better CoC generation.
-
-        Args:
-            input_ids: The input IDs.
-            scores: The scores.
-
-        Returns:
-            torch.FloatTensor: The modified scores tensor with trajectory tokens masked out (set to -inf).
-        """
-        # Directly assign -inf to the trajectory token positions in the scores tensor
-        scores[:, self.traj_token_offset : self.traj_token_offset + self.traj_vocab_size] = float('-inf')
-        return scores
 
 
 class AlpamayoR1(ReasoningVLA):
