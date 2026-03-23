@@ -18,14 +18,8 @@ from typing import Any
 import einops
 import torch
 import torch.nn.functional as F
-from transformers import GenerationConfig, StoppingCriteriaList
-from transformers.generation.logits_process import LogitsProcessorList
-
-from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1, ExpertLogitsProcessor
-from alpamayo_r1.models.token_utils import (
-    StopAfterEOS,
-    extract_traj_tokens,
-)
+from alpamayo_r1.inference import decode_vlm_trajectories, generate_coc, prepare_vlm_inputs
+from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1.training.rollout_utils import ClipDataCache
 
 logger = logging.getLogger(__name__)
@@ -459,21 +453,13 @@ class RolloutEngine:
         # Encode artificial trajectory into discrete tokens
         pred_xyz_t = torch.tensor(pred_xyz_np)
         # Use identity rotation (contiguous for action_space internals)
-        pred_rot_t = (
-            torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, n_points, 3, 3).contiguous()
-        )
+        pred_rot_t = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, n_points, 3, 3).contiguous()
         discrete_tokens = self.traj_tokenizer.encode(hist_xyz, hist_rot, pred_xyz_t, pred_rot_t)
         discrete_tokens = discrete_tokens.clamp(0, self.traj_vocab_size - 1)
         traj_token_ids = (discrete_tokens + self.traj_token_start_idx).squeeze(0).tolist()
 
         # Build prompt_ids (same for all G completions)
-        tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
-        input_ids = tokenized.pop("input_ids")
-        traj_data = {
-            "ego_history_xyz": model_inputs["ego_history_xyz"],
-            "ego_history_rot": model_inputs["ego_history_rot"],
-        }
-        input_ids = self.full_model.fuse_traj_tokens(input_ids, traj_data)
+        input_ids, _ = prepare_vlm_inputs(self.full_model, model_inputs)
         prompt_ids_list = input_ids[0].cpu().tolist()
 
         gt_traj = ego_future_xyz[0, 0].numpy().flatten().tolist()
@@ -549,17 +535,11 @@ class RolloutEngine:
         scenes = []
         for clip_id in clip_ids:
             model_inputs, ego_future_xyz = self.data_cache.get(clip_id, t0_us, device)
-            tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
-            input_ids = tokenized.pop("input_ids")  # (1, L_s)
-            traj_data = {
-                "ego_history_xyz": model_inputs["ego_history_xyz"],
-                "ego_history_rot": model_inputs["ego_history_rot"],
-            }
-            input_ids = self.full_model.fuse_traj_tokens(input_ids, traj_data)
+            input_ids, gen_kwargs = prepare_vlm_inputs(self.full_model, model_inputs)
             scenes.append(
                 {
                     "input_ids": input_ids,
-                    "tokenized": tokenized,
+                    "tokenized": gen_kwargs,
                     "ego_future_xyz": ego_future_xyz,
                     "hist_xyz": model_inputs["ego_history_xyz"][:, -1],  # (1, T, 3)
                     "hist_rot": model_inputs["ego_history_rot"][:, -1],  # (1, T, 3, 3)
@@ -694,28 +674,23 @@ class RolloutEngine:
         # repeat_interleave garbling concatenated pixel_values across scenes.
         t_ = time.time()
         expanded = self._expand_for_generation(batched_inputs, per_scene_meta, G)
-        gen_config = GenerationConfig(
-            do_sample=True,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            num_return_sequences=1,
-            max_new_tokens=self.max_generation_length + self.tokens_per_future_traj + 10,
-            pad_token_id=self.pad_token_id,
-        )
-        stopping = StoppingCriteriaList([StopAfterEOS(eos_token_id=traj_future_end_id)])
-
         gen_kwargs = {
             k: expanded[k]
             for k in ("attention_mask", "pixel_values", "image_grid_thw")
             if k in expanded
         }
-        with torch.autocast(str(device), dtype=torch.bfloat16):
-            vlm_output = self.full_model.vlm.generate(
-                input_ids=expanded["input_ids"],
-                generation_config=gen_config,
-                stopping_criteria=stopping,
-                **gen_kwargs,
-            )
+        vlm_output = generate_coc(
+            self.full_model,
+            expanded["input_ids"],
+            gen_kwargs,
+            mode="vlm",
+            temperature=self.temperature,
+            top_p=self.top_p,
+            num_samples=1,
+            max_new_tokens=self.max_generation_length + self.tokens_per_future_traj + 10,
+            pad_token_id=self.pad_token_id,
+            autocast_device=device,
+        )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         timings["vlm_generate"] = time.time() - t_
@@ -725,15 +700,6 @@ class RolloutEngine:
 
         # 3. Batched trajectory extraction and decoding
         t_ = time.time()
-        traj_tokens = extract_traj_tokens(
-            vlm_output,
-            self.special_token_ids,
-            self.tokens_per_future_traj,
-            self.traj_token_start_idx,
-            self.traj_vocab_size,
-        )
-
-        # Build batched hist_xyz/hist_rot: each scene's history repeated G times
         hist_xyz_list = []
         hist_rot_list = []
         for meta in per_scene_meta:
@@ -742,10 +708,8 @@ class RolloutEngine:
         hist_xyz_batch = torch.cat(hist_xyz_list, dim=0)  # (S*G, T, 3)
         hist_rot_batch = torch.cat(hist_rot_list, dim=0)  # (S*G, T, 3, 3)
 
-        pred_xyz_tensor, pred_rot_tensor, _ = self.traj_tokenizer.decode(
-            hist_xyz_batch,
-            hist_rot_batch,
-            traj_tokens,
+        pred_xyz_tensor, pred_rot_tensor = decode_vlm_trajectories(
+            self.full_model, vlm_output, hist_xyz_batch, hist_rot_batch
         )
         timings["traj_decode"] = time.time() - t_
 
@@ -865,37 +829,23 @@ class RolloutEngine:
         # repeat_interleave garbling concatenated pixel_values across scenes.
         t_ = time.time()
         expanded = self._expand_for_generation(batched_inputs, per_scene_meta, G)
-        gen_config = GenerationConfig(
-            do_sample=True,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            num_return_sequences=1,
-            max_new_tokens=self.max_generation_length + 10,
-            pad_token_id=self.pad_token_id,
-        )
-        logits_processor = LogitsProcessorList(
-            [
-                ExpertLogitsProcessor(
-                    traj_token_offset=self.traj_token_start_idx,
-                    traj_vocab_size=self.traj_vocab_size,
-                )
-            ]
-        )
-        stopping = StoppingCriteriaList([StopAfterEOS(eos_token_id=traj_future_start_id)])
-
         gen_kwargs = {
             k: expanded[k]
             for k in ("attention_mask", "pixel_values", "image_grid_thw")
             if k in expanded
         }
-        with torch.autocast(str(device), dtype=torch.bfloat16):
-            vlm_output = self.full_model.vlm.generate(
-                input_ids=expanded["input_ids"],
-                generation_config=gen_config,
-                stopping_criteria=stopping,
-                logits_processor=logits_processor,
-                **gen_kwargs,
-            )
+        vlm_output = generate_coc(
+            self.full_model,
+            expanded["input_ids"],
+            gen_kwargs,
+            mode="expert",
+            temperature=self.temperature,
+            top_p=self.top_p,
+            num_samples=1,
+            max_new_tokens=self.max_generation_length + 10,
+            pad_token_id=self.pad_token_id,
+            autocast_device=device,
+        )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         generated_seqs = vlm_output[:, max_prompt_len:]
@@ -1103,13 +1053,7 @@ class RolloutEngine:
                 model_inputs, _ = self.data_cache.get(clip_id, t0_us, device)
 
                 # Prepare prompt input_ids with fused history
-                tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
-                input_ids = tokenized.pop("input_ids")
-                traj_data = {
-                    "ego_history_xyz": model_inputs["ego_history_xyz"],
-                    "ego_history_rot": model_inputs["ego_history_rot"],
-                }
-                input_ids = self.full_model.fuse_traj_tokens(input_ids, traj_data)
+                input_ids, _ = prepare_vlm_inputs(self.full_model, model_inputs)
                 prompt_len = input_ids.shape[1]
                 prompt_input_ids = input_ids.clone()
 
