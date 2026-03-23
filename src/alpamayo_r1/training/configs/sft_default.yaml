@@ -35,7 +35,7 @@ training:
   num_train_epochs: 3           # epochs per iteration
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 1
-  learning_rate: 5e-6
+  learning_rate: 5e-4
   bf16: true
   gradient_checkpointing: true
   logging_steps: 1
@@ -79,7 +79,7 @@ value_head:
 # Uses deferred GPU scheduling: expert step runs after VLM SFT backward
 expert_finetune:
   enabled: true
-  lr: 1e-5
+  lr: 1e-4
   weight_decay: 0.01
   num_noisy_samples: 1          # noise samples per GT action for CFM loss
   every_n_steps: 1              # run expert CFM step every N VLM SFT steps
