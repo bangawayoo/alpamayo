@@ -787,6 +787,15 @@ class SelfPlayLoop:
             "Phase 1 complete: %d completions in %.1fs", len(rollout_results), time.time() - t0
         )
 
+        # Save rollout clip IDs for debugging
+        train_cfg = self.cfg.get("training", {})
+        iter_dir = Path(train_cfg.get("output_dir", "outputs/sft_advcond")) / f"iter_{iteration}"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        rollout_clip_ids = [r["clip_id"] for r in rollout_results]
+        with open(iter_dir / "rollout_clip_ids.json", "w") as f:
+            json.dump(rollout_clip_ids, f, indent=2)
+        logger.info("Saved %d rollout clip IDs to %s", len(rollout_clip_ids), iter_dir)
+
         # ----- Phase 2: EVALUATE -----
         logger.info("Phase 2: EVALUATE — scoring and binarizing advantages")
         t0 = time.time()

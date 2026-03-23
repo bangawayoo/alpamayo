@@ -346,9 +346,13 @@ class AlpamayoR1(ReasoningVLA):
             gen_ids = vlm_outputs.sequences[si, prompt_len:].cpu().tolist()
             while gen_ids and gen_ids[-1] == self.tokenizer.pad_token_id:
                 gen_ids.pop()
+            tail_ids = input_ids[si].cpu().tolist()[-35:]
+            input_tail = self.tokenizer.decode(tail_ids, skip_special_tokens=False)
             logger.info(
-                "[vlm_rollout] sample %d raw generation (%d tokens): %s",
+                "[vlm_rollout] sample %d input tail ids: %s | decoded: ...%s | raw generation (%d tokens): %s",
                 si,
+                tail_ids,
+                input_tail,
                 len(gen_ids),
                 self.tokenizer.decode(gen_ids, skip_special_tokens=False),
             )
