@@ -424,26 +424,29 @@ class RolloutEngine:
     ) -> list[dict]:
         """Generate artificial rollout results for overfit sanity checking.
 
-        Produces a fixed CoC text and a straight-line trajectory (go forward
-        at 5 m/s for 4 seconds) so we can verify the training pipeline teaches
-        the model to reproduce known outputs.
+        Produces a fixed CoC text and a distinctive sinusoidal S-curve
+        trajectory so we can clearly tell if the model is overfitting to
+        the artificial data (a straight line could be confused with
+        reasonable driving behavior).
         """
         import numpy as np
 
         # Fixed CoC text → token IDs (include <cot_end> to match real VLM output format)
         # Add leading space to match standard VLM generation which typically starts with a space
         # after the <|cot_start|> trigger token.
-        artificial_coc = " Drive straight ahead at constant speed. No obstacles detected."
+        artificial_coc = " Swerving in a sinusoidal S-curve pattern. This is artificial data."
         coc_token_ids = self.tokenizer.encode(artificial_coc, add_special_tokens=False)
         cot_end_id = self.special_token_ids["cot_end"]
 
-        # Fixed straight-line trajectory matching real data shape (64 waypoints)
-        # (x=forward, y=lateral, z=up) — go straight in x at 5 m/s
+        # Distinctive S-curve trajectory: forward motion + lateral sine wave
+        # This is clearly non-natural driving, making overfitting easy to spot
         n_points = 64
         dt = 4.0 / n_points
+        t = np.arange(1, n_points + 1) * dt  # time from 0.0625s to 4.0s
         speed = 5.0
         pred_xyz_np = np.zeros((1, n_points, 3), dtype=np.float32)
-        pred_xyz_np[0, :, 0] = np.arange(1, n_points + 1) * dt * speed  # x = forward
+        pred_xyz_np[0, :, 0] = t * speed  # x = forward at 5 m/s
+        pred_xyz_np[0, :, 1] = 3.0 * np.sin(2 * np.pi * t / 4.0)  # y = 3m amplitude sine wave
 
         # Load real history for encoding context
         model_inputs, ego_future_xyz = self.data_cache.get(clip_id, t0_us, device)
@@ -476,7 +479,7 @@ class RolloutEngine:
         for g in range(G):
             # Add small noise to pred_xyz so rewards vary across completions,
             # preventing all advantages from collapsing to zero during binarization.
-            noise = np.random.normal(0, 0.05, size=pred_xyz_np.shape).astype(np.float32)
+            noise = np.random.normal(0, 0.01, size=pred_xyz_np.shape).astype(np.float32)
             noisy_pred = (pred_xyz_np + noise).flatten().tolist()
             results.append(
                 {
