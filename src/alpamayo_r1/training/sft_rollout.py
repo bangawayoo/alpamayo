@@ -505,12 +505,11 @@ class RolloutEngine:
         hist_xyz_rep = hist_xyz.expand(G, -1, -1)
         hist_rot_rep = hist_rot.expand(G, -1, -1, -1)
 
-        with torch.no_grad():
-            pred_xyz_tensor, pred_rot_tensor, _ = self.traj_tokenizer.decode(
-                hist_xyz_rep,
-                hist_rot_rep,
-                traj_tokens,
-            )
+        pred_xyz_tensor, pred_rot_tensor, _ = self.traj_tokenizer.decode(
+            hist_xyz_rep,
+            hist_rot_rep,
+            traj_tokens,
+        )
         timings["traj_decode"] = time.time() - t_
 
         # 5. Build per-sample outputs
@@ -938,7 +937,6 @@ class RolloutEngine:
         prompt_ids_list = input_ids[0].cpu().tolist()
 
         gt_traj = ego_future_xyz[0, 0].numpy().flatten().tolist()
-        pred_traj = pred_xyz_np.flatten().tolist()
 
         completion_ids = (
             coc_token_ids
@@ -1204,12 +1202,11 @@ class RolloutEngine:
         hist_xyz_batch = torch.cat(hist_xyz_list, dim=0)  # (S*G, T, 3)
         hist_rot_batch = torch.cat(hist_rot_list, dim=0)  # (S*G, T, 3, 3)
 
-        with torch.no_grad():
-            pred_xyz_tensor, pred_rot_tensor, _ = self.traj_tokenizer.decode(
-                hist_xyz_batch,
-                hist_rot_batch,
-                traj_tokens,
-            )
+        pred_xyz_tensor, pred_rot_tensor, _ = self.traj_tokenizer.decode(
+            hist_xyz_batch,
+            hist_rot_batch,
+            traj_tokens,
+        )
         timings["traj_decode"] = time.time() - t_
 
         # 4. Build per-completion result dicts

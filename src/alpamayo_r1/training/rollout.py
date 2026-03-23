@@ -945,12 +945,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                     hist_rot = model_inputs["ego_history_rot"][:, -1]  # (1, T, 3, 3)
                     hist_xyz_rep = hist_xyz.expand(local_gen_count, -1, -1)
                     hist_rot_rep = hist_rot.expand(local_gen_count, -1, -1, -1)
-                    with torch.no_grad():
-                        pred_xyz_tensor, pred_rot_tensor, _ = traj_tokenizer.decode(
-                            hist_xyz_rep,
-                            hist_rot_rep,
-                            traj_tokens,
-                        )
+                    pred_xyz_tensor, pred_rot_tensor, _ = traj_tokenizer.decode(
+                        hist_xyz_rep,
+                        hist_rot_rep,
+                        traj_tokens,
+                    )
 
                     # 5. Build per-sample outputs (local_gen_count per unique prompt)
                     prompt_ids_list = prompt_input_ids[0].cpu().tolist()
@@ -1114,12 +1113,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             hist_rot = hist_rot.reshape(1, n_hist, 3, 3)
 
             # Decode trajectory tokens → continuous xyz
-            with torch.no_grad():
-                pred_xyz_tensor, _, _ = traj_tokenizer.decode(
-                    hist_xyz,
-                    hist_rot,
-                    traj_tokens,
-                )
+            pred_xyz_tensor, _, _ = traj_tokenizer.decode(
+                hist_xyz,
+                hist_rot,
+                traj_tokens,
+            )
 
             pred_traj = pred_xyz_tensor[0].cpu().numpy().flatten().tolist()
             all_pred_xyz.append(pred_traj)
