@@ -1232,6 +1232,8 @@ class SelfPlayLoop:
             adv_token_ids=self.adv_token_ids,
             p_drop=float(adv_cfg.get("p_drop", 0.3)),
             traj_future_start_id=traj_future_start_id,
+            data_cache=self._get_data_cache(),
+            processor=self.processor,
         )
 
     def _get_data_cache(self):
@@ -1243,7 +1245,7 @@ class SelfPlayLoop:
             self._data_cache = ClipDataCache(
                 avdi=self.avdi,
                 processor=self.processor,
-                cache_pil_images=False,
+                cache_pil_images=True,
                 max_size=int(rollout_cfg.get("data_cache_max_size", 200)),
             )
         return self._data_cache

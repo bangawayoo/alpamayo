@@ -40,7 +40,8 @@ def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
     """Collate variable-length AdvCondDataset samples by padding to max length.
 
     Pads input_ids with pad_token_id, labels with IGNORE_INDEX, and
-    attention_mask with 0. Also collates expert CFM metadata if present.
+    attention_mask with 0. Also collates expert CFM metadata and vision data
+    if present.
     """
     max_len = max(len(f["input_ids"]) for f in features)
 
@@ -50,6 +51,10 @@ def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
         "attention_mask": [],
         "is_unconditional": [],
     }
+    # Vision data (optional, but needed for VLM training)
+    pixel_values = []
+    image_grid_thw = []
+
     # Expert CFM metadata (non-tensor, collected as lists)
     clip_ids = []
     t0_us_list = []
@@ -63,6 +68,11 @@ def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
         batch["attention_mask"].append(f["attention_mask"] + [0] * pad_len)
         batch["is_unconditional"].append(f["is_unconditional"])
 
+        if "pixel_values" in f:
+            pixel_values.append(f["pixel_values"])
+        if "image_grid_thw" in f:
+            image_grid_thw.append(f["image_grid_thw"])
+
         if "clip_id" in f:
             clip_ids.append(f["clip_id"])
         if "t0_us" in f:
@@ -74,6 +84,11 @@ def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
     batch["labels"] = torch.tensor(batch["labels"], dtype=torch.long)
     batch["attention_mask"] = torch.tensor(batch["attention_mask"], dtype=torch.long)
     batch["is_unconditional"] = torch.tensor(batch["is_unconditional"], dtype=torch.bool)
+
+    if pixel_values:
+        batch["pixel_values"] = torch.cat(pixel_values, dim=0)
+    if image_grid_thw:
+        batch["image_grid_thw"] = torch.cat(image_grid_thw, dim=0)
 
     if clip_ids:
         batch["clip_ids"] = clip_ids
@@ -249,11 +264,17 @@ class AdvCondSFTTrainer(Trainer):
         The dataset has already masked prompt+conditioning positions in labels
         with IGNORE_INDEX. We just apply the alpha weight for conditional examples.
         """
-        outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            labels=inputs["labels"],
-        )
+        model_inputs = {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+            "labels": inputs["labels"],
+        }
+        if "pixel_values" in inputs:
+            model_inputs["pixel_values"] = inputs["pixel_values"]
+        if "image_grid_thw" in inputs:
+            model_inputs["image_grid_thw"] = inputs["image_grid_thw"]
+
+        outputs = model(**model_inputs)
         loss = outputs.loss
 
         # Apply alpha weighting for conditional examples
