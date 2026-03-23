@@ -599,6 +599,17 @@ def build_conditioned_sequence(
         - attention_mask: list[int] — all 1s
         - is_unconditional: bool — True if this is an unconditional example
     """
+    # When adv_token_ids is None, skip all conditioning (plain SFT)
+    if adv_token_ids is None:
+        input_ids = prompt_ids + completion_ids
+        labels = [IGNORE_INDEX] * len(prompt_ids) + completion_ids
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": [1] * len(input_ids),
+            "is_unconditional": True,
+        }
+
     is_all_positive = i_obs and i_traj
     is_unconditional = is_all_positive and random.random() < p_drop
 

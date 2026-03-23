@@ -526,11 +526,17 @@ class SelfPlayLoop:
         )
         self.current_policy_path = self.base_model_path
 
-        # Compute advantage token IDs and create trainable side embedding
-        vocab_size = full_model.vlm.config.text_config.vocab_size
-        self.adv_token_ids = compute_advantage_token_ids(vocab_size)
-        hidden_size = full_model.vlm.config.text_config.hidden_size
-        self.adv_embedding = AdvantageEmbedding(hidden_size, self.adv_token_ids)
+        # Advantage conditioning: compute token IDs and trainable side embedding
+        self.adv_enabled = bool(adv_cfg.get("enabled", True))
+        if self.adv_enabled:
+            vocab_size = full_model.vlm.config.text_config.vocab_size
+            self.adv_token_ids = compute_advantage_token_ids(vocab_size)
+            hidden_size = full_model.vlm.config.text_config.hidden_size
+            self.adv_embedding = AdvantageEmbedding(hidden_size, self.adv_token_ids)
+        else:
+            self.adv_token_ids = None
+            self.adv_embedding = None
+            logger.info("Advantage conditioning disabled — training as plain SFT")
 
         # Replay ratio: fraction of training data from historical replay buffer
         self.replay_ratio = float(adv_cfg.get("replay_ratio", 0.3))
@@ -1007,7 +1013,7 @@ class SelfPlayLoop:
         #    Detach advantage embedding hooks BEFORE freeing the old model so
         #    stale hook handles don't keep the old embedding layer (and thus
         #    the entire old VLM) alive.
-        if hasattr(self, "adv_embedding"):
+        if self.adv_embedding is not None:
             self.adv_embedding.detach()
 
         if self.full_model is not None:
@@ -1080,11 +1086,12 @@ class SelfPlayLoop:
             logger.info("Applied LoRA: r=%d, alpha=%d", lora_config.r, lora_config.lora_alpha)
 
         # Attach trainable advantage embedding to PeftModel
-        self.adv_embedding = self.adv_embedding.to(
-            dtype=next(full_model.vlm.parameters()).dtype
-        )
-        full_model.vlm.adv_embedding = self.adv_embedding  # visible to Trainer optimizer
-        self.adv_embedding.attach(full_model.vlm)
+        if self.adv_embedding is not None:
+            self.adv_embedding = self.adv_embedding.to(
+                dtype=next(full_model.vlm.parameters()).dtype
+            )
+            full_model.vlm.adv_embedding = self.adv_embedding  # visible to Trainer optimizer
+            self.adv_embedding.attach(full_model.vlm)
 
         # 3. Build training dataset (fresh + historical replay)
         train_dataset = self._build_training_dataset(rollout_results, adv_labels)

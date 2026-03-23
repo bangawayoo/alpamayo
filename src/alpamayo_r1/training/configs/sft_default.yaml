@@ -48,6 +48,7 @@ training:
 
 # Advantage conditioning parameters (outer self-play loop)
 advantage_conditioning:
+  enabled: true                   # set to false to disable advantage token injection (plain SFT)
   num_iterations: 5             # self-play outer loop iterations
   completions_per_scene: 4      # G completions per scene during rollout
   p_drop: 0.3                   # conditioning dropout probability for CFG
