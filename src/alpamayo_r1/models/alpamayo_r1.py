@@ -97,7 +97,6 @@ class AlpamayoR1(ReasoningVLA):
             model.vlm = model.vlm.merge_and_unload()
             model.vlm = model.vlm.to(dtype)
 
-
         return model
 
     def __init__(
@@ -269,37 +268,27 @@ class AlpamayoR1(ReasoningVLA):
             "max_generation_length", self.config.tokens_per_future_traj
         )
 
-        input_ids, tokenized_data, ego_history_xyz, ego_history_rot, B = (
-            self._prepare_vlm_generation(
-                data, top_p, top_k, temperature, num_traj_samples, max_generation_length,
-            )
-        )
+        input_ids, gen_kwargs = prepare_vlm_inputs(self, data)
         device = input_ids.device
 
-        # Full pipeline needs logits and KV cache for Expert
-        generation_config = self.vlm.generation_config
-        generation_config.output_logits = True
-        generation_config.return_dict_in_generate = True
+        ego_history_xyz = data["ego_history_xyz"]
+        ego_history_rot = data["ego_history_rot"]
+        B, n_traj_group, _, _ = ego_history_xyz.shape
+        assert n_traj_group == 1, "Only one trajectory group is supported for inference."
 
-        # use custom stopping criteria to stop after EOS token + one more token,
-        # because the KV cache is updated after the next token is generated
-        eos_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
-        stopping_criteria = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_token_id)])
-        logits_processor = LogitsProcessorList(
-            [
-                ExpertLogitsProcessor(
-                    traj_token_offset=self.config.traj_token_start_idx,
-                    traj_vocab_size=self.config.traj_vocab_size,
-                )
-            ]
+        vlm_outputs = generate_coc(
+            self,
+            input_ids,
+            gen_kwargs,
+            mode="expert",
+            temperature=temperature,
+            top_p=top_p,
+            num_samples=num_traj_samples,
+            max_new_tokens=max_generation_length,
+            pad_token_id=self.tokenizer.pad_token_id,
+            return_dict=True,
         )
-        vlm_outputs = self.vlm.generate(
-            input_ids=input_ids,
-            generation_config=generation_config,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
-            **tokenized_data,
-        )
+        eos_token_id = self.special_token_ids["traj_future_start"]
         # Navigate through PeftModel wrapper if LoRA is unmerged
         _inner = self.vlm.model
         if not hasattr(_inner, "rope_deltas"):
@@ -430,9 +419,13 @@ class AlpamayoR1(ReasoningVLA):
         )
 
         return self._postprocess_trajectories(
-            pred_xyz, pred_rot, vlm_outputs.sequences,
-            num_traj_sets, num_traj_samples,
-            input_ids.shape[0], kwargs.get("return_extra", False),
+            pred_xyz,
+            pred_rot,
+            vlm_outputs.sequences,
+            num_traj_sets,
+            num_traj_samples,
+            input_ids.shape[0],
+            kwargs.get("return_extra", False),
         )
 
     def sample_trajectories_from_data_with_vlm_only(
@@ -477,28 +470,20 @@ class AlpamayoR1(ReasoningVLA):
                 containing CoC text, shape ``(B, num_traj_sets, num_traj_samples)``.
         """
         n_samples_total = num_traj_samples * num_traj_sets
-        tokens_per_future_traj = self.config.tokens_per_future_traj
-        max_new_tokens = max_generation_length + tokens_per_future_traj + 10
+        max_new_tokens = max_generation_length + self.config.tokens_per_future_traj + 10
 
-        input_ids, tokenized_data, ego_history_xyz, ego_history_rot, B = (
-            self._prepare_vlm_generation(
-                data, top_p, top_k, temperature, num_traj_samples, max_new_tokens,
-            )
-        )
+        input_ids, gen_kwargs = prepare_vlm_inputs(self, data)
 
-        # No ExpertLogitsProcessor — VLM freely generates trajectory tokens.
-        # Stop at <|traj_future_end|> (the VLM generates tokens *through* the
-        # trajectory section, unlike the full pipeline which stops at _start).
-        traj_future_end_id = self.special_token_ids["traj_future_end"]
-        stopping_criteria = StoppingCriteriaList(
-            [StopAfterEOS(eos_token_id=traj_future_end_id)]
-        )
-
-        vlm_output = self.vlm.generate(
-            input_ids=input_ids,
-            generation_config=self.vlm.generation_config,
-            stopping_criteria=stopping_criteria,
-            **tokenized_data,
+        vlm_output = generate_coc(
+            self,
+            input_ids,
+            gen_kwargs,
+            mode="vlm",
+            temperature=temperature,
+            top_p=top_p,
+            num_samples=num_traj_samples,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=self.tokenizer.pad_token_id,
         )
         # vlm_output: (B * num_traj_samples, prompt_len + generated_len)
 
@@ -515,27 +500,22 @@ class AlpamayoR1(ReasoningVLA):
                 self.tokenizer.decode(gen_ids, skip_special_tokens=False),
             )
 
-        # Extract discrete trajectory tokens and decode to continuous xyz
-        traj_tokens = extract_traj_tokens(
-            vlm_output,
-            self.special_token_ids,
-            tokens_per_future_traj,
-            self.future_token_start_idx,
-            self.config.traj_vocab_size,
-        )
-
+        ego_history_xyz = data["ego_history_xyz"]
+        ego_history_rot = data["ego_history_rot"]
         hist_xyz_rep, hist_rot_rep = self._repeat_history(
             ego_history_xyz, ego_history_rot, n_samples_total
         )
 
-        pred_xyz, pred_rot, _ = self.traj_tokenizer.decode(
-            hist_xyz_rep, hist_rot_rep, traj_tokens
-        )
+        pred_xyz, pred_rot = decode_vlm_trajectories(self, vlm_output, hist_xyz_rep, hist_rot_rep)
 
         return self._postprocess_trajectories(
-            pred_xyz, pred_rot, vlm_output,
-            num_traj_sets, num_traj_samples,
-            input_ids.shape[0], return_extra,
+            pred_xyz,
+            pred_rot,
+            vlm_output,
+            num_traj_sets,
+            num_traj_samples,
+            input_ids.shape[0],
+            return_extra,
         )
 
 
