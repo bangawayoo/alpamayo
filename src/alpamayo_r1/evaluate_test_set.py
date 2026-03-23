@@ -29,8 +29,9 @@ from tqdm import tqdm
 
 from alpamayo_r1 import helper
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
-from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1, ExpertLogitsProcessor
-from alpamayo_r1.models.token_utils import StopAfterEOS, extract_traj_tokens
+from alpamayo_r1.inference import generate_coc, prepare_vlm_inputs
+from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+from alpamayo_r1.models.token_utils import extract_traj_tokens
 from alpamayo_r1.training.advantage_conditioning import compute_advantage_token_ids
 
 # Pin to avoid breaking changes when the upstream HF dataset is updated.
@@ -199,21 +200,12 @@ def _evaluate_expert_with_adv_traj(
     Uses ``run_batched_expert_diffusion`` from sft_rollout for the shared
     TF forward + adv_traj injection + expert diffusion phases.
     """
-    from transformers import GenerationConfig, StoppingCriteriaList
-    from transformers.generation.logits_process import LogitsProcessorList
-
     from alpamayo_r1.training.sft_rollout import run_batched_expert_diffusion
 
     device = next(model.vlm.parameters()).device
 
     # 1. Fuse history trajectory tokens
-    tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
-    input_ids = tokenized.pop("input_ids")
-    traj_data = {
-        "ego_history_xyz": model_inputs["ego_history_xyz"],
-        "ego_history_rot": model_inputs["ego_history_rot"],
-    }
-    input_ids = model.fuse_traj_tokens(input_ids, traj_data)
+    input_ids, gen_kwargs = prepare_vlm_inputs(model, model_inputs)
     prompt_len = input_ids.shape[1]
 
     hist_xyz = model_inputs["ego_history_xyz"][:, -1]  # (1, T, 3)
@@ -223,30 +215,16 @@ def _evaluate_expert_with_adv_traj(
     traj_future_start_id = model.special_token_ids["traj_future_start"]
     pad_token_id = model.tokenizer.pad_token_id
 
-    gen_config = GenerationConfig(
-        do_sample=True,
+    vlm_output = generate_coc(
+        model,
+        input_ids,
+        gen_kwargs,
+        mode="expert",
         temperature=temperature,
         top_p=top_p,
-        num_return_sequences=num_traj_samples,
+        num_samples=num_traj_samples,
         max_new_tokens=256 + 10,
         pad_token_id=pad_token_id,
-    )
-    logits_processor = LogitsProcessorList(
-        [
-            ExpertLogitsProcessor(
-                traj_token_offset=model.config.traj_token_start_idx,
-                traj_vocab_size=model.config.traj_vocab_size,
-            )
-        ]
-    )
-    stopping = StoppingCriteriaList([StopAfterEOS(eos_token_id=traj_future_start_id)])
-
-    vlm_output = model.vlm.generate(
-        input_ids=input_ids,
-        generation_config=gen_config,
-        stopping_criteria=stopping,
-        logits_processor=logits_processor,
-        **tokenized,
     )
     generated_seqs = vlm_output[:, prompt_len:]
 
@@ -310,8 +288,8 @@ def _evaluate_expert_with_adv_traj(
         tf_attention_mask[i, :actual_len] = 1
 
     # Replicate pixel_values and image_grid_thw for each valid completion
-    pv = tokenized.get("pixel_values")
-    igt = tokenized.get("image_grid_thw")
+    pv = gen_kwargs.get("pixel_values")
+    igt = gen_kwargs.get("image_grid_thw")
     pv_tensor = pv.repeat(n_valid, *([1] * (pv.dim() - 1))) if pv is not None else None
     igt_tensor = igt.repeat(n_valid, 1) if igt is not None else None
 
@@ -361,16 +339,12 @@ def _evaluate_vlm_only_with_adv_traj(
     """
     from transformers import GenerationConfig, StoppingCriteriaList
 
+    from alpamayo_r1.models.token_utils import StopAfterEOS
+
     device = next(model.vlm.parameters()).device
 
     # 1. Fuse history trajectory tokens
-    tokenized = {k: v for k, v in model_inputs["tokenized_data"].items()}
-    input_ids = tokenized.pop("input_ids")
-    traj_data = {
-        "ego_history_xyz": model_inputs["ego_history_xyz"],
-        "ego_history_rot": model_inputs["ego_history_rot"],
-    }
-    input_ids = model.fuse_traj_tokens(input_ids, traj_data)
+    input_ids, gen_kwargs = prepare_vlm_inputs(model, model_inputs)
     prompt_len = input_ids.shape[1]
 
     hist_xyz = model_inputs["ego_history_xyz"][:, -1]  # (1, T, 3)
@@ -382,21 +356,16 @@ def _evaluate_vlm_only_with_adv_traj(
     tokens_per_future_traj = model.config.tokens_per_future_traj
     pad_token_id = model.tokenizer.pad_token_id
 
-    gen_config = GenerationConfig(
-        do_sample=True,
+    vlm_output = generate_coc(
+        model,
+        input_ids,
+        gen_kwargs,
+        mode="expert",
         temperature=temperature,
         top_p=top_p,
-        num_return_sequences=num_traj_samples,
+        num_samples=num_traj_samples,
         max_new_tokens=256 + 10,
         pad_token_id=pad_token_id,
-    )
-    stopping = StoppingCriteriaList([StopAfterEOS(eos_token_id=traj_future_start_id)])
-
-    vlm_output = model.vlm.generate(
-        input_ids=input_ids,
-        generation_config=gen_config,
-        stopping_criteria=stopping,
-        **tokenized,
     )
     generated_seqs = vlm_output[:, prompt_len:]
 
@@ -453,15 +422,15 @@ def _evaluate_vlm_only_with_adv_traj(
             full_ids = torch.cat([input_ids, prefix_tensor], dim=1)
 
             tf_kwargs = {}
-            if "attention_mask" in tokenized:
-                orig_mask = tokenized["attention_mask"]
+            if "attention_mask" in gen_kwargs:
+                orig_mask = gen_kwargs["attention_mask"]
                 prefix_mask = torch.ones(
                     1, len(completion_prefix_ids), device=device, dtype=orig_mask.dtype
                 )
                 tf_kwargs["attention_mask"] = torch.cat([orig_mask, prefix_mask], dim=1)
             for k in ("pixel_values", "image_grid_thw"):
-                if k in tokenized:
-                    tf_kwargs[k] = tokenized[k]
+                if k in gen_kwargs:
+                    tf_kwargs[k] = gen_kwargs[k]
 
             with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
                 tf_out = vlm(
