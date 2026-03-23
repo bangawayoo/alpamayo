@@ -13,7 +13,7 @@ import torch
 from transformers import GenerationConfig, LogitsProcessorList, StoppingCriteriaList
 
 from alpamayo_r1.models.alpamayo_r1 import ExpertLogitsProcessor
-from alpamayo_r1.models.token_utils import StopAfterEOS
+from alpamayo_r1.models.token_utils import StopAfterEOS, extract_traj_tokens
 
 
 def prepare_vlm_inputs(
@@ -146,3 +146,40 @@ def generate_coc(
         with torch.autocast(str(autocast_device), dtype=torch.bfloat16):
             return model.vlm.generate(**generate_kwargs)
     return model.vlm.generate(**generate_kwargs)
+
+
+def decode_vlm_trajectories(
+    model,
+    vlm_output: torch.Tensor,
+    hist_xyz: torch.Tensor,
+    hist_rot: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract discrete trajectory tokens and decode to continuous waypoints.
+
+    Consolidates the repeated pattern of ``extract_traj_tokens()`` followed
+    by ``traj_tokenizer.decode()``.
+
+    The trajectory tokenizer decode is pure math (dequantization + cumsum),
+    so no ``torch.no_grad()`` wrapper is needed.
+
+    Args:
+        model: AlpamayoR1 model (needs ``special_token_ids``,
+            ``future_token_start_idx``, ``config``, ``traj_tokenizer``).
+        vlm_output: Raw VLM output sequences of shape ``(B, seq_len)``.
+        hist_xyz: History positions, shape ``(B, T, 3)``.
+        hist_rot: History rotations, shape ``(B, T, 3, 3)``.
+
+    Returns:
+        pred_xyz: Predicted future waypoints, shape ``(B, T_future, 3)``.
+        pred_rot: Predicted future rotations, shape ``(B, T_future, 3, 3)``.
+    """
+    traj_tokens = extract_traj_tokens(
+        vlm_output,
+        model.special_token_ids,
+        model.config.tokens_per_future_traj,
+        model.future_token_start_idx,
+        model.config.traj_vocab_size,
+    )
+
+    pred_xyz, pred_rot, _ = model.traj_tokenizer.decode(hist_xyz, hist_rot, traj_tokens)
+    return pred_xyz, pred_rot
