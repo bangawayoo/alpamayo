@@ -662,9 +662,9 @@ class AdvCondDataset(Dataset):
     """Dataset wrapping rollout results with advantage conditioning labels.
 
     Each item returns a training example with conditioning tokens inserted
-    and labels masked appropriately for cross-entropy loss. Fetch vision data
-    (pixel_values, image_grid_thw) on-the-fly from the ClipDataCache to
-    minimize memory usage in the rollout results list.
+    and labels masked appropriately for cross-entropy loss. Vision data
+    (pixel_values, image_grid_thw) is pulled from the ClipDataCache's
+    already-processed model_inputs, avoiding redundant re-processing.
 
     Args:
         rollout_results: List of dicts per completion with at least:
@@ -676,7 +676,6 @@ class AdvCondDataset(Dataset):
         traj_future_start_id: Token ID of <|traj_future_start|> for finding
             CoC/trajectory boundary. If None, adv_traj is placed at end.
         data_cache: ClipDataCache for loading vision data.
-        processor: VLM processor for preparing vision inputs.
     """
 
     def __init__(
@@ -687,7 +686,6 @@ class AdvCondDataset(Dataset):
         p_drop: float = 0.3,
         traj_future_start_id: int | None = None,
         data_cache: Any | None = None,
-        processor: Any | None = None,
     ) -> None:
         if len(rollout_results) != len(adv_labels):
             raise ValueError(
@@ -699,7 +697,6 @@ class AdvCondDataset(Dataset):
         self._p_drop = p_drop
         self._traj_future_start_id = traj_future_start_id
         self._data_cache = data_cache
-        self._processor = processor
 
     def __len__(self) -> int:
         return len(self._rollouts)
@@ -726,39 +723,16 @@ class AdvCondDataset(Dataset):
         if "completion_prefix" in rollout:
             item["completion_prefix"] = rollout["completion_prefix"]
 
-        # Fetch vision data if cache/processor are available
-        if self._data_cache is not None and self._processor is not None and "clip_id" in rollout:
-            from alpamayo_r1.helper import create_message
-            import torchvision.transforms.functional as TF
-
-            try:
-                # Load clip data (cached)
-                clip_id = rollout["clip_id"]
-                t0_us = rollout.get("t0_us", 5_100_000)
-                pil_images = self._data_cache.get_pil_images(clip_id, t0_us)
-
-                # Convert list[PIL] -> Tensor (N, C, H, W)
-                frames = torch.stack([TF.to_tensor(img) for img in pil_images])
-
-                # Process vision data: apply chat template to get pixel_values/image_grid_thw
-                messages = create_message(frames)
-                inputs = self._processor.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    add_generation_prompt=False,
-                    continue_final_message=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                )
-
-                # Squeeze to remove batch dimension (Trainer collator will re-add it)
-                if "pixel_values" in inputs:
-                    item["pixel_values"] = inputs["pixel_values"].squeeze(0)
-                if "image_grid_thw" in inputs:
-                    item["image_grid_thw"] = inputs["image_grid_thw"].squeeze(0)
-
-            except Exception as e:
-                logger.warning("Failed to fetch vision data for training sample %d: %s", idx, e)
+        # Fetch vision data from cached model_inputs (already processor-encoded)
+        if self._data_cache is not None and "clip_id" in rollout:
+            clip_id = rollout["clip_id"]
+            t0_us = rollout.get("t0_us", 5_100_000)
+            model_inputs, _ = self._data_cache.get(clip_id, t0_us, device="cpu")
+            tokenized = model_inputs["tokenized_data"]
+            if "pixel_values" in tokenized:
+                item["pixel_values"] = tokenized["pixel_values"].squeeze(0)
+            if "image_grid_thw" in tokenized:
+                item["image_grid_thw"] = tokenized["image_grid_thw"].squeeze(0)
 
         return item
 
