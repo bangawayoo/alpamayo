@@ -39,6 +39,7 @@ from alpamayo_r1.training.advantage_conditioning import (
     compute_advantage_token_ids,
     compute_segment_advantages_from_rollouts,
     compute_value_targets,
+    precompute_conditioned_sequences,
     train_segment_value_head,
 )
 
@@ -1516,6 +1517,16 @@ class SelfPlayLoop:
         traj_future_start_id = None
         if hasattr(self.full_model, "special_token_ids"):
             traj_future_start_id = self.full_model.special_token_ids.get("traj_future_start")
+
+        # Pre-compute conditioned sequences to avoid per-sample boundary
+        # scanning and list concatenation in the DataLoader hot path.
+        precomputed = precompute_conditioned_sequences(
+            rollout_results=all_rollouts,
+            adv_labels=all_labels,
+            adv_token_ids=self.adv_token_ids,
+            traj_future_start_id=traj_future_start_id,
+        )
+
         return AdvCondDataset(
             rollout_results=all_rollouts,
             adv_labels=all_labels,
@@ -1523,6 +1534,7 @@ class SelfPlayLoop:
             p_drop=float(adv_cfg.get("p_drop", 0.3)),
             traj_future_start_id=traj_future_start_id,
             data_cache=self._get_data_cache(),
+            precomputed=precomputed,
         )
 
     def _get_data_cache(self):

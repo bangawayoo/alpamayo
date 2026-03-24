@@ -11,6 +11,7 @@ from alpamayo_r1.training.advantage_conditioning import (
     AdvCondDataset,
     build_conditioned_sequence,
     compute_value_targets,
+    precompute_conditioned_sequences,
     train_segment_value_head,
 )
 from alpamayo_r1.training.selfplay_loop import RolloutReplayBuffer, ScenePartitioner
@@ -262,6 +263,67 @@ class TestAdvCondDataset:
         assert "input_ids" in item0
         assert "labels" in item0
         assert "is_unconditional" in item0
+
+    def test_precomputed_matches_on_the_fly(self):
+        """Pre-computed path should produce identical results to on-the-fly path."""
+        rollouts = [
+            {"prompt_ids": [1, 2], "completion_ids": [10, FAKE_TRAJ_START_ID, 20]},
+            {"prompt_ids": [3, 4], "completion_ids": [12, FAKE_TRAJ_START_ID, 22]},
+        ]
+        labels = [
+            {"i_obs": True, "i_traj": True},
+            {"i_obs": False, "i_traj": False},
+        ]
+
+        # On-the-fly dataset (p_drop=0 so dropout never triggers)
+        ds_fly = AdvCondDataset(
+            rollouts, labels, FAKE_ADV_TOKEN_IDS,
+            p_drop=0.0, traj_future_start_id=FAKE_TRAJ_START_ID,
+        )
+
+        # Pre-computed dataset
+        precomputed = precompute_conditioned_sequences(
+            rollouts, labels, FAKE_ADV_TOKEN_IDS,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+        )
+        ds_pre = AdvCondDataset(
+            rollouts, labels, FAKE_ADV_TOKEN_IDS,
+            p_drop=0.0, traj_future_start_id=FAKE_TRAJ_START_ID,
+            precomputed=precomputed,
+        )
+
+        for i in range(len(rollouts)):
+            fly_item = ds_fly[i]
+            pre_item = ds_pre[i]
+            assert fly_item["input_ids"] == pre_item["input_ids"], f"input_ids mismatch at {i}"
+            assert fly_item["labels"] == pre_item["labels"], f"labels mismatch at {i}"
+            assert fly_item["attention_mask"] == pre_item["attention_mask"]
+            assert fly_item["is_unconditional"] == pre_item["is_unconditional"]
+            assert fly_item["completion_prefix"] == pre_item["completion_prefix"]
+
+    def test_precomputed_dropout(self):
+        """Pre-computed path should respect p_drop for all-positive samples."""
+        rollouts = [
+            {"prompt_ids": [1, 2], "completion_ids": [10, FAKE_TRAJ_START_ID, 20]},
+        ]
+        labels = [{"i_obs": True, "i_traj": True}]
+
+        precomputed = precompute_conditioned_sequences(
+            rollouts, labels, FAKE_ADV_TOKEN_IDS,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+        )
+        assert precomputed[0]["is_all_positive"] is True
+
+        # With p_drop=1.0, all-positive samples should always be unconditional
+        ds = AdvCondDataset(
+            rollouts, labels, FAKE_ADV_TOKEN_IDS,
+            p_drop=1.0, traj_future_start_id=FAKE_TRAJ_START_ID,
+            precomputed=precomputed,
+        )
+        item = ds[0]
+        assert item["is_unconditional"] is True
+        # Unconditional: no advantage tokens, so input_ids = prompt + completion
+        assert item["input_ids"] == [1, 2, 10, FAKE_TRAJ_START_ID, 20]
 
     def test_mismatched_lengths_raises(self):
         with pytest.raises(ValueError, match="Mismatched lengths"):
