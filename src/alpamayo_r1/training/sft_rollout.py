@@ -777,8 +777,8 @@ class RolloutEngine:
                         "completion_prefix": raw_completion[:prefix_end],
                         "hist_xyz": meta["hist_xyz"][0].cpu(),
                         "hist_rot": meta["hist_rot"][0].cpu(),
-                        "expert_fut_xyz": meta["expert_fut_xyz"],
-                        "expert_fut_rot": meta["expert_fut_rot"],
+                        "expert_fut_xyz": pred_xyz_tensor[flat_idx].cpu(),
+                        "expert_fut_rot": pred_rot_tensor[flat_idx].cpu(),
                     }
                 )
         timings["postprocess"] = time.time() - t_
@@ -1014,8 +1014,10 @@ class RolloutEngine:
                     "completion_prefix": item["coc_prefix"],
                     "hist_xyz": meta["hist_xyz"][0].cpu(),
                     "hist_rot": meta["hist_rot"][0].cpu(),
-                    "expert_fut_xyz": meta["expert_fut_xyz"],
-                    "expert_fut_rot": meta["expert_fut_rot"],
+                    # Use rolled-out trajectory as expert CFM target so the
+                    # expert trains on the same data the advantages were computed on.
+                    "expert_fut_xyz": pred_xyz[i].cpu(),
+                    "expert_fut_rot": pred_rot[i].cpu(),
                 }
             )
         timings["traj_encode"] = time.time() - t_
