@@ -79,9 +79,9 @@ value_head:
 # Uses deferred GPU scheduling: expert step runs after VLM SFT backward
 expert_finetune:
   enabled: true
-  lr: 1e-4
+  lr: 1e-3
   weight_decay: 0.01
-  num_noisy_samples: 1          # noise samples per GT action for CFM loss
+  num_noisy_samples: 2          # noise samples per GT action for CFM loss
   every_n_steps: 1              # run expert CFM step every N VLM SFT steps
   max_grad_norm: 1.0
   save_path: null               # where to save expert checkpoints
