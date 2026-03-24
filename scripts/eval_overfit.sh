@@ -1,8 +1,8 @@
 export CUDA_VISIBLE_DEVICES=1
 
 
-MODEL_DIR="sft-overfit/text-adv"
-OUTPUT_DIR="sft-overfit/text-adv"
+MODEL_DIR="sft-overfit/fix-kv-cache-longer"
+OUTPUT_DIR="sft-overfit/fix-kv-cache-longer"
 
 bash scripts/evaluate/evaluate_quick_test.sh \
     --output-dir eval_results/$OUTPUT_DIR \
