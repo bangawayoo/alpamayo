@@ -21,7 +21,6 @@ Usage:
 
 from __future__ import annotations
 
-import gc
 import logging
 from pathlib import Path
 from typing import Any
@@ -342,13 +341,6 @@ class AdvCondSFTTrainer(Trainer):
 
         # 2. Deferred expert CFM step
         if self._expert_enabled and self.state.global_step % self._expert_every_n_steps == 0:
-            # Free VLM batch tensors from GPU to make room for expert
-            for k, v in inputs.items():
-                if isinstance(v, torch.Tensor) and v.is_cuda:
-                    inputs[k] = v.cpu()
-            gc.collect()
-            torch.cuda.empty_cache()
-
             self._expert_cfm_step(inputs)
 
         return loss
@@ -409,9 +401,7 @@ class AdvCondSFTTrainer(Trainer):
                     fut_xyz = expert_fut_xyz_list[i].unsqueeze(0).to(device)  # (1, T_fut, 3)
                     fut_rot = expert_fut_rot_list[i].unsqueeze(0).to(device)  # (1, T_fut, 3, 3)
                 else:
-                    ego_future_rot = self._data_cache.get_ego_future_rot(
-                        clip_id, t0_us
-                    ).to(device)
+                    ego_future_rot = self._data_cache.get_ego_future_rot(clip_id, t0_us).to(device)
                     hist_xyz = model_inputs["ego_history_xyz"][:, -1].to(device)
                     hist_rot = model_inputs["ego_history_rot"][:, -1].to(device)
                     fut_xyz = ego_future_xyz.to(device)[:, -1]
@@ -433,16 +423,13 @@ class AdvCondSFTTrainer(Trainer):
         if not cached_samples:
             return
 
-        # ---- Offload VLM to CPU, free GPU for expert ----
-        # self.full_model.vlm.cpu()
-        # gc.collect()
-        # torch.cuda.empty_cache()
-
-        # ---- Phase B: Expert CFM (expert on GPU, VLM offloaded) ----
-        self.full_model.expert.to(device)
-        self.full_model.action_in_proj.to(device)
-        self.full_model.action_out_proj.to(device)
-        self.full_model.action_space.to(device)
+        # ---- Phase B: Expert CFM step ----
+        expert_device = next(self.full_model.expert.parameters()).device
+        if expert_device != device:
+            self.full_model.expert.to(device)
+            self.full_model.action_in_proj.to(device)
+            self.full_model.action_out_proj.to(device)
+            self.full_model.action_space.to(device)
 
         total_loss = 0.0
         n_valid = 0
@@ -507,16 +494,9 @@ class AdvCondSFTTrainer(Trainer):
 
             # Log to TensorBoard
             if self.state is not None:
-                self.log({"expert_cfm/loss": total_loss, "expert_cfm/valid_samples": float(n_valid)})
-
-        # Move expert back to CPU, restore VLM to GPU for next training step
-        # self.full_model.expert.cpu()
-        # self.full_model.action_in_proj.cpu()
-        # self.full_model.action_out_proj.cpu()
-        # self.full_model.action_space.cpu()
-        # gc.collect()
-        # torch.cuda.empty_cache()
-        # self.full_model.vlm.to(device)
+                self.log(
+                    {"expert_cfm/loss": total_loss, "expert_cfm/valid_samples": float(n_valid)}
+                )
 
     def _get_vlm_kv_cache_teacher_forced(
         self,
