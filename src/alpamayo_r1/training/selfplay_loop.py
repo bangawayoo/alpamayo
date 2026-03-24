@@ -703,6 +703,12 @@ class SelfPlayLoop:
                 chunk_start + len(chunk_scenes) - 1,
             )
 
+            # Prefetch next iteration's scenes so data loads overlap with GPU work
+            next_start = chunk_end
+            next_end = next_start + pretrain_batch_scenes
+            for cid in pretrain_scenes[next_start:next_end]:
+                data_cache.prefetch(cid, t0_us)
+
             # 1. Generate rollouts
             rollout_results = engine.generate_completions(chunk_scenes, t0_us, G)
             if not rollout_results:
