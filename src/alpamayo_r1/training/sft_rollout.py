@@ -163,7 +163,7 @@ def run_batched_expert_diffusion(
         if diffusion_steps is not None and diffusion_steps != 10:
             diff_kwargs["num_steps"] = diffusion_steps
 
-        with torch.autocast(str(device), dtype=torch.bfloat16):
+        with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
             sampled_action = model.diffusion.sample(
                 batch_size=n_valid,
                 step_fn=step_fn,

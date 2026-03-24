@@ -622,7 +622,7 @@ def evaluate_batch(
                 )
 
             # Run inference with the selected trajectory generation mode
-            with torch.autocast(device, dtype=torch.bfloat16):
+            with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
                 if adv_traj_token_id is not None:
                     # Per-sample teacher-forced generation with adv_traj injection
                     if traj_mode == "vlm":

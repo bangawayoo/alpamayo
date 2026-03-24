@@ -167,7 +167,7 @@ def get_vlm_kv_cache(
     gen_config.output_logits = True
     gen_config.return_dict_in_generate = True
 
-    with torch.autocast(str(device), dtype=torch.bfloat16):
+    with torch.no_grad(), torch.autocast(str(device), dtype=torch.bfloat16):
         vlm_outputs = model.vlm.generate(
             input_ids=input_ids,
             generation_config=gen_config,

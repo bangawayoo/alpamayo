@@ -52,7 +52,7 @@ model_inputs = {
 model_inputs = helper.to_device(model_inputs, "cuda")
 
 torch.cuda.manual_seed_all(42)
-with torch.autocast("cuda", dtype=torch.bfloat16):
+with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
     pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
         data=model_inputs,
         top_p=0.98,
