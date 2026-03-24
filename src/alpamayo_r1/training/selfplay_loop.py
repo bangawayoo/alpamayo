@@ -1529,12 +1529,9 @@ class SelfPlayLoop:
 
         return AdvCondDataset(
             rollout_results=all_rollouts,
-            adv_labels=all_labels,
-            adv_token_ids=self.adv_token_ids,
-            p_drop=float(adv_cfg.get("p_drop", 0.3)),
-            traj_future_start_id=traj_future_start_id,
-            data_cache=self._get_data_cache(),
             precomputed=precomputed,
+            p_drop=float(adv_cfg.get("p_drop", 0.3)),
+            data_cache=self._get_data_cache(),
         )
 
     def _get_data_cache(self):
