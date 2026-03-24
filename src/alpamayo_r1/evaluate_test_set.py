@@ -875,13 +875,6 @@ def main():
         "hooks, 'text' uses plain-text tokens the VLM already understands.",
     )
     parser.add_argument(
-        "--adv-mode",
-        type=str,
-        default="embedding",
-        choices=["embedding", "text"],
-        help="Advantage conditioning mode: 'embedding' (learned hooks) or 'text' (plain text).",
-    )
-    parser.add_argument(
         "--visualize",
         action="store_true",
         help="Save BEV trajectory plots (predicted vs. ground truth) to output_dir/plots/",
