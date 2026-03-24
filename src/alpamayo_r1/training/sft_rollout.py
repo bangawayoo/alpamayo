@@ -304,6 +304,8 @@ class RolloutEngine:
             return results
 
         # Dispatch generation method based on mode
+        from tqdm import tqdm
+
         use_expert = self.mode == "expert"
         batch_fn = self._generate_batch_expert if use_expert else self._generate_batch_vlm_only
         S = self.scene_batch_size
@@ -323,6 +325,12 @@ class RolloutEngine:
             self.data_cache.prefetch(cid, t0_us)
 
         rollout_start = time.time()
+        pbar = tqdm(
+            total=n_local,
+            desc=f"Rollout (rank {rank})",
+            unit="scene",
+            disable=rank != 0,
+        )
         with torch.no_grad():
             for chunk_start in range(0, n_local, S):
                 chunk_ids = local_clip_ids[chunk_start : chunk_start + S]
@@ -332,33 +340,7 @@ class RolloutEngine:
                 for cid in local_clip_ids[chunk_end : chunk_end + S]:
                     self.data_cache.prefetch(cid, t0_us)
 
-                # Progress logging at chunk boundaries
-                if chunk_start % max(1, (n_local // 10) * S) == 0 or chunk_end >= n_local:
-                    elapsed = time.time() - rollout_start
-                    mem_alloc = (
-                        torch.cuda.memory_allocated(device) / 1e9 if device.type == "cuda" else 0
-                    )
-                    mem_reserved = (
-                        torch.cuda.memory_reserved(device) / 1e9 if device.type == "cuda" else 0
-                    )
-                    scenes_per_sec = chunk_end / max(elapsed, 0.001)
-                    eta = (n_local - chunk_end) / max(scenes_per_sec, 0.001)
-                    logger.info(
-                        "[Rank %d] Rollout progress: %d/%d scenes (%d completions, %d failed) "
-                        "| %.1fs elapsed, ETA %.0fs | GPU mem: %.1f/%.1f GB",
-                        rank,
-                        chunk_end,
-                        n_local,
-                        len(results),
-                        n_failed,
-                        elapsed,
-                        eta,
-                        mem_alloc,
-                        mem_reserved,
-                    )
-
                 try:
-                    chunk_start_time = time.time()
                     chunk_results = batch_fn(
                         chunk_ids,
                         t0_us,
@@ -368,22 +350,12 @@ class RolloutEngine:
                         traj_future_start_id,
                     )
                     results.extend(chunk_results)
-                    logger.debug(
-                        "Chunk %s: %d completions in %.2fs",
-                        chunk_ids,
-                        len(chunk_results),
-                        time.time() - chunk_start_time,
-                    )
                 except Exception as e:
                     logger.warning(
                         "Batch generation failed for %d scenes, falling back to per-scene: %s",
                         len(chunk_ids),
                         e,
                     )
-                    # The failed batch leaves partially-allocated tensors in
-                    # PyTorch's caching allocator.  Without releasing them the
-                    # cache grows (e.g. 22 GB → 41 GB reserved) and later
-                    # per-scene attempts OOM on fragmented memory.
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                     for clip_id in chunk_ids:
@@ -402,6 +374,11 @@ class RolloutEngine:
                             logger.warning("Generation failed for %s: %s", clip_id, e2)
                             if device.type == "cuda":
                                 torch.cuda.empty_cache()
+
+                pbar.update(len(chunk_ids))
+                pbar.set_postfix(completions=len(results), failed=n_failed)
+
+        pbar.close()
 
         if use_expert:
             self._move_expert_to_cpu()
@@ -783,7 +760,7 @@ class RolloutEngine:
                 )
         timings["postprocess"] = time.time() - t_
 
-        logger.info(
+        logger.debug(
             "[vlm_only_batch] S=%d, G=%d (%d results) timings: %s | total=%.2fs",
             S,
             G,
@@ -1022,7 +999,7 @@ class RolloutEngine:
             )
         timings["traj_encode"] = time.time() - t_
 
-        logger.info(
+        logger.debug(
             "[expert_batch] S=%d, G=%d (%d valid, %d results) timings: %s | total=%.2fs",
             S,
             G,
@@ -1101,7 +1078,7 @@ class RolloutEngine:
                     segment_hidden_stash.append(seg_hidden)
                     completion_segment_map.append(seg_map)
 
-        logger.info("Extracted segment hidden states for %d completions", len(segment_hidden_stash))
+        logger.debug("Extracted segment hidden states for %d completions", len(segment_hidden_stash))
         return segment_hidden_stash, completion_segment_map
 
     def compute_rewards(self, rollout_results: list[dict]) -> list[dict]:

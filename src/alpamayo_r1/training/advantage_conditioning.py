@@ -494,9 +494,13 @@ def train_segment_value_head(
     h_obs_all = torch.cat([segment_hidden_stash[i]["h_obs"] for i in range(B)], dim=0)
     g_obs_all = torch.tensor(g_obs_list, dtype=torch.float32)
 
+    from tqdm import tqdm
+
     metrics = {"loss": 0.0, "loss_obs": 0.0, "loss_traj": 0.0,
                "pred_obs_mean": 0.0, "target_obs_mean": 0.0}
     global_step = 0
+    total_batches = num_epochs * math.ceil(math.ceil(B / world_size) / batch_size)
+    pbar = tqdm(total=total_batches, desc="VH train", unit="step", disable=rank != 0)
 
     for epoch in range(num_epochs):
         # Fixed seed so all ranks get the same permutation
@@ -576,7 +580,7 @@ def train_segment_value_head(
             at_epoch_start = (batch_start == 0)
             at_log_interval = (global_step + 1) % max(1, log_interval) == 0
             if global_step == 0 or at_log_interval or at_epoch_start:
-                logger.info(
+                logger.debug(
                     "  Value head step %d (epoch %d/%d): "
                     "loss=%.4f (obs=%.4f traj=%.4f)",
                     global_step + 1,
@@ -588,14 +592,17 @@ def train_segment_value_head(
                 )
 
             global_step += 1
+            pbar.update(1)
+            pbar.set_postfix(loss=f"{metrics['loss']:.4f}")
 
+    pbar.close()
     total_steps = global_step
     metrics["total_steps"] = total_steps
 
     if tb_writer is not None:
         tb_writer.flush()
 
-    logger.info(
+    logger.debug(
         "Value head training: %d epochs, %d steps, %d samples (batch_size=%d) | "
         "loss=%.4f (obs=%.4f, traj=%.4f) | "
         "pred_obs=%.3f target_obs=%.3f",

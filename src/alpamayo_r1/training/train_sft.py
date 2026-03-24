@@ -46,36 +46,51 @@ def main(cfg: DictConfig) -> None:
         cfg: Hydra config with model, training, data, advantage_conditioning,
              expert_finetune, and reward settings.
     """
-    # Hydra's job_logging: none disables all handlers — restore a stream handler
-    # so that logger.info() calls from all modules are visible on stdout.
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
-
-    logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
-
-    # Initialize distributed process group early (before rollout/evaluate phases)
-    # so that all_gather is available. accelerate sets RANK/WORLD_SIZE env vars
-    # but only Trainer calls dist.init_process_group — we need it sooner.
     import os
 
     import torch.distributed as dist
 
+    # Initialize distributed process group early (before rollout/evaluate phases)
+    # so that all_gather is available. accelerate sets RANK/WORLD_SIZE env vars
+    # but only Trainer calls dist.init_process_group — we need it sooner.
     if not dist.is_initialized() and "RANK" in os.environ:
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-        logger.info(
-            "Initialized distributed: rank %d/%d",
-            dist.get_rank(),
-            dist.get_world_size(),
-        )
 
-    # Save resolved Hydra config
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    # Logging: file gets all INFO+, console gets WARNING+ only (tqdm for progress)
     output_dir = Path(cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    log_fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    log_datefmt = "%Y-%m-%d %H:%M:%S"
+
+    # Remove any existing handlers (Hydra may have added some)
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.DEBUG)
+
+    # File handler: all INFO+ logs (one per rank to avoid interleaving)
+    log_file = output_dir / f"train_rank{rank}.log"
+    fh = logging.FileHandler(log_file, mode="a")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter(log_fmt, datefmt=log_datefmt))
+    root.addHandler(fh)
+
+    # Console handler: WARNING+ only (phase banners, errors)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.WARNING)
+    ch.setFormatter(logging.Formatter(log_fmt, datefmt=log_datefmt))
+    root.addHandler(ch)
+
+    logger.warning("Logging to %s (console=WARNING+, file=INFO+)", log_file)
+    logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
+
+    if dist.is_initialized():
+        logger.warning("Initialized distributed: rank %d/%d", rank, dist.get_world_size())
+
+    # Save resolved Hydra config
     config_save_path = output_dir / "resolved_config.yaml"
     config_save_path.write_text(OmegaConf.to_yaml(cfg, resolve=True))
     logger.info("Saved resolved config to %s", config_save_path)

@@ -330,7 +330,7 @@ class AdvCondSFTTrainer(Trainer):
         self._sft_step_count += 1
         if self._sft_step_count % max(1, self.args.logging_steps) == 0:
             uncond_frac = self._uncond_count / max(self._uncond_total, 1)
-            logger.info(
+            logger.debug(
                 "SFT step %d: loss=%.4f lr=%.2e uncond_frac=%.3f (%d/%d)",
                 self._sft_step_count,
                 loss.item() if hasattr(loss, "item") else loss,
@@ -497,7 +497,7 @@ class AdvCondSFTTrainer(Trainer):
 
             self._expert_metrics["expert_cfm/loss"].append(total_loss)
             self._expert_metrics["expert_cfm/valid_samples"].append(float(n_valid))
-            logger.info(
+            logger.debug(
                 "expert CFM step %d | loss=%.6f valid=%d/%d",
                 self._sft_step_count,
                 total_loss,
@@ -507,7 +507,6 @@ class AdvCondSFTTrainer(Trainer):
 
             # Log to TensorBoard
             if self.state is not None:
-                step = self.state.global_step
                 self.log({"expert_cfm/loss": total_loss, "expert_cfm/valid_samples": float(n_valid)})
 
         # Move expert back to CPU, restore VLM to GPU for next training step

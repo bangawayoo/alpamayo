@@ -598,9 +598,9 @@ class SelfPlayLoop:
             self.pretrain_value_head(num_scenes=pretrain_scenes)
 
         for i in range(self.num_iterations):
-            logger.info("=" * 60)
-            logger.info("SELF-PLAY ITERATION %d / %d", i + 1, self.num_iterations)
-            logger.info("=" * 60)
+            logger.warning("=" * 60)
+            logger.warning("SELF-PLAY ITERATION %d / %d", i + 1, self.num_iterations)
+            logger.warning("=" * 60)
             self.run_iteration(i)
 
         if self._tb_writer is not None:
@@ -630,9 +630,9 @@ class SelfPlayLoop:
         """
         from alpamayo_r1.training.sft_rollout import RolloutEngine
 
-        logger.info("=" * 60)
-        logger.info("STAGE 0: VALUE HEAD PRE-TRAINING (%d scenes)", num_scenes)
-        logger.info("=" * 60)
+        logger.warning("=" * 60)
+        logger.warning("STAGE 0: VALUE HEAD PRE-TRAINING (%d scenes)", num_scenes)
+        logger.warning("=" * 60)
 
         vh_cfg = self.cfg.get("value_head", {})
         if num_epochs is None:
@@ -686,7 +686,13 @@ class SelfPlayLoop:
             G,
         )
 
+        from tqdm import tqdm
+
+        pretrain_rank = dist.get_rank() if dist.is_initialized() else 0
         last_loss = float("nan")
+        pbar = tqdm(
+            total=num_iters, desc="VH pretrain", unit="iter", disable=pretrain_rank != 0
+        )
         for i in range(num_iters):
             chunk_start = i * pretrain_batch_scenes
             chunk_end = chunk_start + pretrain_batch_scenes
@@ -694,7 +700,7 @@ class SelfPlayLoop:
             if not chunk_scenes:
                 break
 
-            logger.info(
+            logger.debug(
                 "Pretrain iter %d/%d: %d scenes (clips %d–%d)",
                 i + 1,
                 num_iters,
@@ -746,7 +752,7 @@ class SelfPlayLoop:
             self._vh_global_step += metrics.get("total_steps", 0)
             last_loss = metrics.get("loss", float("nan"))
 
-            logger.info(
+            logger.debug(
                 "Pretrain iter %d/%d done: loss=%.4f, completions=%d, vh_steps=%d",
                 i + 1,
                 num_iters,
@@ -754,10 +760,14 @@ class SelfPlayLoop:
                 len(rollout_results),
                 metrics.get("total_steps", 0),
             )
+            pbar.update(1)
+            pbar.set_postfix(loss=f"{last_loss:.4f}")
 
             # Free intermediate data to reduce memory pressure
             del rollout_results, reward_stash, segment_hidden_stash
             del completion_segment_map, g_obs, g_traj
+
+        pbar.close()
 
         # Save value head and pretrain clip IDs (rank 0 only to avoid race)
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -809,12 +819,10 @@ class SelfPlayLoop:
         iter_start = time.time()
 
         # ----- Phase 1: ROLLOUT -----
-        logger.info("Phase 1: ROLLOUT — generating completions from current policy")
+        logger.warning("Phase 1: ROLLOUT — generating completions")
         t0 = time.time()
         rollout_results = self._rollout_phase(fresh_scenes, iteration)
-        logger.info(
-            "Phase 1 complete: %d completions in %.1fs", len(rollout_results), time.time() - t0
-        )
+        logger.warning("Phase 1 complete: %d completions in %.1fs", len(rollout_results), time.time() - t0)
 
         # Save rollout clip IDs for debugging
         train_cfg = self.cfg.get("training", {})
@@ -823,13 +831,13 @@ class SelfPlayLoop:
         rollout_clip_ids = [r["clip_id"] for r in rollout_results]
         with open(iter_dir / "rollout_clip_ids.json", "w") as f:
             json.dump(rollout_clip_ids, f, indent=2)
-        logger.info("Saved %d rollout clip IDs to %s", len(rollout_clip_ids), iter_dir)
+        logger.debug("Saved %d rollout clip IDs to %s", len(rollout_clip_ids), iter_dir)
 
         # ----- Phase 2: EVALUATE -----
-        logger.info("Phase 2: EVALUATE — scoring and binarizing advantages")
+        logger.warning("Phase 2: EVALUATE — scoring and binarizing advantages")
         t0 = time.time()
         adv_labels = self._evaluate_phase(rollout_results)
-        logger.info("Phase 2 complete in %.1fs", time.time() - t0)
+        logger.warning("Phase 2 complete in %.1fs", time.time() - t0)
 
         # ----- Phase 2.5: GT AUGMENTATION (optional) -----
         adv_cfg = self.cfg.get("advantage_conditioning", {})
@@ -842,10 +850,10 @@ class SelfPlayLoop:
             logger.info("Phase 2.5 complete in %.1fs", time.time() - t0)
 
         # ----- Phase 3: TRAIN -----
-        logger.info("Phase 3: TRAIN — advantage-conditioned SFT + expert CFM")
+        logger.warning("Phase 3: TRAIN — advantage-conditioned SFT + expert CFM")
         t0 = time.time()
         self._train_phase(rollout_results, adv_labels, iteration)
-        logger.info("Phase 3 complete in %.1fs", time.time() - t0)
+        logger.warning("Phase 3 complete in %.1fs", time.time() - t0)
 
         # ----- Phase 4: BOOKKEEPING -----
         logger.info("Phase 4: BOOKKEEPING — updating replay buffer and checkpoints")
