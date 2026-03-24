@@ -759,6 +759,14 @@ class AdvCondDataset(Dataset):
             item["t0_us"] = rollout["t0_us"]
         if "completion_prefix" in rollout:
             item["completion_prefix"] = rollout["completion_prefix"]
+        if "expert_fut_xyz" in rollout:
+            item["expert_fut_xyz"] = rollout["expert_fut_xyz"]
+        if "expert_fut_rot" in rollout:
+            item["expert_fut_rot"] = rollout["expert_fut_rot"]
+        if "hist_xyz" in rollout:
+            item["hist_xyz"] = rollout["hist_xyz"]
+        if "hist_rot" in rollout:
+            item["hist_rot"] = rollout["hist_rot"]
 
         # Fetch vision data from cached model_inputs (already processor-encoded)
         if self._data_cache is not None and "clip_id" in rollout:

@@ -59,6 +59,10 @@ def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
     clip_ids = []
     t0_us_list = []
     completion_prefixes = []
+    expert_fut_xyz_list = []
+    expert_fut_rot_list = []
+    hist_xyz_list = []
+    hist_rot_list = []
 
     for f in features:
         seq_len = len(f["input_ids"])
@@ -79,6 +83,14 @@ def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
             t0_us_list.append(f["t0_us"])
         if "completion_prefix" in f:
             completion_prefixes.append(f["completion_prefix"])
+        if "expert_fut_xyz" in f:
+            expert_fut_xyz_list.append(f["expert_fut_xyz"])
+        if "expert_fut_rot" in f:
+            expert_fut_rot_list.append(f["expert_fut_rot"])
+        if "hist_xyz" in f:
+            hist_xyz_list.append(f["hist_xyz"])
+        if "hist_rot" in f:
+            hist_rot_list.append(f["hist_rot"])
 
     batch["input_ids"] = torch.tensor(batch["input_ids"], dtype=torch.long)
     batch["labels"] = torch.tensor(batch["labels"], dtype=torch.long)
@@ -94,6 +106,11 @@ def adv_cond_collator(features: list[dict], pad_token_id: int = 0) -> dict:
         batch["clip_ids"] = clip_ids
         batch["t0_us_list"] = t0_us_list
         batch["completion_prefixes"] = completion_prefixes
+    if expert_fut_xyz_list:
+        batch["expert_fut_xyz_list"] = expert_fut_xyz_list
+        batch["expert_fut_rot_list"] = expert_fut_rot_list
+        batch["hist_xyz_list"] = hist_xyz_list
+        batch["hist_rot_list"] = hist_rot_list
 
     return batch
 
@@ -359,6 +376,11 @@ class AdvCondSFTTrainer(Trainer):
         clip_ids = inputs.get("clip_ids", [])
         t0_us_list = inputs.get("t0_us_list", [])
         completion_prefixes = inputs.get("completion_prefixes", [])
+        # Expert GT trajectories from rollout (artificial or real)
+        expert_fut_xyz_list = inputs.get("expert_fut_xyz_list", [])
+        expert_fut_rot_list = inputs.get("expert_fut_rot_list", [])
+        hist_xyz_list = inputs.get("hist_xyz_list", [])
+        hist_rot_list = inputs.get("hist_rot_list", [])
 
         if not clip_ids:
             return
@@ -371,20 +393,29 @@ class AdvCondSFTTrainer(Trainer):
                 t0_us = t0_us_list[i]
                 completion_prefix = completion_prefixes[i]
 
-                # Load scene data
+                # Load scene data (needed for VLM KV cache extraction)
                 model_inputs, ego_future_xyz = self._data_cache.get(clip_id, t0_us, device)
-                ego_future_rot = self._data_cache.get_ego_future_rot(clip_id, t0_us).to(device)
 
                 # Teacher-forced VLM forward → KV cache
                 kv_result = self._get_vlm_kv_cache_teacher_forced(
                     model_inputs, completion_prefix, device
                 )
 
-                # Prepare GT trajectory data
-                hist_xyz = model_inputs["ego_history_xyz"][:, -1].to(device)
-                hist_rot = model_inputs["ego_history_rot"][:, -1].to(device)
-                fut_xyz = ego_future_xyz.to(device)[:, -1]
-                fut_rot = ego_future_rot[:, -1]
+                # Use expert GT from rollout if available (handles artificial data correctly),
+                # otherwise fall back to dataset GT.
+                if expert_fut_xyz_list and i < len(expert_fut_xyz_list):
+                    hist_xyz = hist_xyz_list[i].unsqueeze(0).to(device)  # (1, T, 3)
+                    hist_rot = hist_rot_list[i].unsqueeze(0).to(device)  # (1, T, 3, 3)
+                    fut_xyz = expert_fut_xyz_list[i].unsqueeze(0).to(device)  # (1, T_fut, 3)
+                    fut_rot = expert_fut_rot_list[i].unsqueeze(0).to(device)  # (1, T_fut, 3, 3)
+                else:
+                    ego_future_rot = self._data_cache.get_ego_future_rot(
+                        clip_id, t0_us
+                    ).to(device)
+                    hist_xyz = model_inputs["ego_history_xyz"][:, -1].to(device)
+                    hist_rot = model_inputs["ego_history_rot"][:, -1].to(device)
+                    fut_xyz = ego_future_xyz.to(device)[:, -1]
+                    fut_rot = ego_future_rot[:, -1]
 
                 cached_samples.append(
                     {

@@ -429,39 +429,29 @@ class RolloutEngine:
     ) -> list[dict]:
         """Generate artificial rollout results for overfit sanity checking.
 
-        Produces a fixed CoC text and a distinctive sinusoidal S-curve
-        trajectory so we can clearly tell if the model is overfitting to
-        the artificial data (a straight line could be confused with
-        reasonable driving behavior).
+        Produces a fixed artificial CoC text but uses the REAL trajectory from
+        the dataset. This lets us verify:
+        - VLM overfits to the artificial CoC text
+        - Expert overfits to the real trajectory (which round-trips correctly
+          through the unicycle action space, unlike synthetic sinusoids)
         """
-        import numpy as np
 
         # Fixed CoC text → token IDs (include <cot_end> to match real VLM output format)
         # Add leading space to match standard VLM generation which typically starts with a space
         # after the <|cot_start|> trigger token.
-        artificial_coc = " Swerving in a sinusoidal S-curve pattern. This is artificial data."
+        artificial_coc = " This is artificial CoC text for overfit testing."
         coc_token_ids = self.tokenizer.encode(artificial_coc, add_special_tokens=False)
         cot_end_id = self.special_token_ids["cot_end"]
 
-        # Distinctive S-curve trajectory: forward motion + lateral sine wave
-        # This is clearly non-natural driving, making overfitting easy to spot
-        n_points = 64
-        dt = 4.0 / n_points
-        t = np.arange(1, n_points + 1) * dt  # time from 0.0625s to 4.0s
-        speed = 5.0
-        pred_xyz_np = np.zeros((1, n_points, 3), dtype=np.float32)
-        pred_xyz_np[0, :, 0] = t * speed  # x = forward at 5 m/s
-        pred_xyz_np[0, :, 1] = 3.0 * np.sin(2 * np.pi * t / 4.0)  # y = 3m amplitude sine wave
-
-        # Load real history for encoding context
+        # Load real scene data — use real trajectory as the expert target
         model_inputs, ego_future_xyz = self.data_cache.get(clip_id, t0_us, device)
+        ego_future_rot = self.data_cache.get_ego_future_rot(clip_id, t0_us)
         hist_xyz = model_inputs["ego_history_xyz"][:, -1].cpu()  # (1, T, 3)
         hist_rot = model_inputs["ego_history_rot"][:, -1].cpu()  # (1, T, 3, 3)
 
-        # Encode artificial trajectory into discrete tokens
-        pred_xyz_t = torch.tensor(pred_xyz_np)
-        # Use identity rotation (contiguous for action_space internals)
-        pred_rot_t = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, n_points, 3, 3).contiguous()
+        # Use real GT trajectory for discrete token encoding
+        pred_xyz_t = ego_future_xyz[:, 0].cpu()  # (1, T_fut, 3)
+        pred_rot_t = ego_future_rot[:, 0].cpu()  # (1, T_fut, 3, 3)
         discrete_tokens = self.traj_tokenizer.encode(hist_xyz, hist_rot, pred_xyz_t, pred_rot_t)
         discrete_tokens = discrete_tokens.clamp(0, self.traj_vocab_size - 1)
         traj_token_ids = (discrete_tokens + self.traj_token_start_idx).squeeze(0).tolist()
@@ -480,6 +470,13 @@ class RolloutEngine:
         )
         completion_prefix_ids = coc_token_ids + [cot_end_id, traj_future_start_id]
 
+        # Expert CFM GT: real trajectory from dataset
+        expert_fut_xyz = pred_xyz_t[0].cpu()  # (T_fut, 3)
+        expert_fut_rot = pred_rot_t[0].cpu()  # (T_fut, 3, 3)
+
+        import numpy as np
+
+        pred_xyz_np = pred_xyz_t.numpy()  # (1, T_fut, 3)
         results = []
         for g in range(G):
             # Add small noise to pred_xyz so rewards vary across completions,
@@ -498,6 +495,8 @@ class RolloutEngine:
                     "completion_prefix": completion_prefix_ids,
                     "hist_xyz": hist_xyz[0].cpu(),
                     "hist_rot": hist_rot[0].cpu(),
+                    "expert_fut_xyz": expert_fut_xyz,
+                    "expert_fut_rot": expert_fut_rot,
                 }
             )
 
@@ -543,12 +542,14 @@ class RolloutEngine:
         scenes = []
         for clip_id in clip_ids:
             model_inputs, ego_future_xyz = self.data_cache.get(clip_id, t0_us, device)
+            ego_future_rot = self.data_cache.get_ego_future_rot(clip_id, t0_us)
             input_ids, gen_kwargs = prepare_vlm_inputs(self.full_model, model_inputs)
             scenes.append(
                 {
                     "input_ids": input_ids,
                     "tokenized": gen_kwargs,
                     "ego_future_xyz": ego_future_xyz,
+                    "ego_future_rot": ego_future_rot,
                     "hist_xyz": model_inputs["ego_history_xyz"][:, -1],  # (1, T, 3)
                     "hist_rot": model_inputs["ego_history_rot"][:, -1],  # (1, T, 3, 3)
                     "clip_id": clip_id,
@@ -598,6 +599,9 @@ class RolloutEngine:
         per_scene_meta = []
         for i, scene in enumerate(scenes):
             gt_traj = scene["ego_future_xyz"][0, 0].numpy().flatten().tolist()
+            # Expert CFM GT: real dataset trajectory (fut_xyz shape: (T, 3), fut_rot: (T, 3, 3))
+            expert_fut_xyz = scene["ego_future_xyz"][0, 0].cpu()  # (T_fut, 3)
+            expert_fut_rot = scene["ego_future_rot"][0, 0].cpu()  # (T_fut, 3, 3)
             per_scene_meta.append(
                 {
                     "prompt_len": prompt_lens[i],
@@ -608,6 +612,8 @@ class RolloutEngine:
                     "hist_rot": scene["hist_rot"],  # (1, T, 3, 3) on device
                     "pixel_values": pv_list[i],
                     "image_grid_thw": igt_list[i],
+                    "expert_fut_xyz": expert_fut_xyz,
+                    "expert_fut_rot": expert_fut_rot,
                 }
             )
 
@@ -771,6 +777,8 @@ class RolloutEngine:
                         "completion_prefix": raw_completion[:prefix_end],
                         "hist_xyz": meta["hist_xyz"][0].cpu(),
                         "hist_rot": meta["hist_rot"][0].cpu(),
+                        "expert_fut_xyz": meta["expert_fut_xyz"],
+                        "expert_fut_rot": meta["expert_fut_rot"],
                     }
                 )
         timings["postprocess"] = time.time() - t_
@@ -1006,6 +1014,8 @@ class RolloutEngine:
                     "completion_prefix": item["coc_prefix"],
                     "hist_xyz": meta["hist_xyz"][0].cpu(),
                     "hist_rot": meta["hist_rot"][0].cpu(),
+                    "expert_fut_xyz": meta["expert_fut_xyz"],
+                    "expert_fut_rot": meta["expert_fut_rot"],
                 }
             )
         timings["traj_encode"] = time.time() - t_
