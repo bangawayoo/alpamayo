@@ -667,6 +667,15 @@ class SelfPlayLoop:
         value_head = self._get_or_create_value_head()
         reward_weights = self._get_reward_weights()
 
+        # Wrap value head in DDP for synchronized multi-GPU training
+        vh_for_training = value_head
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            vh_device = torch.device("cuda", dist.get_rank())
+            value_head.to(vh_device)
+            vh_for_training = torch.nn.parallel.DistributedDataParallel(
+                value_head, device_ids=[vh_device]
+            )
+
         num_iters = math.ceil(len(pretrain_scenes) / pretrain_batch_scenes)
         logger.info(
             "Iterative pre-training: %d scenes, batch=%d, %d iterations, %d epochs/batch, G=%d",
@@ -715,9 +724,9 @@ class SelfPlayLoop:
                 reward_weights=reward_weights,
             )
 
-            # 5. Train value head on this batch
+            # 5. Train value head on this batch (DDP-wrapped if multi-GPU)
             metrics = train_segment_value_head(
-                value_head=value_head,
+                value_head=vh_for_training,
                 optimizer=self._value_head_optimizer,
                 segment_hidden_stash=segment_hidden_stash,
                 g_obs_list=g_obs,
@@ -744,21 +753,25 @@ class SelfPlayLoop:
             del rollout_results, reward_stash, segment_hidden_stash
             del completion_segment_map, g_obs, g_traj
 
-        # Save value head and pretrain clip IDs
+        # Save value head and pretrain clip IDs (rank 0 only to avoid race)
+        rank = dist.get_rank() if dist.is_initialized() else 0
         output_dir = Path(self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
         pretrain_dir = output_dir / "pretrained"
-        pretrain_dir.mkdir(parents=True, exist_ok=True)
 
-        torch.save(value_head.state_dict(), pretrain_dir / "value_head.pt")
-        with open(pretrain_dir / "clip_ids.json", "w") as f:
-            json.dump(pretrain_scenes, f)
+        if rank == 0:
+            pretrain_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(value_head.state_dict(), pretrain_dir / "value_head.pt")
+            with open(pretrain_dir / "clip_ids.json", "w") as f:
+                json.dump(pretrain_scenes, f)
+            logger.info(
+                "Saved pretrained value head and %d clip IDs to %s (final loss=%.4f)",
+                len(pretrain_scenes),
+                pretrain_dir,
+                last_loss,
+            )
 
-        logger.info(
-            "Saved pretrained value head and %d clip IDs to %s (final loss=%.4f)",
-            len(pretrain_scenes),
-            pretrain_dir,
-            last_loss,
-        )
+        if dist.is_initialized():
+            dist.barrier()
 
         # Exclude pretrain scenes from self-play partitioning
         self._pretrain_clip_ids = pretrain_scenes
@@ -970,8 +983,16 @@ class SelfPlayLoop:
             vh_train_epochs = int(vh_cfg.get("train_epochs", 10))
             vh_log_interval = int(vh_cfg.get("log_interval", 10))
             vh_batch_size = int(vh_cfg.get("batch_size", 64))
+            # Wrap value head in DDP for synchronized multi-GPU training
+            vh_for_train = value_head
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                vh_device = torch.device("cuda", dist.get_rank())
+                value_head.to(vh_device)
+                vh_for_train = torch.nn.parallel.DistributedDataParallel(
+                    value_head, device_ids=[vh_device]
+                )
             vh_metrics = train_segment_value_head(
-                value_head=value_head,
+                value_head=vh_for_train,
                 optimizer=self._value_head_optimizer,
                 segment_hidden_stash=segment_hidden_stash,
                 g_obs_list=g_obs,
@@ -982,6 +1003,8 @@ class SelfPlayLoop:
                 tb_writer=self._get_tb_writer(),
                 global_step_offset=self._vh_global_step,
             )
+            if isinstance(vh_for_train, torch.nn.parallel.DistributedDataParallel):
+                del vh_for_train  # release DDP wrapper
             self._vh_global_step += vh_metrics.get("total_steps", 0)
         else:
             # Fallback: use composite reward as a_obs, no segment-level detail

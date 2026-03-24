@@ -13,6 +13,7 @@ See docs/advantage-conditioning.md for the design specification.
 from __future__ import annotations
 
 import logging
+import math
 import random
 from collections import deque
 from typing import Any
@@ -453,14 +454,19 @@ def train_segment_value_head(
     and then averages across completions. This keeps the two loss terms at
     comparable scales.
 
+    Under DDP (multi-GPU), each rank processes a different shard of each
+    mini-batch. A fixed seed per epoch ensures all ranks agree on the
+    shuffled order, then each rank takes its slice. Gradients are
+    synchronized automatically if ``value_head`` is DDP-wrapped.
+
     Args:
-        value_head: SegmentValueHead instance.
+        value_head: SegmentValueHead instance (optionally DDP-wrapped).
         optimizer: Optimizer for the value head parameters.
         segment_hidden_stash: Per-completion {h_obs, h_traj}.
         g_obs_list: Per-completion G(s_obs) targets.
         g_traj_list: Per-completion G(s_traj_j) tensors.
         num_epochs: Number of training epochs over the data.
-        batch_size: Mini-batch size (default 64).
+        batch_size: Mini-batch size (default 64, **per rank** under DDP).
         log_interval: Log to display every N steps (default 10).
         tb_writer: Optional TensorBoard SummaryWriter for scalar logging.
         global_step_offset: Starting global step for TensorBoard (allows
@@ -470,6 +476,7 @@ def train_segment_value_head(
         Dict of final-step metrics: {loss, loss_obs, loss_traj,
         pred_obs_mean, target_obs_mean, total_steps}.
     """
+    import torch.distributed as dist
     from alpamayo_r1.training.value_head import SegmentValueHead
 
     B = len(g_obs_list)
@@ -479,18 +486,35 @@ def train_segment_value_head(
 
     vh_device = next(value_head.parameters()).device
 
+    # DDP info: shard mini-batches across ranks
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
     # Pre-stack obs into (B, D) / (B,) tensors on CPU for efficient indexing
     h_obs_all = torch.cat([segment_hidden_stash[i]["h_obs"] for i in range(B)], dim=0)
     g_obs_all = torch.tensor(g_obs_list, dtype=torch.float32)
 
-    metrics = {}
+    metrics = {"loss": 0.0, "loss_obs": 0.0, "loss_traj": 0.0,
+               "pred_obs_mean": 0.0, "target_obs_mean": 0.0}
     global_step = 0
 
     for epoch in range(num_epochs):
-        perm = torch.randperm(B)
+        # Fixed seed so all ranks get the same permutation
+        g = torch.Generator().manual_seed(epoch * 31337)
+        perm = torch.randperm(B, generator=g)
 
-        for batch_start in range(0, B, batch_size):
-            idx = perm[batch_start : batch_start + batch_size]
+        # Shard across ranks: each rank gets every world_size-th sample.
+        # Pad so all ranks have the same number of samples (DDP requires
+        # all ranks to participate in every forward/backward step).
+        rank_indices = perm[rank::world_size]
+        max_per_rank = math.ceil(B / world_size)
+        if len(rank_indices) < max_per_rank:
+            # Wrap around to pad with duplicates
+            extra = perm[: max_per_rank - len(rank_indices)]
+            rank_indices = torch.cat([rank_indices, extra])
+
+        for batch_start in range(0, len(rank_indices), batch_size):
+            idx = rank_indices[batch_start : batch_start + batch_size]
 
             # --- Obs-level loss ---
             h_obs_batch = h_obs_all[idx].to(vh_device)
