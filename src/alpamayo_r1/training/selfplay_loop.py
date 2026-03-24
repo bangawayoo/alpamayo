@@ -945,15 +945,15 @@ class SelfPlayLoop:
         )
 
         # 1. Compute rewards
+        t_ = time.time()
         reward_stash = engine.compute_rewards(rollout_results)
+        logger.info("  Stage 1 (compute_rewards): %.1fs for %d completions", time.time() - t_, len(reward_stash))
         if reward_stash:
             r_traj_vals = [r["r_traj"] for r in reward_stash]
             r_reason_vals = [r["r_reason"] for r in reward_stash]
             r_consist_vals = [r["r_consist"] for r in reward_stash]
             logger.info(
-                "Rewards (%d completions): "
-                "traj=[%.3f, %.3f, %.3f] reason=[%.3f, %.3f, %.3f] consist=[%.3f, %.3f, %.3f]",
-                len(reward_stash),
+                "  Rewards: traj=[%.3f, %.3f, %.3f] reason=[%.3f, %.3f, %.3f] consist=[%.3f, %.3f, %.3f]",
                 min(r_traj_vals),
                 np.mean(r_traj_vals),
                 max(r_traj_vals),
@@ -964,23 +964,21 @@ class SelfPlayLoop:
                 np.mean(r_consist_vals),
                 max(r_consist_vals),
             )
-        else:
-            logger.info("Computed rewards for %d completions", len(reward_stash))
 
         # 2. Extract segment hidden states
         vh_cfg = self.cfg.get("value_head", {})
         if vh_cfg.get("enabled", False) and vh_cfg.get("segment_level", False):
+            t_ = time.time()
             segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
                 rollout_results
             )
+            logger.info("  Stage 2 (extract_segment_hidden): %.1fs for %d completions", time.time() - t_, len(rollout_results))
 
             reward_weights = self._get_reward_weights()
             value_head = self._get_or_create_value_head()
 
             # 3. Compute advantages using CURRENT value head (before update)
-            #    V(s) reflects expected returns from previous iterations, so
-            #    A = G - V(s) measures whether this rollout was better/worse
-            #    than expected.
+            t_ = time.time()
             advantages = compute_segment_advantages_from_rollouts(
                 segment_hidden_stash=segment_hidden_stash,
                 segment_reward_stash=reward_stash,
@@ -988,8 +986,10 @@ class SelfPlayLoop:
                 value_head=value_head,
                 reward_weights=reward_weights,
             )
+            logger.info("  Stage 3 (compute_advantages): %.1fs for %d completions", time.time() - t_, len(advantages))
 
             # 4. THEN update value head on current data (for next iteration)
+            t_ = time.time()
             g_obs, g_traj = compute_value_targets(
                 segment_reward_stash=reward_stash,
                 completion_segment_map=completion_segment_map,
@@ -1021,6 +1021,7 @@ class SelfPlayLoop:
             if isinstance(vh_for_train, torch.nn.parallel.DistributedDataParallel):
                 del vh_for_train  # release DDP wrapper
             self._vh_global_step += vh_metrics.get("total_steps", 0)
+            logger.info("  Stage 4 (train_value_head): %.1fs (%d epochs)", time.time() - t_, vh_train_epochs)
         else:
             # Fallback: use composite reward as a_obs, no segment-level detail
             advantages = []
