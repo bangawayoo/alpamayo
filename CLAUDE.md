@@ -13,9 +13,8 @@ When writing new code, do not put any license statements like below:
 
 ## Environment
 
-- Development environment uses MIG notebook (10GB VRAM)
 - Run enviornment uses multi-gpu
-- Python enviornment is in conda's .venv environment
+- Python enviornment is in conda's `alpa` environment
 - When the conversation history includes requests for working in a worktree or the user has asked to do so, always work in the worktree unless otherwise requested. If unsure, ask the user.
 
 ## Running
