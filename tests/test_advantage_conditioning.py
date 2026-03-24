@@ -168,6 +168,77 @@ class TestBuildConditionedSequence:
         assert all(m == 1 for m in result["attention_mask"])
         assert len(result["attention_mask"]) == len(result["input_ids"])
 
+    def test_completion_prefix_conditional_includes_adv_tokens(self):
+        """Conditioned prefix includes advantage tokens for expert KV cache."""
+        completion = [10, 11, FAKE_TRAJ_START_ID, 20, 21]
+        result = build_conditioned_sequence(
+            prompt_ids=[1, 2, 3],
+            completion_ids=completion,
+            i_obs=True,
+            i_traj=False,
+            adv_token_ids=FAKE_ADV_TOKEN_IDS,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+            p_drop=0.0,
+        )
+        prefix = result["completion_prefix"]
+        # Expected: [adv_obs_pos] [10, 11] [adv_traj_neg] [TRAJ_START]
+        assert prefix[0] == FAKE_ADV_TOKEN_IDS["adv_obs_pos"]
+        assert prefix[1:3] == [10, 11]  # CoC part
+        assert prefix[3] == FAKE_ADV_TOKEN_IDS["adv_traj_neg"]
+        assert prefix[4] == FAKE_TRAJ_START_ID
+
+    def test_completion_prefix_unconditional_no_adv_tokens(self):
+        """Unconditional prefix has no advantage tokens."""
+        completion = [10, 11, FAKE_TRAJ_START_ID, 20, 21]
+        result = build_conditioned_sequence(
+            prompt_ids=[1, 2, 3],
+            completion_ids=completion,
+            i_obs=True,
+            i_traj=True,
+            adv_token_ids=FAKE_ADV_TOKEN_IDS,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+            p_drop=1.0,  # force unconditional
+        )
+        prefix = result["completion_prefix"]
+        # No adv tokens: just [CoC...] [TRAJ_START]
+        assert prefix == [10, 11, FAKE_TRAJ_START_ID]
+
+    def test_completion_prefix_no_adv_token_ids(self):
+        """Plain SFT (adv_token_ids=None) returns prefix without adv tokens."""
+        completion = [10, 11, FAKE_TRAJ_START_ID, 20, 21]
+        result = build_conditioned_sequence(
+            prompt_ids=[1, 2, 3],
+            completion_ids=completion,
+            i_obs=True,
+            i_traj=True,
+            adv_token_ids=None,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+        )
+        prefix = result["completion_prefix"]
+        assert prefix == [10, 11, FAKE_TRAJ_START_ID]
+
+    def test_completion_prefix_text_mode_multi_token(self):
+        """Text-mode adv tokens (multi-token lists) appear in prefix."""
+        text_adv_ids = {
+            "adv_obs_pos": [50, 51, 52],
+            "adv_obs_neg": [53, 54, 55],
+            "adv_traj_pos": [60, 61],
+            "adv_traj_neg": [62, 63],
+        }
+        completion = [10, FAKE_TRAJ_START_ID, 20]
+        result = build_conditioned_sequence(
+            prompt_ids=[1, 2],
+            completion_ids=completion,
+            i_obs=True,
+            i_traj=True,
+            adv_token_ids=text_adv_ids,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+            p_drop=0.0,
+        )
+        prefix = result["completion_prefix"]
+        # [50,51,52] [10] [60,61] [TRAJ_START]
+        assert prefix == [50, 51, 52, 10, 60, 61, FAKE_TRAJ_START_ID]
+
 
 class TestAdvCondDataset:
     def test_basic(self):

@@ -593,6 +593,17 @@ def train_segment_value_head(
 # ---------------------------------------------------------------------------
 
 
+def _find_completion_prefix(
+    completion_ids: list[int], traj_future_start_id: int | None
+) -> list[int]:
+    """Return completion tokens up to and including <traj_future_start>."""
+    if traj_future_start_id is not None:
+        for idx, tid in enumerate(completion_ids):
+            if tid == traj_future_start_id:
+                return completion_ids[: idx + 1]
+    return list(completion_ids)
+
+
 def build_conditioned_sequence(
     prompt_ids: list[int],
     completion_ids: list[int],
@@ -635,11 +646,14 @@ def build_conditioned_sequence(
     if adv_token_ids is None:
         input_ids = prompt_ids + completion_ids
         labels = [IGNORE_INDEX] * len(prompt_ids) + completion_ids
+        # completion_prefix: CoC tokens up to and including <traj_future_start>
+        comp_prefix = _find_completion_prefix(completion_ids, traj_future_start_id)
         return {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": [1] * len(input_ids),
             "is_unconditional": True,
+            "completion_prefix": comp_prefix,
         }
 
     is_all_positive = i_obs and i_traj
@@ -649,6 +663,8 @@ def build_conditioned_sequence(
         # Unconditional path: no conditioning tokens
         input_ids = prompt_ids + completion_ids
         labels = [IGNORE_INDEX] * len(prompt_ids) + completion_ids
+        # No advantage tokens — prefix is just CoC + <traj_future_start>
+        comp_prefix = _find_completion_prefix(completion_ids, traj_future_start_id)
     else:
         # Conditional path: split placement
         # adv_obs goes after prompt (before CoC)
@@ -680,6 +696,11 @@ def build_conditioned_sequence(
             + traj_part  # trajectory tokens (supervised)
         )
 
+        # Conditioned prefix for expert KV cache: includes advantage tokens
+        # [adv_obs...] [CoC tokens...] [adv_traj...] [<traj_future_start>]
+        traj_start = traj_part[:1] if traj_part else []
+        comp_prefix = adv_obs_token + coc_part + adv_traj_token + traj_start
+
     attention_mask = [1] * len(input_ids)
 
     return {
@@ -687,6 +708,7 @@ def build_conditioned_sequence(
         "labels": labels,
         "attention_mask": attention_mask,
         "is_unconditional": is_unconditional,
+        "completion_prefix": comp_prefix,
     }
 
 
@@ -752,13 +774,13 @@ class AdvCondDataset(Dataset):
             p_drop=self._p_drop,
         )
 
-        # Propagate metadata for expert CFM step
+        # Propagate metadata for expert CFM step.
+        # completion_prefix is set by build_conditioned_sequence and includes
+        # advantage tokens when conditioning is active.
         if "clip_id" in rollout:
             item["clip_id"] = rollout["clip_id"]
         if "t0_us" in rollout:
             item["t0_us"] = rollout["t0_us"]
-        if "completion_prefix" in rollout:
-            item["completion_prefix"] = rollout["completion_prefix"]
         if "expert_fut_xyz" in rollout:
             item["expert_fut_xyz"] = rollout["expert_fut_xyz"]
         if "expert_fut_rot" in rollout:
