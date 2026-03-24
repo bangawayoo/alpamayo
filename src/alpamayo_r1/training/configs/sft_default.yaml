@@ -12,6 +12,12 @@ defaults:
   - override hydra/hydra_logging: none
   - override hydra/job_logging: none
 
+# Save Hydra configs to training.output_dir instead of the default outputs/<date>/<time>/
+hydra:
+  run:
+    dir: ${training.output_dir}
+  output_subdir: hydra
+
 # General
 seed: 42
 model_name: nvidia/Alpamayo-R1-10B
@@ -66,7 +72,7 @@ advantage_conditioning:
 value_head:
   enabled: true
   hidden_dim: 4096              # must match VLM hidden size
-  lr: 1e-5
+  lr: 1e-4
   load_path: null               # pre-trained value head checkpoint (skips pre-training if provided)
   segment_level: true
   train_epochs: 3              # epochs to train value head per iteration (before advantage computation)
