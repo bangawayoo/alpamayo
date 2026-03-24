@@ -80,12 +80,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 
-if [[ ! -x "$VENV_PYTHON" ]]; then
-    echo "Error: venv python not found at $VENV_PYTHON"
-    echo "Run 'uv sync' first to create the virtual environment."
-    exit 1
-fi
-
 # ---------------------------------------------------------------
 # Build Hydra overrides
 # ---------------------------------------------------------------
