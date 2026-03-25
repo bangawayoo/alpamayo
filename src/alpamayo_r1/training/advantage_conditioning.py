@@ -270,6 +270,11 @@ def compute_segment_advantages_from_rollouts(
     the advantage is the actual return from that state minus the value head's
     prediction. See docs/value-head.md "Approach A" for details.
 
+    Batches all obs-level and traj-level value head calls for efficiency:
+    obs hidden states are stacked into a single (B, D) tensor, and traj
+    curvature tokens are concatenated into a flat (N_total, D) tensor for
+    one forward pass (no padding — the MLP is pointwise).
+
     Args:
         segment_hidden_stash: List of {h_obs, h_coc, h_traj} per completion.
             h_obs: (1, D), h_coc: (1, D), h_traj: (T_traj, D).
@@ -288,67 +293,111 @@ def compute_segment_advantages_from_rollouts(
     """
     from alpamayo_r1.training.value_head import SegmentValueHead
 
+    B = len(segment_hidden_stash)
+    if B == 0:
+        return []
+
     w_traj, w_reason, w_consist = reward_weights
     vh_device = next(value_head.parameters()).device
-    results = []
 
-    for i in range(len(segment_hidden_stash)):
-        seg = segment_hidden_stash[i]
-        seg_map = completion_segment_map[i]
+    # ------------------------------------------------------------------
+    # 1. Compute returns-to-go on CPU (no GPU needed)
+    # ------------------------------------------------------------------
+    g_obs_list: list[float] = []
+    g_traj_curv_list: list[torch.Tensor] = []  # per-completion, curvature positions only
+    traj_lens: list[int] = []  # number of curvature positions per completion
+
+    for i in range(B):
         seg_rew = segment_reward_stash[i]
+        seg_map = completion_segment_map[i]
 
-        h_obs = seg["h_obs"].to(vh_device)
-        h_traj = seg["h_traj"].to(vh_device)
-
-        # Per-function rewards
         r_traj_scalar = seg_rew.get("r_traj", 0.0)
         r_reason = seg_rew.get("r_reason", 0.0)
         r_consist = seg_rew.get("r_consist", 0.0)
 
-        # Per-token trajectory rewards and returns-to-go (computed over all tokens)
         T_traj = seg_map["traj_len"]
         if T_traj > 0:
             r_per_step = seg_rew.get("r_traj_per_step")
             if r_per_step is not None and len(r_per_step) == T_traj:
-                r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32, device=vh_device)
+                r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
             else:
-                r_per_step_t = torch.full(
-                    (T_traj,), r_traj_scalar / max(T_traj, 1), device=vh_device
-                )
+                r_per_step_t = torch.full((T_traj,), r_traj_scalar / max(T_traj, 1))
             r_traj_weighted = w_traj * r_per_step_t
             r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
             g_traj_all = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
+            curv_idx = torch.arange(1, T_traj, 2)
+            g_traj_curv_list.append(g_traj_all[curv_idx])
+            traj_lens.append(len(curv_idx))
+            traj_total = r_traj_weighted.sum().item()
         else:
-            r_traj_weighted = torch.zeros(0, device=vh_device)
-            g_traj_all = torch.zeros(0, device=vh_device)
+            g_traj_curv_list.append(torch.zeros(0))
+            traj_lens.append(0)
+            traj_total = 0.0
 
-        # Returns-to-go at observation state
-        traj_total = r_traj_weighted.sum().item() if T_traj > 0 else 0.0
-        g_obs = w_reason * r_reason + traj_total  # total return from s_obs
+        g_obs = w_reason * r_reason + traj_total
+        g_obs_list.append(g_obs)
 
-        # Value predictions at curvature positions only (idx % 2 == 1).
-        # Trajectory tokens are (acceleration, curvature) pairs; the curvature
-        # token has seen both components and is the natural V evaluation point.
+    # ------------------------------------------------------------------
+    # 2. Bulk-transfer obs hidden states to GPU, batched forward pass
+    # ------------------------------------------------------------------
+    # Concatenate on CPU first, then single transfer to GPU
+    h_obs_all = torch.cat(
+        [segment_hidden_stash[i]["h_obs"] for i in range(B)], dim=0
+    ).to(vh_device)  # (B, D)
+
+    with torch.no_grad():
+        v_obs_all = value_head(
+            h_obs_all, level=SegmentValueHead.LEVEL_OBS
+        )  # (B,)
+
+    # ------------------------------------------------------------------
+    # 3. Flat-batched traj-level value head inference (no padding)
+    # ------------------------------------------------------------------
+    # The value head MLP is pointwise — concatenate all curvature tokens
+    # from all completions into a single (N_total, D) tensor with their
+    # respective positions, run one forward pass, then split results back.
+    traj_indices = [i for i in range(B) if traj_lens[i] > 0]
+
+    v_traj_per_completion: list[torch.Tensor | None] = [None] * B
+
+    if traj_indices:
+        curv_hiddens = []
+        curv_positions = []
+        curv_lens = []
+        for i in traj_indices:
+            h_traj = segment_hidden_stash[i]["h_traj"]
+            T_traj = completion_segment_map[i]["traj_len"]
+            curv_idx = torch.arange(1, T_traj, 2)
+            curv_hiddens.append(h_traj[curv_idx])  # (T_curv_i, D)
+            curv_positions.append(curv_idx // 2 + SegmentValueHead.POS_TRAJ_START)
+            curv_lens.append(len(curv_idx))
+
+        # Concatenate on CPU, single transfer — no padding waste
+        h_traj_flat = torch.cat(curv_hiddens, dim=0).to(vh_device)  # (N_total, D)
+        pos_flat = torch.cat(curv_positions, dim=0).to(vh_device)  # (N_total,)
+
         with torch.no_grad():
-            v_obs = value_head(h_obs, level=SegmentValueHead.LEVEL_OBS).item()
-            if T_traj > 0:
-                curv_idx = torch.arange(1, T_traj, 2, device=vh_device)
-                h_traj_curv = h_traj[curv_idx]
-                traj_pos = (curv_idx // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0)
-                v_traj = value_head(
-                    h_traj_curv.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ,
-                    positions=traj_pos,
-                ).squeeze(0)
-                g_traj = g_traj_all[curv_idx]
-            else:
-                v_traj = torch.zeros(0, device=vh_device)
-                g_traj = torch.zeros(0, device=vh_device)
+            v_traj_flat = value_head(
+                h_traj_flat, level=SegmentValueHead.LEVEL_TRAJ, positions=pos_flat
+            )  # (N_total,)
 
-        # A_obs: completion quality relative to scene baseline
+        # Split results back per completion
+        v_splits = v_traj_flat.split(curv_lens)
+        for j, i in enumerate(traj_indices):
+            v_traj_per_completion[i] = v_splits[j]
+
+    # ------------------------------------------------------------------
+    # 4. Assemble per-completion advantages
+    # ------------------------------------------------------------------
+    results = []
+    for i in range(B):
+        g_obs = g_obs_list[i]
+        v_obs = v_obs_all[i].item()
         a_obs = g_obs - v_obs
 
-        # A_traj: per-timestep trajectory advantages (curvature positions only)
-        if T_traj > 0:
+        if traj_lens[i] > 0:
+            g_traj = g_traj_curv_list[i].to(vh_device)
+            v_traj = v_traj_per_completion[i]
             a_traj_per_step = g_traj - v_traj
             a_traj_mean = a_traj_per_step.mean().item()
             a_traj_list = a_traj_per_step.cpu().tolist()
@@ -526,7 +575,7 @@ def train_segment_value_head(
             obs_pred = value_head(h_obs_batch, level=SegmentValueHead.LEVEL_OBS)
             loss_obs = F.mse_loss(obs_pred, g_obs_batch)
 
-            # --- Traj-level loss (all curvature positions) ---
+            # --- Traj-level loss (flat-batched over curvature positions) ---
             # Trajectory tokens come in (acceleration, curvature) pairs per timestep.
             # We evaluate V only at curvature positions (idx % 2 == 1) because:
             # (1) the curvature token has seen both components of the timestep,
@@ -534,7 +583,13 @@ def train_segment_value_head(
             #     timestep-level rather than token-level.
             # Per-completion MSE is averaged across completions so that each
             # completion contributes equally regardless of trajectory length.
-            traj_losses = []
+            #
+            # Concatenate all curvature tokens into a flat (N_total, D) tensor
+            # for one forward pass (MLP is pointwise — no padding needed).
+            traj_h_list = []
+            traj_g_list = []
+            traj_p_list = []
+            traj_curv_lens = []
             for i_local in idx.tolist():
                 h_traj = segment_hidden_stash[i_local]["h_traj"]
                 g_traj = g_traj_list[i_local]
@@ -542,15 +597,27 @@ def train_segment_value_head(
                     continue
                 T_t = h_traj.shape[0]
                 curvature_idx = torch.arange(1, T_t, 2)
-                h_sub = h_traj[curvature_idx].to(vh_device)
-                g_sub = g_traj[curvature_idx].to(vh_device)
-                traj_pos = (curvature_idx // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0).to(vh_device)
-                v = value_head(
-                    h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos
-                ).squeeze(0)
-                traj_losses.append(F.mse_loss(v, g_sub))
+                traj_h_list.append(h_traj[curvature_idx])
+                traj_g_list.append(g_traj[curvature_idx])
+                traj_p_list.append(curvature_idx // 2 + SegmentValueHead.POS_TRAJ_START)
+                traj_curv_lens.append(len(curvature_idx))
 
-            if traj_losses:
+            if traj_h_list:
+                # Flat concat on CPU, single transfer — no padding waste
+                h_flat = torch.cat(traj_h_list, dim=0).to(vh_device)  # (N_total, D)
+                g_flat = torch.cat(traj_g_list, dim=0).to(vh_device)  # (N_total,)
+                p_flat = torch.cat(traj_p_list, dim=0).to(vh_device)  # (N_total,)
+
+                v_flat = value_head(
+                    h_flat, level=SegmentValueHead.LEVEL_TRAJ, positions=p_flat
+                )  # (N_total,)
+
+                # Per-completion MSE averaged across completions
+                v_splits = v_flat.split(traj_curv_lens)
+                g_splits = g_flat.split(traj_curv_lens)
+                traj_losses = [
+                    F.mse_loss(v_s, g_s) for v_s, g_s in zip(v_splits, g_splits)
+                ]
                 loss_traj = torch.stack(traj_losses).mean()
             else:
                 loss_traj = torch.tensor(0.0, device=vh_device)
