@@ -22,11 +22,12 @@ Usage:
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import Trainer
+from transformers import DynamicCache, Trainer
 
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1.models.base_model import IGNORE_INDEX
@@ -187,6 +188,12 @@ class AdvCondSFTTrainer(Trainer):
         self._expert_optimizer = None
         self._expert_cfg = expert_cfg or {}
         self._expert_every_n_steps = int(self._expert_cfg.get("every_n_steps", 1))
+        self._reuse_training_kv = bool(self._expert_cfg.get("reuse_training_kv", False))
+        self._validate_kv_reuse = bool(self._expert_cfg.get("validate_kv_reuse", False))
+
+        # KV stash for reuse_training_kv optimization
+        self._capture_kv = False
+        self._stashed_kv_samples: list[tuple] | None = None
 
         if self._expert_cfg.get("enabled", False) and full_model is not None:
             self._setup_expert(full_model, self._expert_cfg)
@@ -279,6 +286,10 @@ class AdvCondSFTTrainer(Trainer):
 
         The dataset has already masked prompt+conditioning positions in labels
         with IGNORE_INDEX. We just apply the alpha weight for conditional examples.
+
+        When ``_capture_kv`` is set, disables gradient checkpointing and runs
+        with ``use_cache=True`` to capture KV caches for the expert CFM step,
+        eliminating the redundant serial VLM forward passes in Phase A.
         """
         model_inputs = {
             "input_ids": inputs["input_ids"],
@@ -290,7 +301,10 @@ class AdvCondSFTTrainer(Trainer):
         if "image_grid_thw" in inputs:
             model_inputs["image_grid_thw"] = inputs["image_grid_thw"]
 
-        outputs = model(**model_inputs)
+        if self._capture_kv:
+            outputs = self._forward_with_kv_capture(model, inputs, model_inputs)
+        else:
+            outputs = model(**model_inputs)
         loss = outputs.loss
 
         # Apply alpha weighting for conditional examples
@@ -316,8 +330,25 @@ class AdvCondSFTTrainer(Trainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Override to add deferred expert CFM step after VLM backward."""
-        # 1. Normal SFT forward + backward
+        # Set KV capture flag if expert step will fire and reuse is enabled
+        if (
+            self._reuse_training_kv
+            and self._expert_enabled
+            and self.state.global_step % self._expert_every_n_steps == 0
+        ):
+            self._capture_kv = True
+
+        # 1. Normal SFT forward + backward (compute_loss captures KV if flagged)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t_fwd_start = time.perf_counter()
+
         loss = super().training_step(model, inputs, num_items_in_batch)
+        self._capture_kv = False
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t_fwd_end = time.perf_counter()
 
         # Track unconditional fraction
         is_unconditional = inputs.get("is_unconditional")
@@ -341,9 +372,156 @@ class AdvCondSFTTrainer(Trainer):
 
         # 2. Deferred expert CFM step
         if self._expert_enabled and self.state.global_step % self._expert_every_n_steps == 0:
+            t_expert_start = time.perf_counter()
             self._expert_cfm_step(inputs)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_expert_end = time.perf_counter()
+
+            peak_mem = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+            logger.warning(
+                "Step %d timing: fwd+bwd=%.2fs expert=%.2fs total=%.2fs | peak_mem=%.1fGB",
+                self._sft_step_count,
+                t_fwd_end - t_fwd_start,
+                t_expert_end - t_expert_start,
+                t_expert_end - t_fwd_start,
+                peak_mem,
+            )
 
         return loss
+
+    def _forward_with_kv_capture(self, model, inputs, model_inputs):
+        """Run VLM forward with use_cache=True and stash per-sample KV caches.
+
+        Temporarily disables gradient checkpointing so the VLM returns
+        past_key_values. After forward, crops and unbatches the KV cache
+        per sample to the completion_prefix boundary (traj_future_start
+        position). The stashed caches are consumed by _expert_cfm_step.
+        """
+        vlm = model
+        # Unwrap DDP / accelerate wrapper to reach actual VLM modules
+        unwrapped = self.accelerator.unwrap_model(vlm)
+
+        gc_modules = [
+            m for m in unwrapped.modules() if getattr(m, "gradient_checkpointing", False)
+        ]
+        for m in gc_modules:
+            m.gradient_checkpointing = False
+
+        try:
+            outputs = model(**model_inputs, use_cache=True)
+        finally:
+            for m in gc_modules:
+                m.gradient_checkpointing = True
+
+        past_kv = outputs.past_key_values
+        if past_kv is None:
+            logger.warning("KV capture failed: past_key_values is None. Falling back.")
+            return outputs
+
+        # Get rope_deltas from VLM inner model
+        _inner = unwrapped.model if hasattr(unwrapped, "model") else unwrapped
+        if not hasattr(_inner, "rope_deltas"):
+            _inner = _inner.model
+        rope_deltas = _inner.rope_deltas
+
+        # Find traj_future_start_id for determining prefix boundary
+        traj_future_start_id = None
+        if self.full_model is not None and hasattr(self.full_model, "special_token_ids"):
+            traj_future_start_id = self.full_model.special_token_ids.get("traj_future_start")
+
+        # Crop and stash per-sample KV caches
+        input_ids = inputs["input_ids"]  # (batch, seq_len)
+        batch_size = input_ids.shape[0]
+        stashed = []
+
+        t0 = time.perf_counter()
+        for i in range(batch_size):
+            # Find completion_prefix boundary: position AFTER traj_future_start
+            ids_i = input_ids[i]
+            if traj_future_start_id is not None:
+                matches = (ids_i == traj_future_start_id).nonzero(as_tuple=False)
+                if len(matches) > 0:
+                    # Include traj_future_start in the prefix
+                    prefix_end = matches[0].item() + 1
+                else:
+                    # No traj_future_start found — use full sequence (minus padding)
+                    attn = inputs["attention_mask"][i]
+                    prefix_end = attn.sum().item()
+            else:
+                attn = inputs["attention_mask"][i]
+                prefix_end = attn.sum().item()
+
+            # Extract single-sample KV and crop to prefix length
+            sample_kv = DynamicCache()
+            for layer_idx, layer in enumerate(past_kv.layers):
+                k = layer.keys[i : i + 1, :, :prefix_end, :].detach().clone()
+                v = layer.values[i : i + 1, :, :prefix_end, :].detach().clone()
+                sample_kv.update(k, v, layer_idx)
+
+            offset = torch.tensor([prefix_end], device=input_ids.device)
+            stashed.append((sample_kv, rope_deltas, prefix_end, 1, offset))
+
+        elapsed = time.perf_counter() - t0
+        logger.debug("KV capture: cropped %d samples in %.3fs", batch_size, elapsed)
+        self._stashed_kv_samples = stashed
+        return outputs
+
+    def _validate_kv_caches(
+        self,
+        clip_ids: list,
+        t0_us_list: list,
+        completion_prefixes: list,
+        cached_samples: list[dict],
+        device: torch.device,
+    ) -> None:
+        """Compare stashed KV caches against serial extraction for correctness."""
+        logger.warning("=== KV Reuse Validation (compare stashed vs serial) ===")
+        t0 = time.perf_counter()
+
+        for i in range(len(clip_ids)):
+            if i >= len(cached_samples):
+                break
+            stash_kv, stash_rope, stash_plen, _, stash_off = cached_samples[i]["kv_result"]
+
+            # Run serial extraction for this sample
+            model_inputs, _ = self._data_cache.get(clip_ids[i], t0_us_list[i], device)
+            serial_result = self._get_vlm_kv_cache_teacher_forced(
+                model_inputs, completion_prefixes[i], device
+            )
+            serial_kv, serial_rope, serial_plen, _, serial_off = serial_result
+
+            # Compare prefill lengths
+            if stash_plen != serial_plen:
+                logger.error(
+                    "  Sample %d MISMATCH prefill: stashed=%d serial=%d",
+                    i, stash_plen, serial_plen,
+                )
+                continue
+
+            # Compare KV per layer
+            n_layers = len(stash_kv.layers)
+            max_dk = 0.0
+            max_dv = 0.0
+            for li in range(n_layers):
+                sk = stash_kv.layers[li].keys
+                sv = stash_kv.layers[li].values
+                rk = serial_kv.layers[li].keys
+                rv = serial_kv.layers[li].values
+                if sk.shape != rk.shape:
+                    logger.error("  Layer %d shape mismatch: %s vs %s", li, sk.shape, rk.shape)
+                    break
+                max_dk = max(max_dk, (sk.float() - rk.float()).abs().max().item())
+                max_dv = max(max_dv, (sv.float() - rv.float()).abs().max().item())
+
+            ok = max_dk < 0.01 and max_dv < 0.01
+            logger.warning(
+                "  Sample %d [%s]: max_diff keys=%.6f values=%.6f (%d layers, prefill=%d)",
+                i, "PASS" if ok else "FAIL", max_dk, max_dv, n_layers, stash_plen,
+            )
+
+        elapsed = time.perf_counter() - t0
+        logger.warning("=== Validation done in %.2fs ===", elapsed)
 
     def _expert_cfm_step(self, inputs: dict) -> None:
         """Run one expert CFM training step using deferred GPU scheduling.
@@ -375,9 +553,16 @@ class AdvCondSFTTrainer(Trainer):
         hist_rot_list = inputs.get("hist_rot_list", [])
 
         if not clip_ids:
+            self._stashed_kv_samples = None
             return
 
         # ---- Phase A: Extract KV caches (VLM on GPU) ----
+        # If reuse_training_kv captured KV caches during compute_loss, skip
+        # the serial VLM forward passes entirely.
+        use_stashed = self._stashed_kv_samples is not None
+        if use_stashed:
+            logger.debug("Using stashed KV caches from training forward (%d samples)", len(clip_ids))
+
         cached_samples = []
         for i in range(len(clip_ids)):
             try:
@@ -385,13 +570,14 @@ class AdvCondSFTTrainer(Trainer):
                 t0_us = t0_us_list[i]
                 completion_prefix = completion_prefixes[i]
 
-                # Load scene data (needed for VLM KV cache extraction)
-                model_inputs, ego_future_xyz = self._data_cache.get(clip_id, t0_us, device)
-
-                # Teacher-forced VLM forward → KV cache
-                kv_result = self._get_vlm_kv_cache_teacher_forced(
-                    model_inputs, completion_prefix, device
-                )
+                if use_stashed and i < len(self._stashed_kv_samples):
+                    kv_result = self._stashed_kv_samples[i]
+                else:
+                    # Fallback: serial VLM forward (original path)
+                    model_inputs, ego_future_xyz = self._data_cache.get(clip_id, t0_us, device)
+                    kv_result = self._get_vlm_kv_cache_teacher_forced(
+                        model_inputs, completion_prefix, device
+                    )
 
                 # Use expert GT from rollout if available (handles artificial data correctly),
                 # otherwise fall back to dataset GT.
@@ -401,9 +587,10 @@ class AdvCondSFTTrainer(Trainer):
                     fut_xyz = expert_fut_xyz_list[i].unsqueeze(0).to(device)  # (1, T_fut, 3)
                     fut_rot = expert_fut_rot_list[i].unsqueeze(0).to(device)  # (1, T_fut, 3, 3)
                 else:
+                    scene_data, ego_future_xyz = self._data_cache.get(clip_id, t0_us, device)
                     ego_future_rot = self._data_cache.get_ego_future_rot(clip_id, t0_us).to(device)
-                    hist_xyz = model_inputs["ego_history_xyz"][:, -1].to(device)
-                    hist_rot = model_inputs["ego_history_rot"][:, -1].to(device)
+                    hist_xyz = scene_data["ego_history_xyz"][:, -1].to(device)
+                    hist_rot = scene_data["ego_history_rot"][:, -1].to(device)
                     fut_xyz = ego_future_xyz.to(device)[:, -1]
                     fut_rot = ego_future_rot[:, -1]
 
@@ -419,6 +606,13 @@ class AdvCondSFTTrainer(Trainer):
             except Exception as e:
                 logger.warning("KV cache extraction failed for sample %d: %s", i, e)
                 continue
+
+        # Validate stashed KV against serial extraction if requested
+        if use_stashed and self._validate_kv_reuse:
+            self._validate_kv_caches(clip_ids, t0_us_list, completion_prefixes, cached_samples, device)
+
+        # Clear stash after use
+        self._stashed_kv_samples = None
 
         if not cached_samples:
             return
