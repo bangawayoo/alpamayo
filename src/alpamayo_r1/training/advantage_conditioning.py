@@ -744,48 +744,139 @@ def build_conditioned_sequence(
 
 
 # ---------------------------------------------------------------------------
-# 3e. AdvCondDataset
+# 3e. Pre-computation + AdvCondDataset
 # ---------------------------------------------------------------------------
 
 
-class AdvCondDataset(Dataset):
-    """Dataset wrapping rollout results with advantage conditioning labels.
+def precompute_conditioned_sequences(
+    rollout_results: list[dict],
+    adv_labels: list[dict],
+    adv_token_ids: dict[str, int | list[int]] | None,
+    traj_future_start_id: int | None = None,
+) -> list[dict]:
+    """Pre-compute both conditional and unconditional sequences for all samples.
 
-    Each item returns a training example with conditioning tokens inserted
-    and labels masked appropriately for cross-entropy loss. Vision data
-    (pixel_values, image_grid_thw) is pulled from the ClipDataCache's
-    already-processed model_inputs, avoiding redundant re-processing.
+    Moves the per-sample scanning (finding traj_future_start boundary) and
+    list concatenation out of the DataLoader hot path and into a single
+    batch pre-computation step. The returned list is consumed by
+    AdvCondDataset, which only needs a cheap random check for p_drop at
+    __getitem__ time.
 
     Args:
-        rollout_results: List of dicts per completion with at least:
-            {prompt_ids: list[int], completion_ids: list[int]}.
-        adv_labels: List of dicts per completion with:
-            {i_obs: bool, i_traj: bool}.
-        adv_token_ids: Dict mapping token name -> ID.
+        rollout_results: List of rollout dicts with prompt_ids, completion_ids.
+        adv_labels: List of dicts with i_obs, i_traj booleans.
+        adv_token_ids: Advantage token IDs (or None for plain SFT).
+        traj_future_start_id: Token ID of <|traj_future_start|>.
+
+    Returns:
+        List of dicts, one per sample, each containing:
+        - "cond": dict with input_ids, labels, attention_mask, completion_prefix
+        - "uncond": dict with input_ids, labels, attention_mask, completion_prefix
+        - "is_all_positive": bool — whether dropout can apply
+    """
+    precomputed = []
+    for rollout, label in zip(rollout_results, adv_labels):
+        prompt_ids = rollout["prompt_ids"]
+        completion_ids = rollout["completion_ids"]
+        i_obs = label["i_obs"]
+        i_traj = label["i_traj"]
+
+        # --- Unconditional version (always needed for dropout fallback) ---
+        uncond_input_ids = prompt_ids + completion_ids
+        uncond_labels = [IGNORE_INDEX] * len(prompt_ids) + completion_ids
+        uncond_prefix = _find_completion_prefix(completion_ids, traj_future_start_id)
+        uncond = {
+            "input_ids": uncond_input_ids,
+            "labels": uncond_labels,
+            "attention_mask": [1] * len(uncond_input_ids),
+            "completion_prefix": uncond_prefix,
+        }
+
+        # --- Conditional version ---
+        if adv_token_ids is None:
+            # Plain SFT: conditional == unconditional
+            cond = uncond
+        else:
+            adv_obs_token = adv_token_ids["adv_obs_pos" if i_obs else "adv_obs_neg"]
+            adv_traj_token = adv_token_ids["adv_traj_pos" if i_traj else "adv_traj_neg"]
+
+            adv_obs_token = (
+                [adv_obs_token] if isinstance(adv_obs_token, int) else list(adv_obs_token)
+            )
+            adv_traj_token = (
+                [adv_traj_token] if isinstance(adv_traj_token, int) else list(adv_traj_token)
+            )
+
+            # Find CoC/trajectory boundary
+            traj_boundary = len(completion_ids)
+            if traj_future_start_id is not None:
+                for idx, tid in enumerate(completion_ids):
+                    if tid == traj_future_start_id:
+                        traj_boundary = idx
+                        break
+
+            coc_part = completion_ids[:traj_boundary]
+            traj_part = completion_ids[traj_boundary:]
+
+            cond_input_ids = prompt_ids + adv_obs_token + coc_part + adv_traj_token + traj_part
+            cond_labels = (
+                [IGNORE_INDEX] * (len(prompt_ids) + len(adv_obs_token))
+                + coc_part
+                + [IGNORE_INDEX] * len(adv_traj_token)
+                + traj_part
+            )
+            traj_start = traj_part[:1] if traj_part else []
+            cond_prefix = adv_obs_token + coc_part + adv_traj_token + traj_start
+
+            cond = {
+                "input_ids": cond_input_ids,
+                "labels": cond_labels,
+                "attention_mask": [1] * len(cond_input_ids),
+                "completion_prefix": cond_prefix,
+            }
+
+        precomputed.append(
+            {
+                "cond": cond,
+                "uncond": uncond,
+                "is_all_positive": i_obs and i_traj,
+            }
+        )
+
+    return precomputed
+
+
+class AdvCondDataset(Dataset):
+    """Dataset wrapping rollout results with pre-computed advantage conditioning.
+
+    Sequences (input_ids, labels, attention_mask, completion_prefix) are
+    pre-built by precompute_conditioned_sequences() before training starts.
+    At __getitem__ time the only CPU work is a single random check for
+    conditioning dropout, plus vision data retrieval from the cache.
+
+    Args:
+        rollout_results: List of dicts per completion (metadata for vision
+            data lookup and expert CFM: clip_id, t0_us, etc.).
+        precomputed: Pre-computed sequences from precompute_conditioned_sequences().
         p_drop: Conditioning dropout probability.
-        traj_future_start_id: Token ID of <|traj_future_start|> for finding
-            CoC/trajectory boundary. If None, adv_traj is placed at end.
         data_cache: ClipDataCache for loading vision data.
     """
 
     def __init__(
         self,
         rollout_results: list[dict],
-        adv_labels: list[dict],
-        adv_token_ids: dict[str, int],
+        precomputed: list[dict],
         p_drop: float = 0.3,
-        traj_future_start_id: int | None = None,
         data_cache: Any | None = None,
     ) -> None:
-        if len(rollout_results) != len(adv_labels):
+        if len(rollout_results) != len(precomputed):
             raise ValueError(
-                f"Mismatched lengths: {len(rollout_results)} rollouts vs {len(adv_labels)} labels"
+                f"Mismatched lengths: {len(rollout_results)} rollouts vs "
+                f"{len(precomputed)} precomputed"
             )
         self._rollouts = rollout_results
-        self._labels = adv_labels
-        self._adv_token_ids = adv_token_ids
+        self._precomputed = precomputed
         self._p_drop = p_drop
-        self._traj_future_start_id = traj_future_start_id
         self._data_cache = data_cache
 
     def __len__(self) -> int:
@@ -793,21 +884,18 @@ class AdvCondDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         rollout = self._rollouts[idx]
-        label = self._labels[idx]
-
-        item = build_conditioned_sequence(
-            prompt_ids=rollout["prompt_ids"],
-            completion_ids=rollout["completion_ids"],
-            i_obs=label["i_obs"],
-            i_traj=label["i_traj"],
-            adv_token_ids=self._adv_token_ids,
-            traj_future_start_id=self._traj_future_start_id,
-            p_drop=self._p_drop,
-        )
+        pc = self._precomputed[idx]
+        is_unconditional = pc["is_all_positive"] and random.random() < self._p_drop
+        seq = pc["uncond"] if is_unconditional else pc["cond"]
+        item = {
+            "input_ids": seq["input_ids"],
+            "labels": seq["labels"],
+            "attention_mask": seq["attention_mask"],
+            "is_unconditional": is_unconditional,
+            "completion_prefix": seq["completion_prefix"],
+        }
 
         # Propagate metadata for expert CFM step.
-        # completion_prefix is set by build_conditioned_sequence and includes
-        # advantage tokens when conditioning is active.
         if "clip_id" in rollout:
             item["clip_id"] = rollout["clip_id"]
         if "t0_us" in rollout:
@@ -833,7 +921,3 @@ class AdvCondDataset(Dataset):
                 item["image_grid_thw"] = tokenized["image_grid_thw"].squeeze(0)
 
         return item
-
-    def set_p_drop(self, p_drop: float) -> None:
-        """Update dropout probability (e.g., per epoch)."""
-        self._p_drop = p_drop

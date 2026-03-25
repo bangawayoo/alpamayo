@@ -11,6 +11,7 @@ from alpamayo_r1.training.advantage_conditioning import (
     AdvCondDataset,
     build_conditioned_sequence,
     compute_value_targets,
+    precompute_conditioned_sequences,
     train_segment_value_head,
 )
 from alpamayo_r1.training.selfplay_loop import RolloutReplayBuffer, ScenePartitioner
@@ -250,22 +251,74 @@ class TestAdvCondDataset:
             {"i_obs": True, "i_traj": True},
             {"i_obs": False, "i_traj": False},
         ]
-        ds = AdvCondDataset(
-            rollouts,
-            labels,
-            FAKE_ADV_TOKEN_IDS,
-            p_drop=0.0,
+        precomputed = precompute_conditioned_sequences(
+            rollouts, labels, FAKE_ADV_TOKEN_IDS,
             traj_future_start_id=FAKE_TRAJ_START_ID,
         )
+        ds = AdvCondDataset(rollouts, precomputed, p_drop=0.0)
         assert len(ds) == 2
         item0 = ds[0]
         assert "input_ids" in item0
         assert "labels" in item0
         assert "is_unconditional" in item0
 
+    def test_precomputed_matches_build(self):
+        """Pre-computed sequences should match build_conditioned_sequence output."""
+        rollouts = [
+            {"prompt_ids": [1, 2], "completion_ids": [10, FAKE_TRAJ_START_ID, 20]},
+            {"prompt_ids": [3, 4], "completion_ids": [12, FAKE_TRAJ_START_ID, 22]},
+        ]
+        labels = [
+            {"i_obs": True, "i_traj": True},
+            {"i_obs": False, "i_traj": False},
+        ]
+
+        precomputed = precompute_conditioned_sequences(
+            rollouts, labels, FAKE_ADV_TOKEN_IDS,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+        )
+        ds = AdvCondDataset(rollouts, precomputed, p_drop=0.0)
+
+        for i, (rollout, label) in enumerate(zip(rollouts, labels)):
+            expected = build_conditioned_sequence(
+                prompt_ids=rollout["prompt_ids"],
+                completion_ids=rollout["completion_ids"],
+                i_obs=label["i_obs"],
+                i_traj=label["i_traj"],
+                adv_token_ids=FAKE_ADV_TOKEN_IDS,
+                traj_future_start_id=FAKE_TRAJ_START_ID,
+                p_drop=0.0,
+            )
+            item = ds[i]
+            assert item["input_ids"] == expected["input_ids"], f"input_ids mismatch at {i}"
+            assert item["labels"] == expected["labels"], f"labels mismatch at {i}"
+            assert item["attention_mask"] == expected["attention_mask"]
+            assert item["is_unconditional"] == expected["is_unconditional"]
+            assert item["completion_prefix"] == expected["completion_prefix"]
+
+    def test_dropout(self):
+        """p_drop should make all-positive samples unconditional."""
+        rollouts = [
+            {"prompt_ids": [1, 2], "completion_ids": [10, FAKE_TRAJ_START_ID, 20]},
+        ]
+        labels = [{"i_obs": True, "i_traj": True}]
+
+        precomputed = precompute_conditioned_sequences(
+            rollouts, labels, FAKE_ADV_TOKEN_IDS,
+            traj_future_start_id=FAKE_TRAJ_START_ID,
+        )
+        assert precomputed[0]["is_all_positive"] is True
+
+        # With p_drop=1.0, all-positive samples should always be unconditional
+        ds = AdvCondDataset(rollouts, precomputed, p_drop=1.0)
+        item = ds[0]
+        assert item["is_unconditional"] is True
+        # Unconditional: no advantage tokens, so input_ids = prompt + completion
+        assert item["input_ids"] == [1, 2, 10, FAKE_TRAJ_START_ID, 20]
+
     def test_mismatched_lengths_raises(self):
         with pytest.raises(ValueError, match="Mismatched lengths"):
-            AdvCondDataset([{"prompt_ids": [1], "completion_ids": [2]}], [], FAKE_ADV_TOKEN_IDS)
+            AdvCondDataset([{"prompt_ids": [1], "completion_ids": [2]}], [])
 
 
 class TestAdvTokenStrings:
