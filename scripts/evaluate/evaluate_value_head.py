@@ -56,7 +56,8 @@ from alpamayo_r1.training.rewards import (
     reasoning_quality_reward,
     trajectory_quality_reward,
 )
-from alpamayo_r1.training.value_head import SceneValueHead
+from alpamayo_r1.training.sft_rollout import _compute_batch_logprobs, _extract_segment_hidden
+from alpamayo_r1.training.value_head import SceneValueHead, SegmentValueHead
 
 # Reward weights (from grpo_default.yaml)
 TRAJ_WEIGHT = 0.50
@@ -81,8 +82,9 @@ def project_ego_to_pixels(
 
     pixels = cam_model.ray2pixel(p_cam)
 
-    valid = in_front.copy()
-    for i in range(len(pixels)):
+    valid = in_front.flatten().copy()
+    pixels = pixels.reshape(-1, 2) if pixels.ndim > 2 else pixels
+    for i in range(len(valid)):
         if valid[i] and cam_model.is_out_of_bounds(pixels[i]):
             valid[i] = False
 
@@ -126,33 +128,72 @@ def _lat_to_color_array(labels: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def compute_scene_h0(
-    model: AlpamayoR1,
-    model_inputs: dict,
-    device: str,
-) -> torch.Tensor:
-    """Extract VLM hidden state at the last prompt token.
 
-    Mirrors the training pipeline: fuses history trajectory tokens into
-    the prompt before running the VLM forward, then takes the hidden
-    state at the last prompt position.
+def compute_segment_values(
+    model: AlpamayoR1,
+    value_head: SceneValueHead,
+    model_inputs: dict,
+    completion_ids: list[int],
+    device: str,
+) -> dict:
+    """Compute obs-level and trajectory-level value predictions.
+
+    Runs a teacher-forced VLM forward to extract hidden states at segment
+    boundaries, then evaluates the value head at both obs and traj levels.
 
     Returns:
-        h0: shape (1, hidden_dim), float32, on CPU.
+        Dict with v_obs, v_traj_mean, v_traj_per_step, and segment_map.
     """
     from alpamayo_r1.inference import prepare_vlm_inputs
 
     input_ids, gen_kwargs = prepare_vlm_inputs(model, model_inputs)
+    prompt_len = input_ids.shape[1]
 
-    with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
-        outputs = model.vlm(
-            input_ids=input_ids,
-            output_hidden_states=True,
-            **gen_kwargs,
-        )
+    logprob_result = _compute_batch_logprobs(
+        model, model_inputs, input_ids, [completion_ids],
+        prompt_len, device, mini_batch_size=1, output_hidden_states=True,
+    )
+    _, batch_hidden = logprob_result
+    hidden_states = batch_hidden[0]  # (1, 1+comp_len, D)
 
-    h0 = outputs.hidden_states[-1][:, -1, :].float().cpu()
-    return h0
+    seg_hidden, seg_map = _extract_segment_hidden(
+        hidden_states, completion_ids,
+        model.special_token_ids,
+        model.config.traj_token_start_idx,
+        model.config.traj_vocab_size,
+    )
+
+    vh_device = next(value_head.parameters()).device
+
+    # Obs-level value
+    h_obs = seg_hidden["h_obs"].to(vh_device)  # (1, D)
+    with torch.no_grad():
+        v_obs = value_head(h_obs, level=SegmentValueHead.LEVEL_OBS).item()
+
+    # Trajectory-level values (curvature positions only, matching training)
+    h_traj = seg_hidden["h_traj"]  # (T_traj, D)
+    T_traj = seg_map["traj_len"]
+    v_traj_mean = 0.0
+    v_traj_per_step = []
+
+    if T_traj > 0:
+        curv_idx = torch.arange(1, T_traj, 2)
+        if len(curv_idx) > 0:
+            h_traj_curv = h_traj[curv_idx].to(vh_device)  # (T_curv, D)
+            traj_pos = (curv_idx // 2 + SegmentValueHead.POS_TRAJ_START).to(vh_device)
+            with torch.no_grad():
+                v_traj = value_head(
+                    h_traj_curv, level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos,
+                )
+            v_traj_per_step = v_traj.cpu().tolist()
+            v_traj_mean = float(v_traj.mean().item())
+
+    return {
+        "v_obs": v_obs,
+        "v_traj_mean": v_traj_mean,
+        "v_traj_per_step": v_traj_per_step,
+        "segment_map": seg_map,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +215,10 @@ def evaluate_sample(
     device: str,
 ) -> dict | None:
     """Run inference on one clip, compute value prediction and actual reward."""
+    from alpamayo_r1.inference import generate_coc, prepare_vlm_inputs
+    from alpamayo_r1.models.alpamayo_r1 import decode_vlm_trajectories
+    from alpamayo_r1.models.token_utils import extract_text_tokens
+
     try:
         data = load_physical_aiavdataset(
             clip_id=clip_id, t0_us=t0_us, avdi=avdi, maybe_stream=True,
@@ -184,22 +229,46 @@ def evaluate_sample(
 
     try:
         model_inputs = helper.prepare_model_inputs(data, processor, device)
+        input_ids, gen_kwargs = prepare_vlm_inputs(model, model_inputs)
+        prompt_len = input_ids.shape[1]
 
-        # 1. Extract h0 and predict value
-        h0 = compute_scene_h0(model, model_inputs, device)
-        with torch.no_grad():
-            v_pred = value_head(h0.to(value_head.net[0].weight.device)).item()
-
-        # 2. Run VLM inference
+        # 1. Run VLM generation (captures raw sequences for value head)
+        max_new_tokens = 256 + model.config.tokens_per_future_traj + 10
         with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
-            pred_xyz, _pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
-                data=model_inputs,
-                top_p=top_p,
-                temperature=temperature,
-                num_traj_samples=num_traj_samples,
-                max_generation_length=256,
-                return_extra=True,
+            vlm_output = generate_coc(
+                model, input_ids, gen_kwargs,
+                mode="vlm", temperature=temperature, top_p=top_p,
+                num_samples=num_traj_samples,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=model.tokenizer.pad_token_id,
             )
+
+        # Decode trajectories
+        ego_history_xyz = model_inputs["ego_history_xyz"]
+        ego_history_rot = model_inputs["ego_history_rot"]
+        hist_xyz_rep = ego_history_xyz.repeat(num_traj_samples, 1, 1, 1)
+        hist_rot_rep = ego_history_rot.repeat(num_traj_samples, 1, 1, 1, 1)
+        pred_xyz, pred_rot = decode_vlm_trajectories(
+            model, vlm_output, hist_xyz_rep, hist_rot_rep,
+        )
+        pred_xyz = pred_xyz.unsqueeze(0).unsqueeze(0)  # (1, 1, S, T, 3)
+
+        # Extract CoC text
+        extra = extract_text_tokens(model.tokenizer, vlm_output)
+
+        # 2. Compute segment-level values from first completion
+        first_gen_ids = vlm_output[0, prompt_len:].cpu().tolist()
+        # Strip padding
+        pad_id = model.tokenizer.pad_token_id
+        while first_gen_ids and first_gen_ids[-1] == pad_id:
+            first_gen_ids.pop()
+
+        seg_values = compute_segment_values(
+            model, value_head, model_inputs, first_gen_ids, device,
+        )
+        v_obs = seg_values["v_obs"]
+        v_traj_mean = seg_values["v_traj_mean"]
+
     except Exception as e:
         print(f"  inference failed: {e}")
         return None
@@ -238,26 +307,54 @@ def evaluate_sample(
         pred_xyz=per_sample_preds,
     )
 
-    traj_mean = float(np.mean(traj_r))
+    traj_r_scalar = float(np.mean(traj_r))
     reason_mean = float(np.mean(reason_r))
     consist_mean = float(np.mean(consist_r))
     composite = (
-        TRAJ_WEIGHT * traj_mean
+        TRAJ_WEIGHT * traj_r_scalar
         + REASONING_WEIGHT * reason_mean
         + CONSISTENCY_WEIGHT * consist_mean
     )
+
+    # 4. Compute return targets G(s_obs) and G(s_traj) to match training
+    # G(s_obs) = w_reason * r_reason + sum(w_traj * r_per_step_j + w_consist * r_consist)
+    # G(s_traj_j) = cumulative reward from position j to end
+    T_traj = seg_values["segment_map"]["traj_len"]
+    if T_traj > 0:
+        # Uniform per-step reward split, matching sft_rollout.py compute_rewards
+        r_per_step = [traj_r_scalar / max(T_traj, 1)] * T_traj
+        r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
+        r_traj_weighted = TRAJ_WEIGHT * r_per_step_t
+        r_traj_weighted[-1] = r_traj_weighted[-1] + CONSISTENCY_WEIGHT * consist_mean
+        g_traj_all = torch.flip(
+            torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0]
+        )
+        curv_idx = torch.arange(1, T_traj, 2)
+        g_traj_curv = g_traj_all[curv_idx].tolist() if len(curv_idx) > 0 else []
+        g_traj_mean = float(np.mean(g_traj_curv)) if g_traj_curv else 0.0
+        traj_total = r_traj_weighted.sum().item()
+    else:
+        g_traj_curv = []
+        g_traj_mean = 0.0
+        traj_total = 0.0
+
+    g_obs = REASONING_WEIGHT * reason_mean + traj_total
 
     # Meta-action summary from ground truth
     gt_summary = extract_meta_actions_summary(gt)
 
     return {
         "clip_id": clip_id,
-        "v_pred": v_pred,
+        "v_obs": v_obs,
+        "g_obs": g_obs,
+        "v_traj_mean": v_traj_mean,
+        "g_traj_mean": g_traj_mean,
+        "v_traj_per_step": seg_values["v_traj_per_step"],
+        "g_traj_per_step": g_traj_curv,
         "composite_reward": composite,
-        "traj_reward": traj_mean,
+        "traj_reward": traj_r_scalar,
         "reasoning_reward": reason_mean,
         "consistency_reward": consist_mean,
-        "residual": v_pred - composite,
         "gt_summary_lon": gt_summary.longitudinal,
         "gt_summary_lat": gt_summary.lateral,
         "pred_samples_np": pred_samples,
@@ -283,9 +380,8 @@ def plot_sample_with_value(
     data = result["data"]
     gt = result["gt_np"]
     pred = result["pred_samples_np"][0]  # best/first sample for visualization
-    v_pred = result["v_pred"]
-    composite = result["composite_reward"]
-    residual = result["residual"]
+    v_obs = result["v_obs"]
+    g_obs = result["g_obs"]
     T = gt.shape[0]
 
     meta = extract_meta_actions(gt)
@@ -336,11 +432,14 @@ def plot_sample_with_value(
         ax_img.plot(hpx[:, 0], hpx[:, 1], color="gray", alpha=0.6, linewidth=2.5, zorder=3)
 
     # Value annotation box
-    color = "#44BB44" if abs(residual) < 0.15 else ("#FF8844" if abs(residual) < 0.3 else "#FF4444")
+    obs_residual = v_obs - g_obs
+    color = "#44BB44" if abs(obs_residual) < 0.15 else (
+        "#FF8844" if abs(obs_residual) < 0.3 else "#FF4444"
+    )
     value_text = (
-        f"V(scene): {v_pred:.3f}\n"
-        f"Actual:   {composite:.3f}\n"
-        f"Residual: {residual:+.3f}"
+        f"V_obs:  {v_obs:.3f}\n"
+        f"G_obs:  {g_obs:.3f}\n"
+        f"res:    {obs_residual:+.3f}"
     )
     ax_img.text(
         0.02, 0.98, value_text, transform=ax_img.transAxes,
@@ -412,9 +511,8 @@ def plot_sample_with_value(
 
     # Stats box on BEV
     stats_text = (
-        f"V(scene):  {v_pred:.3f}\n"
-        f"Actual:    {composite:.3f}\n"
-        f"Residual:  {residual:+.3f}\n"
+        f"v_obs:   {result['v_obs']:.3f}  G_obs:  {result['g_obs']:.3f}\n"
+        f"v_traj:  {result['v_traj_mean']:.3f}  G_traj: {result['g_traj_mean']:.3f}\n"
         f"\n"
         f"traj_r:    {result['traj_reward']:.3f}\n"
         f"reason_r:  {result['reasoning_reward']:.3f}\n"
@@ -431,7 +529,7 @@ def plot_sample_with_value(
     )
 
     fig.suptitle(
-        f"V={v_pred:.3f}  vs  R={composite:.3f}  |  {summary.longitudinal} + {summary.lateral}",
+        f"V_obs={v_obs:.3f} G_obs={g_obs:.3f}  |  {summary.longitudinal} + {summary.lateral}",
         fontsize=14, fontweight="bold", y=1.02,
     )
     fig.tight_layout()
@@ -444,104 +542,222 @@ def plot_sample_with_value(
 # ---------------------------------------------------------------------------
 
 
+def _traj_per_step_stats(results: list[dict]) -> dict:
+    """Compute per-step traj V vs G statistics with early/mid/late breakdown.
+
+    Pools per-step values across all samples and splits curvature positions
+    into three equal-sized bins (early/mid/late in the trajectory).
+    """
+    all_v = []
+    all_g = []
+    all_pos = []
+    for r in results:
+        v_steps = r["v_traj_per_step"]
+        g_steps = r["g_traj_per_step"]
+        if not v_steps or not g_steps:
+            continue
+        n = min(len(v_steps), len(g_steps))
+        all_v.extend(v_steps[:n])
+        all_g.extend(g_steps[:n])
+        all_pos.extend(range(n))
+
+    if len(all_v) < 3:
+        return {"per_step_n": len(all_v)}
+
+    all_v = np.array(all_v)
+    all_g = np.array(all_g)
+    all_pos = np.array(all_pos)
+    n_curv = int(all_pos.max()) + 1
+
+    # Overall per-step correlation
+    overall_r, overall_p = stats.pearsonr(all_v, all_g)
+    overall_mse = float(np.mean((all_v - all_g) ** 2))
+
+    # Split into early (first third), mid, late (last third) by position
+    third = max(1, n_curv // 3)
+    bins = {
+        "early": all_pos < third,
+        "mid": (all_pos >= third) & (all_pos < 2 * third),
+        "late": all_pos >= 2 * third,
+    }
+
+    bin_stats = {}
+    for name, mask in bins.items():
+        if mask.sum() < 2:
+            bin_stats[name] = {"n": int(mask.sum()), "r": 0.0, "mse": 0.0,
+                               "v_mean": 0.0, "g_mean": 0.0}
+            continue
+        bv, bg = all_v[mask], all_g[mask]
+        r_val, _ = stats.pearsonr(bv, bg)
+        bin_stats[name] = {
+            "n": int(mask.sum()),
+            "r": float(r_val),
+            "mse": float(np.mean((bv - bg) ** 2)),
+            "v_mean": float(bv.mean()),
+            "g_mean": float(bg.mean()),
+        }
+
+    return {
+        "per_step_n": len(all_v),
+        "per_step_pearson_r": float(overall_r),
+        "per_step_pearson_p": float(overall_p),
+        "per_step_mse": overall_mse,
+        "n_curv_positions": n_curv,
+        "bins": bin_stats,
+        "all_v": all_v,
+        "all_g": all_g,
+        "all_pos": all_pos,
+    }
+
+
 def plot_correlation(results: list[dict], output_path: Path):
-    """Scatter plot of V(scene) vs actual composite reward with regression line."""
-    v_preds = [r["v_pred"] for r in results]
-    actuals = [r["composite_reward"] for r in results]
+    """Scatter plots of V vs G at obs and traj levels with per-step breakdown."""
+    v_obs = [r["v_obs"] for r in results]
+    g_obs = [r["g_obs"] for r in results]
+    v_traj = [r["v_traj_mean"] for r in results]
+    g_traj = [r["g_traj_mean"] for r in results]
 
-    pearson_r, pearson_p = stats.pearsonr(v_preds, actuals)
-    spearman_r, spearman_p = stats.spearmanr(v_preds, actuals)
-    mse = float(np.mean([(v - a) ** 2 for v, a in zip(v_preds, actuals)]))
+    obs_pearson, obs_p = stats.pearsonr(v_obs, g_obs)
+    obs_spearman, _ = stats.spearmanr(v_obs, g_obs)
+    obs_mse = float(np.mean([(v - g) ** 2 for v, g in zip(v_obs, g_obs)]))
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    has_traj = any(v != 0.0 or g != 0.0 for v, g in zip(v_traj, g_traj))
+    if has_traj:
+        traj_pearson, traj_p = stats.pearsonr(v_traj, g_traj)
+        traj_spearman, _ = stats.spearmanr(v_traj, g_traj)
+        traj_mse = float(np.mean([(v - g) ** 2 for v, g in zip(v_traj, g_traj)]))
+    else:
+        traj_pearson = traj_mse = 0.0
 
-    # --- Panel 1: V(scene) vs Composite Reward ---
-    ax = axes[0]
-    ax.scatter(actuals, v_preds, c="#4488FF", s=60, alpha=0.7, edgecolors="white", linewidths=0.5)
+    traj_step_stats = _traj_per_step_stats(results)
 
-    # Perfect prediction line
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+    # --- Panel 1: V_obs vs G_obs ---
+    ax = axes[0, 0]
+    ax.scatter(g_obs, v_obs, c="#4488FF", s=60, alpha=0.7, edgecolors="white", linewidths=0.5)
     lims = [
-        min(min(actuals), min(v_preds)) - 0.05,
-        max(max(actuals), max(v_preds)) + 0.05,
+        min(min(g_obs), min(v_obs)) - 0.05,
+        max(max(g_obs), max(v_obs)) + 0.05,
     ]
     ax.plot(lims, lims, "--", color="gray", alpha=0.5, label="Perfect prediction")
-
-    # Regression line
-    if len(actuals) > 2:
-        slope, intercept = np.polyfit(actuals, v_preds, 1)
+    if len(g_obs) > 2:
+        slope, intercept = np.polyfit(g_obs, v_obs, 1)
         x_fit = np.linspace(lims[0], lims[1], 100)
         ax.plot(x_fit, slope * x_fit + intercept, "-", color="red", alpha=0.7, label="Linear fit")
-
-    ax.set_xlabel("Actual Composite Reward", fontsize=11)
-    ax.set_ylabel("V(scene) Prediction", fontsize=11)
-    ax.set_title("Value Head Calibration", fontsize=12, fontweight="bold")
+    ax.set_xlabel("G(s_obs)", fontsize=11)
+    ax.set_ylabel("V(s_obs)", fontsize=11)
+    ax.set_title("Obs-Level Calibration", fontsize=12, fontweight="bold")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
-
-    stats_text = (
-        f"Pearson r:  {pearson_r:.3f} (p={pearson_p:.2e})\n"
-        f"Spearman r: {spearman_r:.3f} (p={spearman_p:.2e})\n"
-        f"MSE:        {mse:.4f}\n"
-        f"N:          {len(results)}"
-    )
     ax.text(
-        0.03, 0.97, stats_text, transform=ax.transAxes,
-        fontsize=9, fontfamily="monospace", verticalalignment="top",
+        0.03, 0.97,
+        f"Pearson r:  {obs_pearson:.3f} (p={obs_p:.2e})\n"
+        f"Spearman r: {obs_spearman:.3f}\n"
+        f"MSE:        {obs_mse:.4f}\nN:          {len(results)}",
+        transform=ax.transAxes, fontsize=9, fontfamily="monospace",
+        verticalalignment="top",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9),
     )
 
-    # --- Panel 2: Residual histogram ---
-    ax2 = axes[1]
-    residuals = [r["residual"] for r in results]
-    ax2.hist(residuals, bins=15, color="#4488FF", alpha=0.7, edgecolor="white")
-    ax2.axvline(0, color="red", linestyle="--", alpha=0.7)
-    ax2.set_xlabel("Residual (V - R)", fontsize=11)
-    ax2.set_ylabel("Count", fontsize=11)
-    ax2.set_title("Residual Distribution", fontsize=12, fontweight="bold")
+    # --- Panel 2: V_traj vs G_traj (per-step, colored by position) ---
+    ax2 = axes[0, 1]
+    if "all_v" in traj_step_stats:
+        sc = ax2.scatter(
+            traj_step_stats["all_g"], traj_step_stats["all_v"],
+            c=traj_step_stats["all_pos"], cmap="viridis",
+            s=30, alpha=0.6, edgecolors="white", linewidths=0.3,
+        )
+        plt.colorbar(sc, ax=ax2, label="Curvature position (0=early)")
+        all_vals = np.concatenate([traj_step_stats["all_g"], traj_step_stats["all_v"]])
+        lims2 = [all_vals.min() - 0.05, all_vals.max() + 0.05]
+        ax2.plot(lims2, lims2, "--", color="gray", alpha=0.5)
+        ax2.text(
+            0.03, 0.97,
+            f"Per-step r: {traj_step_stats['per_step_pearson_r']:.3f}\n"
+            f"MSE:        {traj_step_stats['per_step_mse']:.4f}\n"
+            f"N:          {traj_step_stats['per_step_n']}",
+            transform=ax2.transAxes, fontsize=9, fontfamily="monospace",
+            verticalalignment="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9),
+        )
+    ax2.set_xlabel("G(s_traj) per step", fontsize=11)
+    ax2.set_ylabel("V(s_traj) per step", fontsize=11)
+    ax2.set_title("Traj Per-Step Calibration", fontsize=12, fontweight="bold")
     ax2.grid(True, alpha=0.3)
 
-    res_stats = (
-        f"mean: {np.mean(residuals):+.3f}\n"
-        f"std:  {np.std(residuals):.3f}"
-    )
-    ax2.text(
-        0.97, 0.97, res_stats, transform=ax2.transAxes,
-        fontsize=9, fontfamily="monospace", verticalalignment="top",
-        horizontalalignment="right",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9),
-    )
+    # --- Panel 3: Early/mid/late breakdown bar chart ---
+    ax3 = axes[1, 0]
+    if "bins" in traj_step_stats:
+        bin_names = ["early", "mid", "late"]
+        bin_labels = []
+        bin_r = []
+        bin_mse = []
+        bin_v_means = []
+        bin_g_means = []
+        for name in bin_names:
+            b = traj_step_stats["bins"].get(name, {})
+            bin_labels.append(f"{name}\n(n={b.get('n', 0)})")
+            bin_r.append(b.get("r", 0.0))
+            bin_mse.append(b.get("mse", 0.0))
+            bin_v_means.append(b.get("v_mean", 0.0))
+            bin_g_means.append(b.get("g_mean", 0.0))
 
-    # --- Panel 3: V(scene) vs individual reward components ---
-    ax3 = axes[2]
-    traj_vals = [r["traj_reward"] for r in results]
-    reason_vals = [r["reasoning_reward"] for r in results]
-    consist_vals = [r["consistency_reward"] for r in results]
+        x = np.arange(len(bin_names))
+        w = 0.35
+        ax3.bar(x - w / 2, bin_g_means, w, label="G (target)", color="#4488FF", alpha=0.7)
+        ax3.bar(x + w / 2, bin_v_means, w, label="V (predicted)", color="#FF4444", alpha=0.7)
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(bin_labels)
+        ax3.set_ylabel("Mean value", fontsize=11)
+        ax3.set_title("V vs G by Trajectory Phase", fontsize=12, fontweight="bold")
+        ax3.legend(fontsize=9)
+        ax3.grid(True, alpha=0.3, axis="y")
 
-    ax3.scatter(traj_vals, v_preds, c="#FF4444", s=40, alpha=0.6, label=f"Traj (w={TRAJ_WEIGHT})")
-    ax3.scatter(reason_vals, v_preds, c="#44BB44", s=40, alpha=0.6, label=f"Reason (w={REASONING_WEIGHT})")
-    ax3.scatter(consist_vals, v_preds, c="#4488FF", s=40, alpha=0.6, label=f"Consist (w={CONSISTENCY_WEIGHT})")
-    ax3.set_xlabel("Component Reward", fontsize=11)
-    ax3.set_ylabel("V(scene) Prediction", fontsize=11)
-    ax3.set_title("V(scene) vs Reward Components", fontsize=12, fontweight="bold")
-    ax3.legend(fontsize=9)
-    ax3.grid(True, alpha=0.3)
+        # Annotate with correlation
+        for i, name in enumerate(bin_names):
+            b = traj_step_stats["bins"].get(name, {})
+            ax3.text(
+                i, max(bin_g_means[i], bin_v_means[i]) + 0.02,
+                f"r={b.get('r', 0):.2f}", ha="center", fontsize=8,
+            )
+
+    # --- Panel 4: Residual histograms ---
+    ax4 = axes[1, 1]
+    obs_residuals = [v - g for v, g in zip(v_obs, g_obs)]
+    ax4.hist(obs_residuals, bins=15, color="#4488FF", alpha=0.7, edgecolor="white", label="Obs")
+    if has_traj:
+        traj_residuals = [v - g for v, g in zip(v_traj, g_traj)]
+        ax4.hist(traj_residuals, bins=15, color="#FF4444", alpha=0.5, edgecolor="white", label="Traj (mean)")
+    ax4.axvline(0, color="black", linestyle="--", alpha=0.5)
+    ax4.set_xlabel("Residual (V - G)", fontsize=11)
+    ax4.set_ylabel("Count", fontsize=11)
+    ax4.set_title("Residual Distribution", fontsize=12, fontweight="bold")
+    ax4.legend(fontsize=9)
+    ax4.grid(True, alpha=0.3)
 
     fig.suptitle(
-        f"Value Head Evaluation  |  Pearson r={pearson_r:.3f}  |  MSE={mse:.4f}",
-        fontsize=14, fontweight="bold", y=1.03,
+        f"Value Head Evaluation  |  Obs r={obs_pearson:.3f}  "
+        f"Traj per-step r={traj_step_stats.get('per_step_pearson_r', 0):.3f}",
+        fontsize=14, fontweight="bold", y=1.02,
     )
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     return {
-        "pearson_r": pearson_r,
-        "pearson_p": pearson_p,
-        "spearman_r": spearman_r,
-        "spearman_p": spearman_p,
-        "mse": mse,
-        "residual_mean": float(np.mean(residuals)),
-        "residual_std": float(np.std(residuals)),
+        "obs_pearson_r": obs_pearson,
+        "obs_pearson_p": obs_p,
+        "obs_spearman_r": obs_spearman,
+        "obs_mse": obs_mse,
+        "obs_residual_mean": float(np.mean(obs_residuals)),
+        "obs_residual_std": float(np.std(obs_residuals)),
+        "traj_mean_pearson_r": traj_pearson,
+        "traj_mean_mse": traj_mse,
+        "traj_per_step": {
+            k: v for k, v in traj_step_stats.items()
+            if k not in ("all_v", "all_g", "all_pos")
+        },
     }
 
 
@@ -642,8 +858,8 @@ def main():
             continue
 
         tqdm.write(
-            f"  V={result['v_pred']:.3f}  R={result['composite_reward']:.3f}  "
-            f"res={result['residual']:+.3f}  "
+            f"  obs: V={result['v_obs']:.3f} G={result['g_obs']:.3f}  "
+            f"traj: V={result['v_traj_mean']:.3f} G={result['g_traj_mean']:.3f}  "
             f"({result['gt_summary_lon']} + {result['gt_summary_lat']})"
         )
 
@@ -663,12 +879,15 @@ def main():
         # Plot individual sample
         out_path = (
             output_dir
-            / f"{i:02d}_V{result['v_pred']:.2f}_R{result['composite_reward']:.2f}"
+            / f"{i:02d}_Vobs{result['v_obs']:.2f}_Gobs{result['g_obs']:.2f}"
             f"_{result['gt_summary_lon']}_{result['gt_summary_lat']}"
             f"_{clip_id[:8]}.png"
         )
-        plot_sample_with_value(result, clip_cam_model, clip_cam_pose, out_path)
-        tqdm.write(f"  -> {out_path.name}")
+        try:
+            plot_sample_with_value(result, clip_cam_model, clip_cam_pose, out_path)
+            tqdm.write(f"  -> {out_path.name}")
+        except Exception as e:
+            tqdm.write(f"  plot failed: {e}")
 
         results.append(result)
 
@@ -686,23 +905,47 @@ def main():
     print("  VALUE HEAD EVALUATION SUMMARY")
     print("=" * 60)
     print(f"  Samples evaluated: {len(results)}")
-    print(f"  Pearson r:         {corr_stats['pearson_r']:.4f}  (p={corr_stats['pearson_p']:.2e})")
-    print(f"  Spearman r:        {corr_stats['spearman_r']:.4f}  (p={corr_stats['spearman_p']:.2e})")
-    print(f"  MSE:               {corr_stats['mse']:.4f}")
-    print(f"  Residual mean:     {corr_stats['residual_mean']:+.4f}")
-    print(f"  Residual std:      {corr_stats['residual_std']:.4f}")
+    print("  --- Obs level ---")
+    print(f"  Pearson r:         {corr_stats['obs_pearson_r']:.4f}  (p={corr_stats['obs_pearson_p']:.2e})")
+    print(f"  Spearman r:        {corr_stats['obs_spearman_r']:.4f}")
+    print(f"  MSE:               {corr_stats['obs_mse']:.4f}")
+    print(f"  Residual mean:     {corr_stats['obs_residual_mean']:+.4f}")
+    print(f"  Residual std:      {corr_stats['obs_residual_std']:.4f}")
+    print("  --- Traj level (per-sample mean) ---")
+    print(f"  Pearson r:         {corr_stats['traj_mean_pearson_r']:.4f}")
+    print(f"  MSE:               {corr_stats['traj_mean_mse']:.4f}")
+    tps = corr_stats.get("traj_per_step", {})
+    if "per_step_pearson_r" in tps:
+        print("  --- Traj level (per-step, pooled) ---")
+        print(f"  Pearson r:         {tps['per_step_pearson_r']:.4f}")
+        print(f"  MSE:               {tps['per_step_mse']:.4f}")
+        print(f"  N points:          {tps['per_step_n']}")
+        if "bins" in tps:
+            for phase in ("early", "mid", "late"):
+                b = tps["bins"].get(phase, {})
+                print(
+                    f"    {phase:5s}: r={b.get('r', 0):.3f}  "
+                    f"MSE={b.get('mse', 0):.4f}  "
+                    f"V_mean={b.get('v_mean', 0):.3f}  "
+                    f"G_mean={b.get('g_mean', 0):.3f}  "
+                    f"(n={b.get('n', 0)})"
+                )
 
     # Save JSON results (strip non-serializable fields)
     json_results = []
     for r in results:
         json_results.append({
             "clip_id": r["clip_id"],
-            "v_pred": r["v_pred"],
+            "v_obs": r["v_obs"],
+            "g_obs": r["g_obs"],
+            "v_traj_mean": r["v_traj_mean"],
+            "g_traj_mean": r["g_traj_mean"],
+            "v_traj_per_step": r["v_traj_per_step"],
+            "g_traj_per_step": r["g_traj_per_step"],
             "composite_reward": r["composite_reward"],
             "traj_reward": r["traj_reward"],
             "reasoning_reward": r["reasoning_reward"],
             "consistency_reward": r["consistency_reward"],
-            "residual": r["residual"],
             "gt_summary_lon": r["gt_summary_lon"],
             "gt_summary_lat": r["gt_summary_lat"],
             "coc_text": r["coc_text"],
