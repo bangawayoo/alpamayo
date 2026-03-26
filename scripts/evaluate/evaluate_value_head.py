@@ -133,21 +133,22 @@ def compute_scene_h0(
 ) -> torch.Tensor:
     """Extract VLM hidden state at the last prompt token.
 
-    This mirrors _compute_scene_h0 from rollout.py but works with the
-    standard inference input format.
+    Mirrors the training pipeline: fuses history trajectory tokens into
+    the prompt before running the VLM forward, then takes the hidden
+    state at the last prompt position.
 
     Returns:
         h0: shape (1, hidden_dim), float32, on CPU.
     """
-    tokenized = model_inputs["tokenized_data"]
-    input_ids = tokenized["input_ids"]
-    forward_kwargs = {k: v for k, v in tokenized.items() if k != "input_ids"}
+    from alpamayo_r1.inference import prepare_vlm_inputs
+
+    input_ids, gen_kwargs = prepare_vlm_inputs(model, model_inputs)
 
     with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
         outputs = model.vlm(
             input_ids=input_ids,
             output_hidden_states=True,
-            **forward_kwargs,
+            **gen_kwargs,
         )
 
     h0 = outputs.hidden_states[-1][:, -1, :].float().cpu()
