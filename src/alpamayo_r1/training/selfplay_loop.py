@@ -768,6 +768,12 @@ class SelfPlayLoop:
             del rollout_results, reward_stash, segment_hidden_stash
             del completion_segment_map, g_obs, g_traj
 
+            # Periodically force garbage collection to keep CPU RAM usage
+            # stable on long runs (3000+ scenes). Without this, Python may
+            # defer collection of large intermediate objects across iterations.
+            if (i + 1) % 50 == 0:
+                gc.collect()
+
         pbar.close()
 
         # Save value head and pretrain clip IDs (rank 0 only to avoid race)
