@@ -63,7 +63,9 @@ advantage_conditioning:
   k_traj: 30                    # percentile threshold for traj-level binarization
   ema_alpha: 0.99               # EMA decay for obs-level baseline
   adv_mode: text            # "embedding" (learned AdvantageEmbedding hooks) or "text" (plain-text phrases, no hooks)
-  augment_with_gt: true         # add GT trajectory examples for negative-traj completions (two-pass)
+  augment_with_gt: true         # select bottom-k% rollouts + GT-augmented positives as training set
+  gt_augment_bottom_k: 30       # bottom k% of rollouts by a_traj to use as negatives
+  gt_augment_top_k2: 50         # top k2% of GT-augmented samples to retain by r_consist
   replay_ratio: 0.3             # fraction of training data from historical replay buffer
   replay_buffer_max_size: 50000
   reset_to_base: false          # true = reload pi_0 each iteration (RECAP), false = continue from previous iteration's weights

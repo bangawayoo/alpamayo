@@ -190,12 +190,21 @@ class RolloutReplayBuffer:
             reward_weights=reward_weights,
         )
 
-        # Update labels in buffer
+        # Update labels in buffer (skip GT-augmented entries — keep i_traj=True)
+        n_recomputed = 0
         for entry, adv in zip(self._entries, new_advantages):
+            if entry["rollout"].get("is_gt_augmented", False):
+                continue
             i_obs, i_traj = advantage_buffer.binarize(adv["a_obs"], adv["a_traj"])
             entry["adv_label"] = {"i_obs": i_obs, "i_traj": i_traj}
+            n_recomputed += 1
 
-        logger.info("Recomputed advantage labels for %d buffer entries", len(self._entries))
+        n_gt = len(self._entries) - n_recomputed
+        logger.info(
+            "Recomputed advantage labels for %d buffer entries (%d GT-augmented skipped)",
+            n_recomputed,
+            n_gt,
+        )
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -899,16 +908,16 @@ class SelfPlayLoop:
         # ----- Phase 2: EVALUATE -----
         logger.warning("Phase 2: EVALUATE — scoring and binarizing advantages")
         t0 = time.time()
-        adv_labels = self._evaluate_phase(rollout_results)
+        adv_labels, advantages = self._evaluate_phase(rollout_results)
         logger.warning("Phase 2 complete in %.1fs", time.time() - t0)
 
         # ----- Phase 2.5: GT AUGMENTATION (optional) -----
         adv_cfg = self.cfg.get("advantage_conditioning", {})
         if adv_cfg.get("augment_with_gt", False):
-            logger.info("Phase 2.5: GT AUGMENTATION — adding GT trajectory examples")
+            logger.info("Phase 2.5: GT AUGMENTATION — selecting bottom-k%% + GT positives")
             t0 = time.time()
             rollout_results, adv_labels = self._augment_negative_traj_with_gt(
-                rollout_results, adv_labels
+                rollout_results, adv_labels, advantages
             )
             logger.info("Phase 2.5 complete in %.1fs", time.time() - t0)
 
@@ -981,7 +990,9 @@ class SelfPlayLoop:
             )
         return results
 
-    def _evaluate_phase(self, rollout_results: list[dict]) -> list[dict]:
+    def _evaluate_phase(
+        self, rollout_results: list[dict]
+    ) -> tuple[list[dict], list[dict]]:
         """Score completions and binarize advantages.
 
         1. Compute rewards using reward functions
@@ -992,7 +1003,7 @@ class SelfPlayLoop:
         6. Binarize advantages into conditioning labels
 
         Returns:
-            List of dicts per completion: {i_obs, i_traj}
+            (adv_labels, advantages): binarized labels and raw advantage dicts.
         """
         from alpamayo_r1.training.sft_rollout import RolloutEngine
 
@@ -1115,38 +1126,54 @@ class SelfPlayLoop:
             len(adv_labels),
             self.advantage_buffer.compute_thresholds(),
         )
-        return adv_labels
+        return adv_labels, advantages
 
     def _augment_negative_traj_with_gt(
         self,
         rollout_results: list[dict],
         adv_labels: list[dict],
+        advantages: list[dict],
     ) -> tuple[list[dict], list[dict]]:
-        """Add GT trajectory examples for completions with negative traj advantage.
+        """Select bottom-k% rollouts and build GT-augmented positive counterparts.
 
-        For each completion where i_traj=False, builds an augmented copy that
-        keeps the same CoC but replaces trajectory tokens with GT trajectory
-        encoded from expert_fut_xyz/expert_fut_rot. The augmented completions
-        are scored through the reward pipeline and binarized normally.
+        The returned training set contains ONLY:
+        - The bottom-k% rollouts by trajectory advantage (negative examples)
+        - GT-augmented copies of those rollouts, filtered by top-k2% consistency
+          (positive trajectory examples)
+
+        All other rollouts are used for buffer/binarization only and are discarded
+        from the training set.
+
+        Args:
+            rollout_results: All rollout completions from this iteration.
+            adv_labels: Binarized advantage labels for all rollouts.
+            advantages: Raw advantage dicts ({a_obs, a_traj}) for all rollouts.
 
         Returns:
-            Updated (rollout_results, adv_labels) with augmented entries appended.
+            (train_rollouts, train_labels): The filtered training set.
         """
         from alpamayo_r1.training.sft_rollout import RolloutEngine
 
-        # 1. Find negative-traj indices
-        neg_traj_indices = [i for i, lab in enumerate(adv_labels) if not lab["i_traj"]]
-        if not neg_traj_indices:
-            logger.info("GT augmentation: no negative-traj completions, skipping")
-            return rollout_results, adv_labels
+        adv_cfg = self.cfg.get("advantage_conditioning", {})
+        bottom_k = float(adv_cfg.get("gt_augment_bottom_k", 30))
+        top_k2 = float(adv_cfg.get("gt_augment_top_k2", 50))
+
+        # 1. Select bottom-k% by trajectory advantage
+        n_total = len(rollout_results)
+        indexed_a_traj = [(i, advantages[i]["a_traj"]) for i in range(n_total)]
+        indexed_a_traj.sort(key=lambda x: x[1])
+        n_bottom = max(1, int(n_total * bottom_k / 100))
+        bottom_indices = [i for i, _ in indexed_a_traj[:n_bottom]]
 
         logger.info(
-            "GT augmentation: %d/%d completions have negative traj advantage",
-            len(neg_traj_indices),
-            len(adv_labels),
+            "GT augmentation: selected bottom %d/%d rollouts (k=%.0f%%, a_traj threshold=%.4f)",
+            n_bottom,
+            n_total,
+            bottom_k,
+            indexed_a_traj[n_bottom - 1][1] if n_bottom > 0 else 0.0,
         )
 
-        # 2. Build augmented completions with dataset GT trajectory tokens
+        # 2. Build GT-augmented copies for selected rollouts
         traj_future_start_id = self.full_model.special_token_ids["traj_future_start"]
         traj_future_end_id = self.full_model.special_token_ids["traj_future_end"]
         traj_tokenizer = self.full_model.traj_tokenizer
@@ -1155,42 +1182,38 @@ class SelfPlayLoop:
         data_cache = self._get_data_cache()
 
         augmented = []
-        for i in neg_traj_indices:
+        augmented_source_indices = []  # tracks which bottom_indices entry produced each augmented
+        for i in bottom_indices:
             r = rollout_results[i]
 
             if "clip_id" not in r or "hist_xyz" not in r:
                 continue
 
-            # Load dataset GT trajectory from cache
             clip_id = r["clip_id"]
             t0_us = r.get("t0_us", 5_100_000)
             _, ego_future_xyz = data_cache.get(clip_id, t0_us, device="cpu")
             ego_future_rot = data_cache.get_ego_future_rot(clip_id, t0_us)
 
-            hist_xyz = r["hist_xyz"].unsqueeze(0)  # (1, T, 3)
-            hist_rot = r["hist_rot"].unsqueeze(0)  # (1, T, 3, 3)
-            fut_xyz = ego_future_xyz[:, 0].cpu()  # (1, T_fut, 3)
-            fut_rot = ego_future_rot[:, 0].cpu()  # (1, T_fut, 3, 3)
+            hist_xyz = r["hist_xyz"].unsqueeze(0)
+            hist_rot = r["hist_rot"].unsqueeze(0)
+            fut_xyz = ego_future_xyz[:, 0].cpu()
+            fut_rot = ego_future_rot[:, 0].cpu()
 
-            # Encode GT trajectory into discrete tokens
             discrete_tokens = traj_tokenizer.encode(hist_xyz, hist_rot, fut_xyz, fut_rot)
             discrete_tokens = discrete_tokens.clamp(0, traj_vocab_size - 1)
             gt_traj_token_ids = (discrete_tokens + traj_token_start_idx).squeeze(0).tolist()
 
-            # Find CoC/traj boundary in original completion_ids
             completion_ids = r["completion_ids"]
             try:
                 traj_boundary = completion_ids.index(traj_future_start_id)
             except ValueError:
-                continue  # no boundary found, skip
+                continue
             coc_part = completion_ids[:traj_boundary]
 
-            # Build new completion: same CoC + GT trajectory tokens
             new_completion_ids = (
                 coc_part + [traj_future_start_id] + gt_traj_token_ids + [traj_future_end_id]
             )
 
-            # Decode GT trajectory to continuous xyz for reward computation
             pred_xyz, _, _ = traj_tokenizer.decode(hist_xyz, hist_rot, discrete_tokens)
             gt_pred_xyz = pred_xyz[0].cpu().numpy().flatten().tolist()
 
@@ -1200,19 +1223,20 @@ class SelfPlayLoop:
                     "completion_ids": new_completion_ids,
                     "pred_xyz": gt_pred_xyz,
                     "completion_prefix": coc_part + [traj_future_start_id],
-                    # Expert CFM target: use dataset GT for augmented examples
-                    "expert_fut_xyz": fut_xyz[0],  # (T_fut, 3)
-                    "expert_fut_rot": fut_rot[0],  # (T_fut, 3, 3)
+                    "expert_fut_xyz": fut_xyz[0],
+                    "expert_fut_rot": fut_rot[0],
+                    "is_gt_augmented": True,
                 }
             )
+            augmented_source_indices.append(i)
 
         if not augmented:
-            logger.info("GT augmentation: no augmented completions built, skipping")
-            return rollout_results, adv_labels
+            logger.info("GT augmentation: no augmented completions built, returning negatives only")
+            neg_rollouts = [rollout_results[i] for i in bottom_indices]
+            neg_labels = [adv_labels[i] for i in bottom_indices]
+            return neg_rollouts, neg_labels
 
-        logger.info("GT augmentation: built %d augmented completions", len(augmented))
-
-        # 3. Score augmented completions through reward pipeline
+        # 3. Score augmented completions to get consistency reward
         rollout_cfg = self.cfg.get("rollout", {})
         engine = RolloutEngine(
             full_model=self.full_model,
@@ -1223,87 +1247,65 @@ class SelfPlayLoop:
         )
         aug_rewards = engine.compute_rewards(augmented)
 
-        # Compute rewards for the original negative-traj completions for comparison
-        orig_neg = [rollout_results[i] for i in neg_traj_indices if i < len(rollout_results)]
-        orig_rewards = engine.compute_rewards(orig_neg)
-
-        # Log reward comparison: original (negative-traj) vs GT-augmented
-        for j in range(min(len(augmented), len(orig_rewards))):
-            i = neg_traj_indices[j]
-            orig_r = orig_rewards[j]
-            aug_r = aug_rewards[j]
-            clip_id = rollout_results[i]["clip_id"]
+        # Log per-sample reward comparison
+        for j, (aug_r, src_i) in enumerate(zip(aug_rewards, augmented_source_indices)):
+            clip_id = rollout_results[src_i]["clip_id"]
             logger.info(
                 "GT aug [%s] sample %d: "
-                "ORIG r_traj=%.3f r_reason=%.3f r_consist=%.3f | "
-                "AUG  r_traj=%.3f r_reason=%.3f r_consist=%.3f | "
-                "threshold=%.3f",
+                "r_traj=%.3f r_reason=%.3f r_consist=%.3f",
                 clip_id,
                 j,
-                orig_r["r_traj"],
-                orig_r["r_reason"],
-                orig_r["r_consist"],
                 aug_r["r_traj"],
                 aug_r["r_reason"],
                 aug_r["r_consist"],
-                self.advantage_buffer.compute_thresholds()[1],
             )
 
-        # 4. Compute advantages for augmented completions
-        vh_cfg = self.cfg.get("value_head", {})
-        if vh_cfg.get("enabled", False) and vh_cfg.get("segment_level", False):
-            aug_hidden, aug_seg_map = engine.extract_segment_hidden(augmented)
-            reward_weights = self._get_reward_weights()
-            value_head = self._get_or_create_value_head()
-            aug_advantages = compute_segment_advantages_from_rollouts(
-                segment_hidden_stash=aug_hidden,
-                segment_reward_stash=aug_rewards,
-                completion_segment_map=aug_seg_map,
-                value_head=value_head,
-                reward_weights=reward_weights,
-            )
-        else:
-            aug_advantages = []
-            reward_weights = self._get_reward_weights()
-            w_traj, w_reason, w_consist = reward_weights
-            for rew in aug_rewards:
-                composite = (
-                    w_traj * rew["r_traj"]
-                    + w_reason * rew["r_reason"]
-                    + w_consist * rew["r_consist"]
-                )
-                aug_advantages.append({"a_obs": composite, "a_traj": composite})
+        # 4. Filter augmented: keep top-k2% by r_consist
+        consist_scores = [(j, aug_rewards[j]["r_consist"]) for j in range(len(augmented))]
+        consist_scores.sort(key=lambda x: x[1], reverse=True)
+        n_keep = max(1, int(len(augmented) * top_k2 / 100))
+        kept_indices = [j for j, _ in consist_scores[:n_keep]]
+        kept_indices.sort()  # preserve original order
 
-        # 5. Binarize augmented advantages (using existing buffer thresholds)
-        aug_labels = []
-        for adv in aug_advantages:
-            i_obs, i_traj = self.advantage_buffer.binarize(adv["a_obs"], adv["a_traj"])
-            aug_labels.append({"i_obs": i_obs, "i_traj": i_traj})
+        filtered_augmented = [augmented[j] for j in kept_indices]
 
-        # Log per-sample advantage details
-        for j, adv in enumerate(aug_advantages):
-            lab = aug_labels[j] if j < len(aug_labels) else {}
-            logger.info(
-                "GT aug sample %d: a_obs=%.3f a_traj=%.3f → i_obs=%s i_traj=%s",
-                j,
-                adv["a_obs"],
-                adv["a_traj"],
-                lab.get("i_obs"),
-                lab.get("i_traj"),
-            )
+        # 5. Assign labels for kept augmented samples:
+        #    i_traj = True (GT trajectory, positive by construction)
+        #    i_obs = binarize from buffer (preserving independent obs semantics)
+        filtered_aug_labels = []
+        for j in kept_indices:
+            src_i = augmented_source_indices[j]
+            a_obs = advantages[src_i]["a_obs"]
+            i_obs, _ = self.advantage_buffer.binarize(a_obs, 0.0)
+            filtered_aug_labels.append({"i_obs": i_obs, "i_traj": True})
 
-        n_aug_traj_pos = sum(1 for lab in aug_labels if lab["i_traj"])
-        n_aug_all_pos = sum(1 for lab in aug_labels if lab["i_obs"] and lab["i_traj"])
-        logger.info(
-            "GT augmentation: %d/%d augmented have i_traj=pos, %d/%d all-positive",
-            n_aug_traj_pos,
-            len(aug_labels),
-            n_aug_all_pos,
-            len(aug_labels),
+        # 6. Assemble training set: negatives + filtered GT positives
+        neg_rollouts = [rollout_results[i] for i in bottom_indices]
+        neg_labels = [adv_labels[i] for i in bottom_indices]
+
+        train_rollouts = neg_rollouts + filtered_augmented
+        train_labels = neg_labels + filtered_aug_labels
+
+        # 7. Log summary
+        n_neg = len(neg_rollouts)
+        n_pos = len(filtered_augmented)
+        logger.warning(
+            "GT augmentation summary: "
+            "%d total rollouts → %d negatives (bottom %.0f%%) + %d GT positives "
+            "(%.0f%% of %d augmented passed r_consist filter, top %.0f%%) "
+            "= %d training samples (pos/neg ratio: %.2f)",
+            n_total,
+            n_neg,
+            bottom_k,
+            n_pos,
+            n_pos / max(len(augmented), 1) * 100,
+            len(augmented),
+            top_k2,
+            n_neg + n_pos,
+            n_pos / max(n_neg, 1),
         )
 
-        # 6. Merge
-        return rollout_results + augmented, adv_labels + aug_labels
+        return train_rollouts, train_labels
 
     def _train_phase(
         self,
