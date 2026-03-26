@@ -796,10 +796,14 @@ class SelfPlayLoop:
             last_loss = metrics.get("loss", float("nan"))
 
             logger.debug(
-                "Pretrain iter %d/%d done: loss=%.4f, completions=%d, vh_steps=%d",
+                "Pretrain iter %d/%d done: loss=%.4f (obs=%.4f traj=%.4f), "
+                "target_traj=%.3f, completions=%d, vh_steps=%d",
                 i + 1,
                 num_iters,
                 last_loss,
+                metrics.get("loss_obs", float("nan")),
+                metrics.get("loss_traj", float("nan")),
+                metrics.get("target_traj_mean", float("nan")),
                 len(rollout_results),
                 metrics.get("total_steps", 0),
             )
@@ -1094,7 +1098,15 @@ class SelfPlayLoop:
             if isinstance(vh_for_train, torch.nn.parallel.DistributedDataParallel):
                 del vh_for_train  # release DDP wrapper
             self._vh_global_step += vh_metrics.get("total_steps", 0)
-            logger.info("  Stage 4 (train_value_head): %.1fs (%d epochs)", time.time() - t_, vh_train_epochs)
+            logger.info(
+                "  Stage 4 (train_value_head): %.1fs (%d epochs, loss=%.4f obs=%.4f traj=%.4f, target_traj=%.3f)",
+                time.time() - t_,
+                vh_train_epochs,
+                vh_metrics.get("loss", float("nan")),
+                vh_metrics.get("loss_obs", float("nan")),
+                vh_metrics.get("loss_traj", float("nan")),
+                vh_metrics.get("target_traj_mean", float("nan")),
+            )
         else:
             # Fallback: use composite reward as a_obs, no segment-level detail
             advantages = []

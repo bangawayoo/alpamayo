@@ -629,12 +629,14 @@ def train_segment_value_head(
             total_loss.backward()
             optimizer.step()
 
+            target_traj_mean = g_flat.mean().item() if traj_h_list else 0.0
             metrics = {
                 "loss": total_loss.item(),
                 "loss_obs": loss_obs.item(),
                 "loss_traj": loss_traj.item(),
                 "pred_obs_mean": obs_pred.detach().mean().item(),
                 "target_obs_mean": g_obs_batch.mean().item(),
+                "target_traj_mean": target_traj_mean,
             }
 
             # TensorBoard: log every step
@@ -672,7 +674,7 @@ def train_segment_value_head(
     logger.debug(
         "Value head training: %d epochs, %d steps, %d samples (batch_size=%d) | "
         "loss=%.4f (obs=%.4f, traj=%.4f) | "
-        "pred_obs=%.3f target_obs=%.3f",
+        "pred_obs=%.3f target_obs=%.3f target_traj=%.3f",
         num_epochs,
         total_steps,
         B,
@@ -682,6 +684,7 @@ def train_segment_value_head(
         metrics["loss_traj"],
         metrics["pred_obs_mean"],
         metrics["target_obs_mean"],
+        metrics["target_traj_mean"],
     )
     return metrics
 
