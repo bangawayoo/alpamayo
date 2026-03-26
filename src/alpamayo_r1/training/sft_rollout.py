@@ -765,7 +765,7 @@ class RolloutEngine:
         self.stash_segment_hidden_in_results(results, per_scene_meta)
         timings["stash_hidden"] = time.time() - t_
 
-        logger.debug(
+        logger.info(
             "[vlm_only_batch] S=%d, G=%d (%d results) timings: %s | total=%.2fs",
             S,
             G,
