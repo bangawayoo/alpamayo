@@ -1096,102 +1096,58 @@ class RolloutEngine:
     def stash_segment_hidden_in_results(
         self,
         results: list[dict],
-        per_scene_meta: list[dict] | None = None,
+        per_scene_meta: list[dict],
     ) -> None:
         """Extract segment hidden states and stash them in each result dict.
 
         Runs teacher-forced VLM forward passes and stores segment_hidden +
-        segment_map directly in each result dict. This allows the evaluate
-        phase to skip the expensive re-forward by reading from the stash.
+        segment_map directly in each result dict. Called during rollout
+        where model inputs are already on GPU.
 
         Args:
             results: List of rollout result dicts (mutated in-place).
-            per_scene_meta: If provided, reuse already-prepared model inputs
-                from _prepare_scene_batch (avoids re-loading from cache).
-                Must have one entry per scene, with results ordered as
-                [scene0_g0, scene0_g1, ..., scene1_g0, ...].
+                Must be ordered as [scene0_g0, scene0_g1, ..., scene1_g0, ...].
+            per_scene_meta: Scene metadata from _prepare_scene_batch, one
+                entry per scene.
         """
-        from collections import defaultdict
-
         device = self.device
+        G = len(results) // len(per_scene_meta) if per_scene_meta else 0
 
-        if per_scene_meta is not None:
-            # Fast path: reuse already-prepared inputs from batch rollout
-            G = len(results) // len(per_scene_meta) if per_scene_meta else 0
-            for s_idx, meta in enumerate(per_scene_meta):
-                # Indices into results for this scene
-                scene_indices = list(range(s_idx * G, (s_idx + 1) * G))
-                if not scene_indices or scene_indices[-1] >= len(results):
-                    continue
+        for s_idx, meta in enumerate(per_scene_meta):
+            scene_indices = list(range(s_idx * G, (s_idx + 1) * G))
+            if not scene_indices or scene_indices[-1] >= len(results):
+                continue
 
-                clip_id = meta["clip_id"]
-                t0_us = results[scene_indices[0]].get("t0_us", 5_100_000)
-                model_inputs, _ = self.data_cache.get(clip_id, t0_us, device)
-                prompt_ids = torch.tensor([meta["prompt_ids"]], device=device, dtype=torch.long)
-                prompt_len = len(meta["prompt_ids"])
+            clip_id = meta["clip_id"]
+            t0_us = results[scene_indices[0]].get("t0_us", 5_100_000)
+            model_inputs, _ = self.data_cache.get(clip_id, t0_us, device)
+            prompt_ids = torch.tensor([meta["prompt_ids"]], device=device, dtype=torch.long)
+            prompt_len = len(meta["prompt_ids"])
 
-                comp_ids_list = [results[i]["completion_ids"] for i in scene_indices]
-                logprob_result = _compute_batch_logprobs(
-                    self.full_model,
-                    model_inputs,
-                    prompt_ids,
-                    comp_ids_list,
-                    prompt_len,
-                    device,
-                    mini_batch_size=self.logprob_mini_batch_size,
-                    output_hidden_states=True,
+            comp_ids_list = [results[i]["completion_ids"] for i in scene_indices]
+            logprob_result = _compute_batch_logprobs(
+                self.full_model,
+                model_inputs,
+                prompt_ids,
+                comp_ids_list,
+                prompt_len,
+                device,
+                mini_batch_size=self.logprob_mini_batch_size,
+                output_hidden_states=True,
+            )
+            _, batch_hidden = logprob_result
+
+            for local_idx, global_idx in enumerate(scene_indices):
+                hidden_states = batch_hidden[local_idx]
+                seg_hidden, seg_map = _extract_segment_hidden(
+                    hidden_states,
+                    results[global_idx]["completion_ids"],
+                    self.special_token_ids,
+                    self.traj_token_start_idx,
+                    self.traj_vocab_size,
                 )
-                _, batch_hidden = logprob_result
-
-                for local_idx, global_idx in enumerate(scene_indices):
-                    hidden_states = batch_hidden[local_idx]
-                    seg_hidden, seg_map = _extract_segment_hidden(
-                        hidden_states,
-                        results[global_idx]["completion_ids"],
-                        self.special_token_ids,
-                        self.traj_token_start_idx,
-                        self.traj_vocab_size,
-                    )
-                    results[global_idx]["segment_hidden"] = seg_hidden
-                    results[global_idx]["segment_map"] = seg_map
-        else:
-            # Fallback: group by clip_id and load from cache
-            scene_groups: dict[str, list[int]] = defaultdict(list)
-            for i, r in enumerate(results):
-                scene_groups[r["clip_id"]].append(i)
-
-            for clip_id, indices in scene_groups.items():
-                t0_us = results[indices[0]]["t0_us"]
-                model_inputs, _ = self.data_cache.get(clip_id, t0_us, device)
-
-                input_ids, _ = prepare_vlm_inputs(self.full_model, model_inputs)
-                prompt_len = input_ids.shape[1]
-                prompt_input_ids = input_ids.clone()
-
-                comp_ids_list = [results[i]["completion_ids"] for i in indices]
-                logprob_result = _compute_batch_logprobs(
-                    self.full_model,
-                    model_inputs,
-                    prompt_input_ids,
-                    comp_ids_list,
-                    prompt_len,
-                    device,
-                    mini_batch_size=self.logprob_mini_batch_size,
-                    output_hidden_states=True,
-                )
-                _, batch_hidden = logprob_result
-
-                for local_idx, global_idx in enumerate(indices):
-                    hidden_states = batch_hidden[local_idx]
-                    seg_hidden, seg_map = _extract_segment_hidden(
-                        hidden_states,
-                        results[global_idx]["completion_ids"],
-                        self.special_token_ids,
-                        self.traj_token_start_idx,
-                        self.traj_vocab_size,
-                    )
-                    results[global_idx]["segment_hidden"] = seg_hidden
-                    results[global_idx]["segment_map"] = seg_map
+                results[global_idx]["segment_hidden"] = seg_hidden
+                results[global_idx]["segment_map"] = seg_map
 
     def compute_rewards(self, rollout_results: list[dict]) -> list[dict]:
         """Score completions using reward functions.

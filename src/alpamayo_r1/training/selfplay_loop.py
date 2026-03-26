@@ -969,28 +969,17 @@ class SelfPlayLoop:
                 max(r_consist_vals),
             )
 
-        # 2. Extract segment hidden states (or use stash from rollout phase)
+        # 2. Read segment hidden states from rollout stash
         vh_cfg = self.cfg.get("value_head", {})
         if vh_cfg.get("enabled", False) and vh_cfg.get("segment_level", False):
             t_ = time.time()
-            if rollout_results and "segment_hidden" in rollout_results[0]:
-                # Use pre-computed stash from rollout phase
-                segment_hidden_stash = [r["segment_hidden"] for r in rollout_results]
-                completion_segment_map = [r["segment_map"] for r in rollout_results]
-                logger.info(
-                    "  Stage 2 (extract_segment_hidden): %.1fs — used rollout stash for %d completions",
-                    time.time() - t_,
-                    len(rollout_results),
-                )
-            else:
-                segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
-                    rollout_results
-                )
-                logger.info(
-                    "  Stage 2 (extract_segment_hidden): %.1fs for %d completions",
-                    time.time() - t_,
-                    len(rollout_results),
-                )
+            segment_hidden_stash = [r["segment_hidden"] for r in rollout_results]
+            completion_segment_map = [r["segment_map"] for r in rollout_results]
+            logger.info(
+                "  Stage 2 (segment_hidden from stash): %.1fs for %d completions",
+                time.time() - t_,
+                len(rollout_results),
+            )
 
             reward_weights = self._get_reward_weights()
             value_head = self._get_or_create_value_head()
