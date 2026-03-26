@@ -50,6 +50,10 @@ def trajectory_quality_reward(
     computed as the mean per-timestep L2 distance (ADE) between that trajectory
     and the ground truth, mapped to [0, 1] via a soft threshold.
 
+    Vectorized: all samples with matching trajectory lengths are batched into
+    a single NumPy operation. Samples with mismatched lengths or errors fall
+    back to per-sample computation.
+
     Args:
         completions: Generated CoC text (unused for trajectory scoring but
             required by the TRL reward function interface).
@@ -67,28 +71,44 @@ def trajectory_quality_reward(
     if pred_xyz is None or gt_xyz is None:
         return [0.0] * len(completions)
 
-    rewards: list[float] = []
-    for pred_flat, gt_flat in zip(pred_xyz, gt_xyz):
+    N = len(pred_xyz)
+    rewards = [0.0] * N
+
+    # Try to batch all samples into a single (N, T, 3) array.
+    # This works when all trajectories have the same length (common case).
+    try:
+        pred_all = np.array(pred_xyz, dtype=np.float32)  # (N, T*3) or (N, T, 3)
+        gt_all = np.array(gt_xyz, dtype=np.float32)
+
+        if pred_all.ndim == 2:
+            pred_all = pred_all.reshape(N, -1, 3)
+        if gt_all.ndim == 2:
+            gt_all = gt_all.reshape(N, -1, 3)
+
+        # Batched L2 on xy plane: (N, T)
+        l2_per_step = np.linalg.norm(pred_all[:, :, :2] - gt_all[:, :, :2], axis=-1)
+        ade = l2_per_step.mean(axis=1)  # (N,)
+        reward_arr = np.maximum(0.0, 1.0 - ade / ade_threshold)
+        return reward_arr.tolist()
+    except (ValueError, IndexError):
+        pass
+
+    # Fallback: per-sample computation for ragged trajectory lengths
+    for i, (pred_flat, gt_flat) in enumerate(zip(pred_xyz, gt_xyz)):
         try:
             pred = np.array(pred_flat, dtype=np.float32)
             gt = np.array(gt_flat, dtype=np.float32)
 
-            # Reshape to (T, 3)
             if gt.ndim == 1:
                 gt = gt.reshape(-1, 3)
             if pred.ndim == 1:
                 pred = pred.reshape(-1, 3)
 
-            # Per-timestep L2 distance on xy plane, then average
-            pred_xy = pred[:, :2]
-            gt_xy = gt[:, :2]
-            l2_per_step = np.linalg.norm(pred_xy - gt_xy, axis=-1)  # (T,)
+            l2_per_step = np.linalg.norm(pred[:, :2] - gt[:, :2], axis=-1)
             ade = float(l2_per_step.mean())
-
-            reward = max(0.0, 1.0 - ade / ade_threshold)
-            rewards.append(reward)
+            rewards[i] = max(0.0, 1.0 - ade / ade_threshold)
         except Exception:
-            rewards.append(0.0)
+            pass  # rewards[i] remains 0.0
 
     return rewards
 
