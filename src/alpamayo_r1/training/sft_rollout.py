@@ -1093,6 +1093,7 @@ class RolloutEngine:
         from alpamayo_r1.training.rewards import (
             consistency_reward,
             reasoning_quality_reward,
+            trajectory_per_timestep_rewards,
             trajectory_quality_reward,
         )
 
@@ -1106,9 +1107,14 @@ class RolloutEngine:
 
         results = []
         for i in range(len(rollout_results)):
-            # Per-timestep trajectory rewards (uniform split as fallback)
-            n_traj = self.tokens_per_future_traj
-            r_per_step = [r_traj[i] / max(n_traj, 1)] * n_traj if n_traj > 0 else []
+            # Per-timestep trajectory rewards from per-waypoint L2 distance
+            r_per_step_arr = trajectory_per_timestep_rewards(pred_xyzs[i], gt_xyzs[i])
+            if r_per_step_arr is not None:
+                r_per_step = r_per_step_arr.tolist()
+            else:
+                # Fallback: uniform split of scalar reward
+                n_traj = self.tokens_per_future_traj
+                r_per_step = [r_traj[i] / max(n_traj, 1)] * n_traj if n_traj > 0 else []
 
             results.append(
                 {
