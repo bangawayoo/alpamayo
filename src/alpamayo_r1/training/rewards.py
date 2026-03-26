@@ -116,17 +116,21 @@ def trajectory_quality_reward(
 def trajectory_per_timestep_rewards(
     pred_flat: list[float],
     gt_flat: list[float],
-    ade_threshold: float = 5.0,
+    eps: float = 0.5,
 ) -> np.ndarray | None:
     """Compute per-timestep trajectory rewards (one per trajectory token).
 
-    Same formula as trajectory_quality_reward but applied per-timestep instead
-    of averaged.  Returns None on error or if inputs are malformed.
+    Uses displacement-relative thresholding: the tolerance at each waypoint
+    scales with its distance from the ego origin. A 2m error at a 50m-away
+    waypoint is acceptable; a 2m error at a 3m-away waypoint is not.
+
+    Formula: reward_j = max(0, 1 - l2_j / (||gt_j||_xy + eps))
 
     Args:
         pred_flat: Flattened predicted trajectory, shape (T*3,).
         gt_flat: Flattened ground-truth trajectory, shape (T*3,).
-        ade_threshold: Soft threshold for the reward mapping.
+        eps: Minimum threshold to avoid division by near-zero for
+            waypoints close to the ego origin (default 0.5m).
 
     Returns:
         Array of shape (T,) with per-timestep rewards in [0, 1], or None.
@@ -139,7 +143,9 @@ def trajectory_per_timestep_rewards(
         if pred.ndim == 1:
             pred = pred.reshape(-1, 3)
         l2_per_step = np.linalg.norm(pred[:, :2] - gt[:, :2], axis=-1)  # (T,)
-        return np.maximum(0.0, 1.0 - l2_per_step / ade_threshold)
+        gt_displacement = np.linalg.norm(gt[:, :2], axis=-1)  # (T,)
+        threshold = gt_displacement + eps
+        return np.maximum(0.0, 1.0 - l2_per_step / threshold)
     except Exception:
         return None
 
