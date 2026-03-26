@@ -32,6 +32,23 @@ Each completion requires a teacher-forced VLM forward pass (~0.57s/completion).
 Completions are grouped by clip_id to share prompt KV cache, but the forward
 passes within each group are sequential.
 
+## Optimization Applied
+
+Moved TF forwards into Phase 1 (rollout) via `stash_segment_hidden_in_results()`.
+Phase 2 reads from the stash instead of re-running forwards.
+
+**After optimization (80 completions):**
+
+| Phase | Before | After |
+|---|---|---|
+| Phase 1 (Rollout) | 245s | ~224s (+TF forwards absorbed) |
+| Phase 2 (Evaluate) | 52s | 6s |
+
+Note: the TF forward cost (~45s) moved from Phase 2 into Phase 1 — the total
+VLM forward compute is unchanged. The gain is structural: Phase 2 becomes
+CPU-only, and the TF forwards in Phase 1 benefit from data cache locality
+(model inputs already loaded for generation).
+
 ## Reward Statistics
 
 ```

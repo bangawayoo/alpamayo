@@ -61,8 +61,8 @@
   3. Redundant Hidden State Extraction — **DONE** (`eee701f`)
   The EVALUATE phase ran a teacher-forced VLM forward pass specifically to extract hidden states for the value head.
 
-   * Fix: Stash segment hidden states during rollout via `stash_segment_hidden_in_results()`, called inside `_generate_batch_vlm_only` and `_generate_batch_expert` where model inputs are already on GPU. Phase 2 reads from the stash instead of re-running TF forwards.
-   * Result: Phase 2 Stage 2 dropped from 45s → 0s (80 completions). Phase 2 total: 52s → 6s (8.4x speedup).
+   * Fix: Stash segment hidden states during rollout via `stash_segment_hidden_in_results()`, called inside `_generate_batch_vlm_only` and `_generate_batch_expert`. Phase 2 reads from the stash instead of re-running TF forwards.
+   * Result: Phase 2 dropped from 52s → 6s (80 completions). The TF forward cost (~45s) moved into Phase 1 — total VLM compute is unchanged, but Phase 2 becomes CPU-only.
    * Benchmark: `scripts/benchmark/profile_eval_phase.sh`, results in `scripts/benchmark/results/`.
 
   4. CPU-Bound Reward Logic
