@@ -652,8 +652,20 @@ class SelfPlayLoop:
         rng.shuffle(shuffled)
         pretrain_scenes = shuffled[:num_scenes]
 
-        # Create RolloutEngine once — pi_0 and expert are frozen throughout
+        # Shrink the data cache for pre-training: scenes are processed
+        # sequentially and never revisited, so we only need a small cache.
+        # The default max_size=200 wastes ~10-20 GB of CPU RAM holding
+        # processed image tensors that will never be reused.
         data_cache = self._get_data_cache()
+        original_cache_max = data_cache._max_size
+        data_cache._max_size = max(pretrain_batch_scenes * 2, 8)
+        logger.info(
+            "Pre-training: reduced data cache from %d to %d entries",
+            original_cache_max,
+            data_cache._max_size,
+        )
+
+        # Create RolloutEngine once — pi_0 and expert are frozen throughout
         engine = RolloutEngine(
             full_model=self.full_model,
             processor=self.processor,
@@ -775,6 +787,9 @@ class SelfPlayLoop:
                 gc.collect()
 
         pbar.close()
+
+        # Restore original cache size for subsequent self-play iterations
+        data_cache._max_size = original_cache_max
 
         # Save value head and pretrain clip IDs (rank 0 only to avoid race)
         rank = dist.get_rank() if dist.is_initialized() else 0
