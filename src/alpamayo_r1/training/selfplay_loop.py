@@ -1436,6 +1436,11 @@ class SelfPlayLoop:
 
         # 4. Create training args
         output_dir = Path(train_cfg.get("output_dir", "outputs/sft_advcond")) / f"iter_{iteration}"
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        fsdp_kwargs = {}
+        if world_size == 1:
+            fsdp_kwargs["fsdp"] = ""
+
         training_args = TrainingArguments(
             output_dir=str(output_dir),
             num_train_epochs=int(train_cfg.get("num_train_epochs", 1)),
@@ -1453,6 +1458,7 @@ class SelfPlayLoop:
             max_grad_norm=float(train_cfg.get("max_grad_norm", 1.0)),
             report_to=train_cfg.get("report_to", "tensorboard"),
             remove_unused_columns=False,
+            **fsdp_kwargs,
         )
 
         # 5. Create trainer
