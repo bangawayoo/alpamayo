@@ -703,10 +703,31 @@ class SelfPlayLoop:
 
         pretrain_rank = dist.get_rank() if dist.is_initialized() else 0
         last_loss = float("nan")
+        output_dir = Path(self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
+        pretrain_dir = output_dir / "pretrained"
+        checkpoint_interval = int(vh_cfg.get("pretrain_checkpoint_interval", 100))
+
+        # Resume from checkpoint if a previous run was interrupted
+        start_iter = 0
+        ckpt_path = pretrain_dir / "pretrain_checkpoint.pt"
+        if ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            value_head.load_state_dict(ckpt["value_head"])
+            if self._value_head_optimizer is not None and "optimizer" in ckpt:
+                self._value_head_optimizer.load_state_dict(ckpt["optimizer"])
+            start_iter = ckpt.get("iteration", 0)
+            self._vh_global_step = ckpt.get("vh_global_step", 0)
+            last_loss = ckpt.get("last_loss", float("nan"))
+            logger.info(
+                "Resumed VH pre-training from checkpoint: iteration %d/%d (loss=%.4f)",
+                start_iter, num_iters, last_loss,
+            )
+
         pbar = tqdm(
-            total=num_iters, desc="VH pretrain", unit="iter", disable=pretrain_rank != 0
+            total=num_iters, initial=start_iter,
+            desc="VH pretrain", unit="iter", disable=pretrain_rank != 0,
         )
-        for i in range(num_iters):
+        for i in range(start_iter, num_iters):
             chunk_start = i * pretrain_batch_scenes
             chunk_end = chunk_start + pretrain_batch_scenes
             chunk_scenes = pretrain_scenes[chunk_start:chunk_end]
@@ -780,10 +801,29 @@ class SelfPlayLoop:
             del rollout_results, reward_stash, segment_hidden_stash
             del completion_segment_map, g_obs, g_traj
 
-            # Periodically force garbage collection to keep CPU RAM usage
-            # stable on long runs (3000+ scenes). Without this, Python may
-            # defer collection of large intermediate objects across iterations.
-            if (i + 1) % 50 == 0:
+            # Periodic checkpoint + GC every N iterations so a killed run
+            # can resume instead of restarting from scratch.
+            if (i + 1) % checkpoint_interval == 0:
+                if pretrain_rank == 0:
+                    pretrain_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save(
+                        {
+                            "value_head": value_head.state_dict(),
+                            "optimizer": self._value_head_optimizer.state_dict()
+                            if self._value_head_optimizer is not None
+                            else None,
+                            "iteration": i + 1,
+                            "vh_global_step": self._vh_global_step,
+                            "last_loss": last_loss,
+                        },
+                        ckpt_path,
+                    )
+                    logger.info(
+                        "VH pretrain checkpoint at iter %d/%d (loss=%.4f)",
+                        i + 1, num_iters, last_loss,
+                    )
+                if dist.is_initialized():
+                    dist.barrier()
                 gc.collect()
 
         pbar.close()
@@ -793,14 +833,15 @@ class SelfPlayLoop:
 
         # Save value head and pretrain clip IDs (rank 0 only to avoid race)
         rank = dist.get_rank() if dist.is_initialized() else 0
-        output_dir = Path(self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
-        pretrain_dir = output_dir / "pretrained"
 
         if rank == 0:
             pretrain_dir.mkdir(parents=True, exist_ok=True)
             torch.save(value_head.state_dict(), pretrain_dir / "value_head.pt")
             with open(pretrain_dir / "clip_ids.json", "w") as f:
                 json.dump(pretrain_scenes, f)
+            # Remove intermediate checkpoint now that training completed
+            if ckpt_path.exists():
+                ckpt_path.unlink()
             logger.info(
                 "Saved pretrained value head and %d clip IDs to %s (final loss=%.4f)",
                 len(pretrain_scenes),
