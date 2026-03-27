@@ -322,16 +322,26 @@ def evaluate_sample(
     # G(s_traj_j) = cumulative reward from position j to end
     T_traj = seg_values["segment_map"]["traj_len"]
     if T_traj > 0:
-        # Uniform per-step reward split, matching sft_rollout.py compute_rewards
-        r_per_step = [traj_r_scalar / max(T_traj, 1)] * T_traj
-        r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
+        # Per-waypoint displacement-relative rewards, matching training
+        from alpamayo_r1.training.rewards import trajectory_per_timestep_rewards
+
+        r_per_step_arrs = [
+            trajectory_per_timestep_rewards(p, gt_flat)
+            for p in per_sample_preds
+        ]
+        valid_arrs = [a for a in r_per_step_arrs if a is not None]
+        r_per_step_t = torch.tensor(
+            np.mean(valid_arrs, axis=0), dtype=torch.float32
+        )
+        # r_per_step_t has one entry per waypoint. Each waypoint corresponds
+        # to one curvature token (the value head evaluation point), so
+        # returns-to-go over waypoints align 1:1 with curvature positions.
         r_traj_weighted = TRAJ_WEIGHT * r_per_step_t
         r_traj_weighted[-1] = r_traj_weighted[-1] + CONSISTENCY_WEIGHT * consist_mean
         g_traj_all = torch.flip(
             torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0]
         )
-        curv_idx = torch.arange(1, T_traj, 2)
-        g_traj_curv = g_traj_all[curv_idx].tolist() if len(curv_idx) > 0 else []
+        g_traj_curv = g_traj_all.tolist()
         g_traj_mean = float(np.mean(g_traj_curv)) if g_traj_curv else 0.0
         traj_total = r_traj_weighted.sum().item()
     else:
