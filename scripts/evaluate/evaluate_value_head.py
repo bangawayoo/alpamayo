@@ -233,36 +233,22 @@ def evaluate_sample(
         prompt_len = input_ids.shape[1]
 
         # 1. Run VLM generation (captures raw sequences for value head)
-        # Expand vision tensors to match num_return_sequences — Qwen3-VL's
-        # generate() expands input_ids/attention_mask but not pixel_values.
-        expanded_kwargs = dict(gen_kwargs)
-        if num_traj_samples > 1:
-            for k in ("pixel_values", "image_grid_thw"):
-                if k in expanded_kwargs:
-                    expanded_kwargs[k] = expanded_kwargs[k].repeat(
-                        num_traj_samples, *([1] * (expanded_kwargs[k].dim() - 1))
-                    )
-            if "attention_mask" in expanded_kwargs:
-                expanded_kwargs["attention_mask"] = expanded_kwargs[
-                    "attention_mask"
-                ].repeat(num_traj_samples, 1)
-            input_ids = input_ids.repeat(num_traj_samples, 1)
-
         max_new_tokens = 256 + model.config.tokens_per_future_traj + 10
         with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
             vlm_output = generate_coc(
-                model, input_ids, expanded_kwargs,
+                model, input_ids, gen_kwargs,
                 mode="vlm", temperature=temperature, top_p=top_p,
-                num_samples=1,  # already expanded manually
+                num_samples=num_traj_samples,
                 max_new_tokens=max_new_tokens,
                 pad_token_id=model.tokenizer.pad_token_id,
             )
 
-        # Decode trajectories
-        ego_history_xyz = model_inputs["ego_history_xyz"]
-        ego_history_rot = model_inputs["ego_history_rot"]
-        hist_xyz_rep = ego_history_xyz.repeat(num_traj_samples, 1, 1, 1)
-        hist_rot_rep = ego_history_rot.repeat(num_traj_samples, 1, 1, 1, 1)
+        # Decode trajectories — squeeze out the scene dim (1,1,T,3) → (1,T,3)
+        # before repeating, so traj_tokenizer.decode gets (S, T, 3)
+        ego_history_xyz = model_inputs["ego_history_xyz"].squeeze(0)  # (1, T, 3)
+        ego_history_rot = model_inputs["ego_history_rot"].squeeze(0)  # (1, T, 3, 3)
+        hist_xyz_rep = ego_history_xyz.repeat(num_traj_samples, 1, 1)
+        hist_rot_rep = ego_history_rot.repeat(num_traj_samples, 1, 1, 1)
         pred_xyz, pred_rot = decode_vlm_trajectories(
             model, vlm_output, hist_xyz_rep, hist_rot_rep,
         )
