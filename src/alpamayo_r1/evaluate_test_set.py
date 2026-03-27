@@ -591,14 +591,9 @@ def evaluate_batch(
                 model.tokenizer.decode(_ids[-30:], skip_special_tokens=False),
                 _ids[-30:],
             )
+
             if adv_obs_token_id is not None:
-                obs_ids = (
-                    [adv_obs_token_id]
-                    if isinstance(adv_obs_token_id, int)
-                    else list(adv_obs_token_id)
-                )
                 has_obs = any(tid in _ids for tid in obs_ids)
-                print(adv_obs_token_id)
                 if not has_obs:
                     logger.warning(
                         "adv_obs token NOT found in input_ids for %s "
@@ -607,14 +602,13 @@ def evaluate_batch(
                         obs_ids,
                         len(_ids),
                     )
+
             if adv_traj_token_id is not None:
                 traj_ids = (
                     [adv_traj_token_id]
                     if isinstance(adv_traj_token_id, int)
                     else list(adv_traj_token_id)
                 )
-                # adv_traj is injected later (teacher-forced), not in input_ids
-                # Just log that it will be injected
                 logger.debug(
                     "adv_traj injection enabled for %s (token_ids=%s)",
                     sample["clip_id"],
