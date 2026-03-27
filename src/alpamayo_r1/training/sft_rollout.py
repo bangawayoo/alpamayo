@@ -1180,7 +1180,9 @@ def _extract_segment_hidden(
 
     if traj_positions:
         traj_indices = [p + 1 for p in traj_positions]
-        h_traj = hidden_states[0, traj_indices, :]
+        h_traj_all = hidden_states[0, traj_indices, :]
+        curv_sel = list(range(1, len(traj_positions), 2))
+        h_traj = h_traj_all[curv_sel]  # curvature positions only (T_curv, D)
     else:
         h_traj = torch.zeros(0, hidden_states.shape[-1])
 

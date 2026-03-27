@@ -318,16 +318,12 @@ def compute_segment_advantages_from_rollouts(
         T_traj = seg_map["traj_len"]
         if T_traj > 0:
             r_per_step = seg_rew.get("r_traj_per_step")
-            if r_per_step is not None and len(r_per_step) == T_traj:
-                r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
-            else:
-                r_per_step_t = torch.full((T_traj,), r_traj_scalar / max(T_traj, 1))
+            r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
             r_traj_weighted = w_traj * r_per_step_t
             r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
             g_traj_all = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
-            curv_idx = torch.arange(1, T_traj, 2)
-            g_traj_curv_list.append(g_traj_all[curv_idx])
-            traj_lens.append(len(curv_idx))
+            g_traj_curv_list.append(g_traj_all)
+            traj_lens.append(len(g_traj_all))
             traj_total = r_traj_weighted.sum().item()
         else:
             g_traj_curv_list.append(torch.zeros(0))
@@ -365,12 +361,11 @@ def compute_segment_advantages_from_rollouts(
         curv_positions = []
         curv_lens = []
         for i in traj_indices:
-            h_traj = segment_hidden_stash[i]["h_traj"]
-            T_traj = completion_segment_map[i]["traj_len"]
-            curv_idx = torch.arange(1, T_traj, 2)
-            curv_hiddens.append(h_traj[curv_idx])  # (T_curv_i, D)
-            curv_positions.append(curv_idx // 2 + SegmentValueHead.POS_TRAJ_START)
-            curv_lens.append(len(curv_idx))
+            h_traj = segment_hidden_stash[i]["h_traj"]  # already curvature-only
+            n_curv = h_traj.shape[0]
+            curv_hiddens.append(h_traj)
+            curv_positions.append(torch.arange(n_curv) + SegmentValueHead.POS_TRAJ_START)
+            curv_lens.append(n_curv)
 
         # Concatenate on CPU, single transfer — no padding waste
         h_traj_flat = torch.cat(curv_hiddens, dim=0).to(vh_device)  # (N_total, D)
@@ -456,10 +451,7 @@ def compute_value_targets(
         T_traj = seg_map["traj_len"]
         if T_traj > 0:
             r_per_step = seg_rew.get("r_traj_per_step")
-            if r_per_step is not None and len(r_per_step) == T_traj:
-                r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
-            else:
-                r_per_step_t = torch.full((T_traj,), r_traj_scalar / max(T_traj, 1))
+            r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
             r_traj_weighted = w_traj * r_per_step_t
             r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
         else:
@@ -591,16 +583,15 @@ def train_segment_value_head(
             traj_p_list = []
             traj_curv_lens = []
             for i_local in idx.tolist():
-                h_traj = segment_hidden_stash[i_local]["h_traj"]
+                h_traj = segment_hidden_stash[i_local]["h_traj"]  # already curvature-only
                 g_traj = g_traj_list[i_local]
                 if h_traj.shape[0] == 0:
                     continue
-                T_t = h_traj.shape[0]
-                curvature_idx = torch.arange(1, T_t, 2)
-                traj_h_list.append(h_traj[curvature_idx])
-                traj_g_list.append(g_traj[curvature_idx])
-                traj_p_list.append(curvature_idx // 2 + SegmentValueHead.POS_TRAJ_START)
-                traj_curv_lens.append(len(curvature_idx))
+                n_curv = h_traj.shape[0]
+                traj_h_list.append(h_traj)
+                traj_g_list.append(g_traj)
+                traj_p_list.append(torch.arange(n_curv) + SegmentValueHead.POS_TRAJ_START)
+                traj_curv_lens.append(n_curv)
 
             if traj_h_list:
                 # Flat concat on CPU, single transfer — no padding waste

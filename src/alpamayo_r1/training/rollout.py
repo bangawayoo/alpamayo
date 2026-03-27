@@ -1208,9 +1208,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 traj_positions.append(idx)
 
         if traj_positions:
-            # h_traj: hidden states at each trajectory token position
+            # h_traj: hidden states at curvature token positions only (stride-2)
             traj_indices = [p + 1 for p in traj_positions]  # +1 for the h_obs offset
-            h_traj = hidden_states[0, traj_indices, :]  # (T_traj, D)
+            h_traj_all = hidden_states[0, traj_indices, :]  # (T_traj, D)
+            curv_sel = list(range(1, len(traj_positions), 2))
+            h_traj = h_traj_all[curv_sel]  # (T_curv, D)
         else:
             h_traj = torch.zeros(0, hidden_states.shape[-1])
 
@@ -1318,15 +1320,15 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                 v_obs = self.value_head(h_obs, level=SegmentValueHead.LEVEL_OBS)  # (1,)
                 v_coc = self.value_head(h_coc, level=SegmentValueHead.LEVEL_COC)  # (1,)
                 if h_traj.shape[0] > 0:
-                    T_tokens = h_traj.shape[0]
-                    curv_idx = torch.arange(1, T_tokens, 2, device=vh_device)
-                    traj_pos = (curv_idx // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0)
+                    n_curv = h_traj.shape[0]
+                    traj_pos = (torch.arange(n_curv, device=vh_device) + SegmentValueHead.POS_TRAJ_START).unsqueeze(0)
                     v_traj_ts = self.value_head(
-                        h_traj[curv_idx].unsqueeze(0),
+                        h_traj.unsqueeze(0),
                         level=SegmentValueHead.LEVEL_TRAJ,
                         positions=traj_pos,
-                    ).squeeze(0)  # (n_timesteps,)
+                    ).squeeze(0)  # (n_curv,)
                     # Expand to per-token: both tokens in a pair get same V
+                    T_tokens = seg_map["traj_len"]
                     v_traj = v_traj_ts.repeat_interleave(2)
                     if v_traj.shape[0] < T_tokens:  # odd T_traj
                         v_traj = torch.cat([v_traj, v_traj_ts[-1:]])
@@ -1509,22 +1511,19 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         total_traj = 0
 
         for i in range(B):
-            h_traj = self._segment_hidden_stash[i]["h_traj"]  # (T_traj, D)
-            g_traj = all_g_traj[i]  # (T_traj,)
+            h_traj = self._segment_hidden_stash[i]["h_traj"]  # (T_curv, D)
+            g_traj = all_g_traj[i]  # (T_curv,)
             if h_traj.shape[0] == 0:
                 continue
-            T_t = h_traj.shape[0]
-            curvature_idx = torch.arange(1, T_t, 2)  # [1, 3, 5, ...]
-            n_timesteps = len(curvature_idx)
-            n_keep = min(n_timesteps, max(1, max_traj_samples - total_traj))
-            if n_keep < n_timesteps:
-                sel = curvature_idx[torch.randperm(n_timesteps)[:n_keep]]
+            n_curv = h_traj.shape[0]
+            n_keep = min(n_curv, max(1, max_traj_samples - total_traj))
+            if n_keep < n_curv:
+                sel = torch.randperm(n_curv)[:n_keep]
             else:
-                sel = curvature_idx
+                sel = torch.arange(n_curv)
             h_sub = h_traj[sel].to(vh_device)
             g_sub = g_traj[sel].to(vh_device)
-            # RoPE positions: timestep index (sel // 2) + traj offset
-            traj_pos = (sel // 2 + SegmentValueHead.POS_TRAJ_START).unsqueeze(0).to(vh_device)
+            traj_pos = (sel + SegmentValueHead.POS_TRAJ_START).unsqueeze(0).to(vh_device)
             v = self.value_head(
                 h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos
             ).squeeze(0)
