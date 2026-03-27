@@ -804,6 +804,143 @@ def evaluate_batch(
     return results
 
 
+def _stat_dict(arr):
+    """Compute summary statistics for an array."""
+    return {
+        "mean": float(np.mean(arr)),
+        "median": float(np.median(arr)),
+        "std": float(np.std(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+    }
+
+
+METRIC_COLUMNS = ["minADE", "minFDE"]
+REWARD_COLUMNS = ["r_traj", "r_reason", "r_consist"]
+
+
+def merge_shards(output_dir: str | Path) -> None:
+    """Merge per-shard results into unified results.csv and statistics.json.
+
+    Combines results_shard*.csv and trajectories_shard*.npz files,
+    computes aggregate statistics including reward signals.
+    """
+    output_dir = Path(output_dir)
+
+    # Merge CSVs
+    shard_csvs = sorted(output_dir.glob("results_shard*.csv"))
+    if not shard_csvs:
+        print("No shard results found!")
+        return
+    dfs = [pd.read_csv(p) for p in shard_csvs]
+    df = pd.concat(dfs, ignore_index=True)
+    df.to_csv(output_dir / "results.csv", index=False)
+
+    # Merge trajectory npz files
+    shard_npzs = sorted(output_dir.glob("trajectories_shard*.npz"))
+    if shard_npzs:
+        merged_traj = {}
+        for npz_path in shard_npzs:
+            data = np.load(npz_path)
+            merged_traj.update(dict(data))
+        np.savez_compressed(output_dir / "trajectories.npz", **merged_traj)
+        print(f"Merged {len(shard_npzs)} trajectory shards "
+              f"({len(merged_traj) // 2} clips)")
+
+    # Compute statistics
+    ok = df[df["success"] == True]  # noqa: E712
+    stats = {
+        "total_samples": len(df),
+        "successful_samples": len(ok),
+        "failed_samples": len(df) - len(ok),
+    }
+    if len(ok) > 0:
+        for m in METRIC_COLUMNS:
+            stats[m] = _stat_dict(ok[m].values)
+        stats["rewards"] = {}
+        for r in REWARD_COLUMNS:
+            if r in ok.columns:
+                stats["rewards"][r] = _stat_dict(ok[r].dropna().values)
+
+    with open(output_dir / "statistics.json", "w") as f:
+        json.dump(stats, f, indent=2)
+
+    print(f"Merged {len(shard_csvs)} shards: {len(df)} total, {len(ok)} successful")
+    if len(ok) > 0:
+        print(f"  minADE mean: {stats['minADE']['mean']:.4f}")
+        print(f"  minFDE mean: {stats['minFDE']['mean']:.4f}")
+        for r in REWARD_COLUMNS:
+            if r in stats.get("rewards", {}):
+                print(f"  {r} mean: {stats['rewards'][r]['mean']:.4f}")
+
+
+def aggregate_trials(output_dir: str | Path, num_trials: int) -> None:
+    """Aggregate results across multiple trial directories.
+
+    Each trial is expected at output_dir/trials/trial_{i}/results.csv.
+    Produces per-clip averaged results and trial-level variance statistics
+    including reward signals.
+    """
+    output_dir = Path(output_dir)
+    trials_dir = output_dir / "trials"
+
+    trial_dfs = []
+    for t in range(num_trials):
+        p = trials_dir / f"trial_{t}" / "results.csv"
+        df = pd.read_csv(p)
+        df["trial"] = t
+        trial_dfs.append(df)
+
+    all_trials = pd.concat(trial_dfs, ignore_index=True)
+    all_trials.to_csv(trials_dir / "all_trials.csv", index=False)
+
+    ok = all_trials[all_trials["success"] == True]  # noqa: E712
+    value_cols = METRIC_COLUMNS + [
+        r for r in REWARD_COLUMNS if r in ok.columns
+    ]
+    per_clip_mean = ok.groupby("clip_id")[value_cols].mean().reset_index()
+    per_clip_mean["success"] = True
+    per_clip_mean.to_csv(output_dir / "results.csv", index=False)
+
+    # Trial-level means for variance estimation
+    trial_means = ok.groupby("trial")[value_cols].mean()
+
+    stats = {
+        "num_trials": num_trials,
+        "total_clips": int(per_clip_mean["clip_id"].nunique()),
+    }
+    for col in value_cols:
+        vals = trial_means[col].values
+        stats[col] = {
+            "mean_of_trials": float(np.mean(vals)),
+            "std_of_trials": float(np.std(vals)),
+            "trial_values": [float(v) for v in vals],
+        }
+
+    with open(output_dir / "statistics.json", "w") as f:
+        json.dump(stats, f, indent=2)
+
+    print(f"Aggregated {num_trials} trials over {stats['total_clips']} clips")
+    for col in value_cols:
+        s = stats[col]
+        trial_str = ", ".join(f"{v:.4f}" for v in s["trial_values"])
+        print(f"  {col}: {s['mean_of_trials']:.4f} +/- "
+              f"{s['std_of_trials']:.4f}  trials=[{trial_str}]")
+
+    # Merge trajectory npz files from all trials
+    merged_traj = {}
+    for t in range(num_trials):
+        npz_path = trials_dir / f"trial_{t}" / "trajectories.npz"
+        if npz_path.exists():
+            data = np.load(npz_path)
+            # Prefix with trial index to avoid key collisions
+            for key in data:
+                merged_traj[f"trial_{t}/{key}"] = data[key]
+    if merged_traj:
+        np.savez_compressed(output_dir / "trajectories.npz", **merged_traj)
+        print(f"Merged trajectories from {num_trials} trials")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Optimized Alpamayo-R1 evaluation with batched data loading"
@@ -939,8 +1076,28 @@ def main():
         action="store_true",
         help="Save BEV trajectory plots (predicted vs. ground truth) to output_dir/plots/",
     )
+    parser.add_argument(
+        "--merge-shards",
+        action="store_true",
+        help="Merge per-shard results in --output-dir and exit (no inference).",
+    )
+    parser.add_argument(
+        "--aggregate-trials",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Aggregate N trial directories in --output-dir/trials/ and exit.",
+    )
 
     args = parser.parse_args()
+
+    # Handle aggregation modes (no inference needed)
+    if args.merge_shards:
+        merge_shards(args.output_dir)
+        return
+    if args.aggregate_trials is not None:
+        aggregate_trials(args.output_dir, args.aggregate_trials)
+        return
 
     if (args.shard_id is None) != (args.num_shards is None):
         parser.error("--shard-id and --num-shards must be used together")
@@ -1256,15 +1413,6 @@ def main():
         r_traj_values = successful_results["r_traj"].values
         r_reason_values = successful_results["r_reason"].values
         r_consist_values = successful_results["r_consist"].values
-
-        def _stat_dict(arr):
-            return {
-                "mean": float(np.mean(arr)),
-                "median": float(np.median(arr)),
-                "std": float(np.std(arr)),
-                "min": float(np.min(arr)),
-                "max": float(np.max(arr)),
-            }
 
         stats = {
             "total_samples": len(results_df),

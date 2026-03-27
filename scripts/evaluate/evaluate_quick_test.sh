@@ -171,33 +171,9 @@ if [[ "${NUM_TRIALS}" -eq 1 ]]; then
         fi
 
         echo "All shards complete. Merging results..."
-        python -c "
-import pandas as pd, json, numpy as np
-from pathlib import Path
-
-output_dir = Path('${OUTPUT_DIR}')
-dfs = [pd.read_csv(p) for p in sorted(output_dir.glob('results_shard*.csv'))]
-if not dfs:
-    print('No shard results found!'); exit(1)
-
-df = pd.concat(dfs, ignore_index=True)
-df.to_csv(output_dir / 'results.csv', index=False)
-
-ok = df[df['success'] == True]
-stats = {'total_samples': len(df), 'successful_samples': len(ok), 'failed_samples': len(df) - len(ok)}
-if len(ok) > 0:
-    for m in ['minADE', 'minFDE']:
-        v = ok[m].values
-        stats[m] = {'mean': float(np.mean(v)), 'median': float(np.median(v)),
-                    'std': float(np.std(v)), 'min': float(np.min(v)), 'max': float(np.max(v))}
-with open(output_dir / 'statistics.json', 'w') as f:
-    json.dump(stats, f, indent=2)
-
-print(f'Merged {len(dfs)} shards: {len(df)} total, {len(ok)} successful')
-if len(ok) > 0:
-    print(f'  minADE mean: {stats[\"minADE\"][\"mean\"]:.4f}')
-    print(f'  minFDE mean: {stats[\"minFDE\"][\"mean\"]:.4f}')
-"
+        python src/alpamayo_r1/evaluate_test_set.py \
+            --merge-shards \
+            --output-dir "${OUTPUT_DIR}"
     fi
 
 # ---------------------------------------------------------------------------
@@ -239,49 +215,9 @@ else
 
     # Aggregate across all trials
     echo "=== Aggregating ${NUM_TRIALS} trials ==="
-    python -c "
-import pandas as pd, json, numpy as np
-from pathlib import Path
-
-output_dir = Path('${OUTPUT_DIR}')
-trials_dir = output_dir / 'trials'
-num_trials = ${NUM_TRIALS}
-
-trial_dfs = []
-for t in range(num_trials):
-    p = trials_dir / f'trial_{t}' / 'results.csv'
-    df = pd.read_csv(p)
-    df['trial'] = t
-    trial_dfs.append(df)
-
-all_trials = pd.concat(trial_dfs, ignore_index=True)
-all_trials.to_csv(trials_dir / 'all_trials.csv', index=False)
-
-# Average per-clip results across trials, then aggregate
-ok = all_trials[all_trials['success'] == True]
-per_clip_mean = ok.groupby('clip_id')[['minADE', 'minFDE']].mean().reset_index()
-per_clip_mean['success'] = True
-per_clip_mean.to_csv(output_dir / 'results.csv', index=False)
-
-# Trial-level means to quantify variance
-trial_means = ok.groupby('trial')[['minADE', 'minFDE']].mean()
-
-stats = {'num_trials': num_trials, 'total_clips': int(per_clip_mean['clip_id'].nunique())}
-for m in ['minADE', 'minFDE']:
-    vals = trial_means[m].values
-    stats[m] = {
-        'mean_of_trials': float(np.mean(vals)),
-        'std_of_trials':  float(np.std(vals)),
-        'trial_values':   [float(v) for v in vals],
-    }
-with open(output_dir / 'statistics.json', 'w') as f:
-    json.dump(stats, f, indent=2)
-
-print(f'Aggregated {num_trials} trials over {stats[\"total_clips\"]} clips')
-for m in ['minADE', 'minFDE']:
-    s = stats[m]
-    print(f'  {m}: {s[\"mean_of_trials\"]:.4f} +/- {s[\"std_of_trials\"]:.4f}  trials={[f\"{v:.4f}\" for v in s[\"trial_values\"]]}')
-"
+    python src/alpamayo_r1/evaluate_test_set.py \
+        --aggregate-trials "${NUM_TRIALS}" \
+        --output-dir "${OUTPUT_DIR}"
 fi
 
 echo ""
