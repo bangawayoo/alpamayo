@@ -165,6 +165,17 @@ def _plot_trajectories(
     ax.set_xlabel("Lateral (m)")
     ax.set_ylabel("Longitudinal (m)")
     ax.set_aspect("equal")
+    # Pad shorter axis to at least 30% of the longer axis to avoid narrow plots
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    x_range = xlim[1] - xlim[0]
+    y_range = ylim[1] - ylim[0]
+    min_range = max(x_range, y_range) * 0.3
+    if x_range < min_range:
+        mid = (xlim[0] + xlim[1]) / 2
+        ax.set_xlim(mid - min_range / 2, mid + min_range / 2)
+    if y_range < min_range:
+        mid = (ylim[0] + ylim[1]) / 2
+        ax.set_ylim(mid - min_range / 2, mid + min_range / 2)
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
 
