@@ -508,6 +508,42 @@ def _evaluate_vlm_only_with_adv_traj(
     return pred_xyz, pred_rot, extra
 
 
+def _compute_reward_signals(
+    pred_xyz: torch.Tensor,
+    gt_xyz: torch.Tensor,
+    coc_text: str | None,
+) -> tuple[float, float, float]:
+    """Compute trajectory, reasoning, and consistency reward signals.
+
+    Args:
+        pred_xyz: Predicted trajectories, shape (1, 1, S, T, 3).
+        gt_xyz: Ground-truth trajectory, shape (1, 1, T, 3).
+        coc_text: Chain-of-causation text (may be None).
+
+    Returns:
+        (r_traj, r_reason, r_consist): Mean reward across trajectory samples.
+    """
+    from alpamayo_r1.training.rewards import (
+        consistency_reward,
+        reasoning_quality_reward,
+        trajectory_quality_reward,
+    )
+
+    pred_np = pred_xyz.cpu().numpy()[0, 0]  # (S, T, 3)
+    gt_np = gt_xyz.cpu().numpy()[0, 0]  # (T, 3)
+    gt_flat = gt_np.flatten().tolist()
+
+    n_samples = pred_np.shape[0]
+    pred_flats = [pred_np[i].flatten().tolist() for i in range(n_samples)]
+    completions = [coc_text or ""] * n_samples
+
+    r_traj = trajectory_quality_reward(completions, pred_flats, [gt_flat] * n_samples)
+    r_reason = reasoning_quality_reward(completions)
+    r_consist = consistency_reward(completions, pred_flats)
+
+    return float(np.mean(r_traj)), float(np.mean(r_reason)), float(np.mean(r_consist))
+
+
 def evaluate_batch(
     model: AlpamayoR1,
     processor,
@@ -708,12 +744,20 @@ def evaluate_batch(
                 except Exception as plot_err:
                     logger.warning("Plot failed for %s: %s", sample["clip_id"], plot_err)
 
+            # Compute reward signals
+            r_traj_val, r_reason_val, r_consist_val = _compute_reward_signals(
+                pred_xyz, sample["ego_future_xyz"], coc_text
+            )
+
             results.append(
                 {
                     "clip_id": sample["clip_id"],
                     "t0_us": t0_us,
                     "minADE": min_ade,
                     "minFDE": min_fde,
+                    "r_traj": r_traj_val,
+                    "r_reason": r_reason_val,
+                    "r_consist": r_consist_val,
                     "success": True,
                     "error": None,
                     "coc": coc_text,
@@ -729,6 +773,9 @@ def evaluate_batch(
                     "t0_us": t0_us,
                     "minADE": None,
                     "minFDE": None,
+                    "r_traj": None,
+                    "r_reason": None,
+                    "r_consist": None,
                     "success": False,
                     "error": f"{str(e)}\n{traceback.format_exc()}",
                     "coc": None,
@@ -1176,24 +1223,29 @@ def main():
     if len(successful_results) > 0:
         min_ade_values = successful_results["minADE"].values
         min_fde_values = successful_results["minFDE"].values
+        r_traj_values = successful_results["r_traj"].values
+        r_reason_values = successful_results["r_reason"].values
+        r_consist_values = successful_results["r_consist"].values
+
+        def _stat_dict(arr):
+            return {
+                "mean": float(np.mean(arr)),
+                "median": float(np.median(arr)),
+                "std": float(np.std(arr)),
+                "min": float(np.min(arr)),
+                "max": float(np.max(arr)),
+            }
 
         stats = {
             "total_samples": len(results_df),
             "successful_samples": len(successful_results),
             "failed_samples": len(failed_results),
-            "minADE": {
-                "mean": float(np.mean(min_ade_values)),
-                "median": float(np.median(min_ade_values)),
-                "std": float(np.std(min_ade_values)),
-                "min": float(np.min(min_ade_values)),
-                "max": float(np.max(min_ade_values)),
-            },
-            "minFDE": {
-                "mean": float(np.mean(min_fde_values)),
-                "median": float(np.median(min_fde_values)),
-                "std": float(np.std(min_fde_values)),
-                "min": float(np.min(min_fde_values)),
-                "max": float(np.max(min_fde_values)),
+            "minADE": _stat_dict(min_ade_values),
+            "minFDE": _stat_dict(min_fde_values),
+            "rewards": {
+                "trajectory": _stat_dict(r_traj_values),
+                "reasoning": _stat_dict(r_reason_values),
+                "consistency": _stat_dict(r_consist_values),
             },
             "config": {
                 "model_name": args.model_name,
@@ -1214,18 +1266,16 @@ def main():
         print(f"\nTotal samples: {stats['total_samples']}")
         print(f"Successful: {stats['successful_samples']}")
         print(f"Failed: {stats['failed_samples']}")
-        print(f"\nminADE (meters):")
-        print(f"  Mean:   {stats['minADE']['mean']:.4f}")
-        print(f"  Median: {stats['minADE']['median']:.4f}")
-        print(f"  Std:    {stats['minADE']['std']:.4f}")
-        print(f"  Min:    {stats['minADE']['min']:.4f}")
-        print(f"  Max:    {stats['minADE']['max']:.4f}")
-        print(f"\nminFDE (meters):")
-        print(f"  Mean:   {stats['minFDE']['mean']:.4f}")
-        print(f"  Median: {stats['minFDE']['median']:.4f}")
-        print(f"  Std:    {stats['minFDE']['std']:.4f}")
-        print(f"  Min:    {stats['minFDE']['min']:.4f}")
-        print(f"  Max:    {stats['minFDE']['max']:.4f}")
+        print("\nminADE (meters):")
+        for k in ("mean", "median", "std", "min", "max"):
+            print(f"  {k.capitalize():7s}: {stats['minADE'][k]:.4f}")
+        print("\nminFDE (meters):")
+        for k in ("mean", "median", "std", "min", "max"):
+            print(f"  {k.capitalize():7s}: {stats['minFDE'][k]:.4f}")
+        print("\nReward signals:")
+        for name, key in [("Trajectory", "trajectory"), ("Reasoning", "reasoning"), ("Consistency", "consistency")]:
+            s = stats["rewards"][key]
+            print(f"  {name:12s}: mean={s['mean']:.4f}  std={s['std']:.4f}  min={s['min']:.4f}  max={s['max']:.4f}")
 
     else:
         stats = {

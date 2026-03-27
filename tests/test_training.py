@@ -1106,28 +1106,34 @@ class TestPerTimestepRewards:
         np.testing.assert_allclose(r, [1.0, 1.0, 1.0])
 
     def test_large_error(self):
-        """Large L2 error should give rewards near 0."""
+        """Large L2 error relative to GT displacement should give rewards near 0."""
         import numpy as np
         from alpamayo_r1.training.rewards import trajectory_per_timestep_rewards
 
+        # GT at origin → threshold = 0 + 0.5 = 0.5m, pred at 100m → reward = 0
         pred = [100.0, 100.0, 0.0] * 4
         gt = [0.0, 0.0, 0.0] * 4
-        r = trajectory_per_timestep_rewards(pred, gt, ade_threshold=5.0)
+        r = trajectory_per_timestep_rewards(pred, gt)
         assert r is not None
         np.testing.assert_array_equal(r, [0.0, 0.0, 0.0, 0.0])
 
     def test_per_timestep_granularity(self):
-        """Different errors at different timesteps should give different rewards."""
+        """Different errors relative to GT displacement give different rewards."""
         import numpy as np
         from alpamayo_r1.training.rewards import trajectory_per_timestep_rewards
 
-        pred = [0.0, 0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 5.0, 0.0]  # 3 timesteps
-        gt = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        r = trajectory_per_timestep_rewards(pred, gt, ade_threshold=5.0)
+        # GT waypoints at increasing distances from ego origin:
+        #   t0: (10, 0, 0) → ||gt||=10, threshold=10.5
+        #   t1: (20, 0, 0) → ||gt||=20, threshold=20.5
+        #   t2: (30, 0, 0) → ||gt||=30, threshold=30.5
+        gt = [10.0, 0.0, 0.0, 20.0, 0.0, 0.0, 30.0, 0.0, 0.0]
+        # Pred matches t0 exactly, off by 10m at t1, off by 30.5m at t2
+        pred = [10.0, 0.0, 0.0, 20.0, 10.0, 0.0, 30.0, 30.5, 0.0]
+        r = trajectory_per_timestep_rewards(pred, gt)
         assert r is not None
-        assert r[0] == pytest.approx(1.0)  # no error
-        assert r[1] == pytest.approx(0.5)  # 2.5/5.0 error
-        assert r[2] == pytest.approx(0.0)  # 5.0/5.0 error
+        assert r[0] == pytest.approx(1.0)  # perfect match
+        assert r[1] == pytest.approx(1.0 - 10.0 / 20.5, abs=1e-4)  # 10m error, 20.5 threshold
+        assert r[2] == pytest.approx(0.0)  # 30.5m error >= 30.5 threshold
 
     def test_malformed_input_returns_none(self):
         """Malformed input should return None."""
