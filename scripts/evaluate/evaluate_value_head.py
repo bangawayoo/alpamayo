@@ -233,12 +233,27 @@ def evaluate_sample(
         prompt_len = input_ids.shape[1]
 
         # 1. Run VLM generation (captures raw sequences for value head)
+        # Expand vision tensors to match num_return_sequences — Qwen3-VL's
+        # generate() expands input_ids/attention_mask but not pixel_values.
+        expanded_kwargs = dict(gen_kwargs)
+        if num_traj_samples > 1:
+            for k in ("pixel_values", "image_grid_thw"):
+                if k in expanded_kwargs:
+                    expanded_kwargs[k] = expanded_kwargs[k].repeat(
+                        num_traj_samples, *([1] * (expanded_kwargs[k].dim() - 1))
+                    )
+            if "attention_mask" in expanded_kwargs:
+                expanded_kwargs["attention_mask"] = expanded_kwargs[
+                    "attention_mask"
+                ].repeat(num_traj_samples, 1)
+            input_ids = input_ids.repeat(num_traj_samples, 1)
+
         max_new_tokens = 256 + model.config.tokens_per_future_traj + 10
         with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
             vlm_output = generate_coc(
-                model, input_ids, gen_kwargs,
+                model, input_ids, expanded_kwargs,
                 mode="vlm", temperature=temperature, top_p=top_p,
-                num_samples=num_traj_samples,
+                num_samples=1,  # already expanded manually
                 max_new_tokens=max_new_tokens,
                 pad_token_id=model.tokenizer.pad_token_id,
             )
