@@ -93,6 +93,7 @@ expert_finetune:
   num_noisy_samples: 2          # noise samples per GT action for CFM loss
   every_n_steps: 1              # run expert CFM step every N VLM SFT steps
   max_grad_norm: 1.0
+  reuse_training_kv: false      # capture KV cache during training forward to skip serial extraction
   save_path: null               # where to save expert checkpoints
   load_path: null               # pre-trained expert weights to load
   expert_lora:

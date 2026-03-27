@@ -1380,7 +1380,7 @@ class SelfPlayLoop:
                     "Continuing from iteration %d checkpoint (merge previous LoRA)",
                     iteration - 1,
                 )
-                full_model.vlm = full_model.vlm.merge_and_unload()
+                full_model.vlm = self._fsdp_safe_merge_and_unload(full_model.vlm)
                 logger.info("Merged previous VLM LoRA weights into base model")
             else:
                 logger.info("Reusing existing model for iteration %d", iteration)
@@ -1487,26 +1487,30 @@ class SelfPlayLoop:
         final_save_dir = output_dir / "final"
         trainer.save_model(str(final_save_dir))
 
-        # ALSO: Save the ENTIRE model to confirm if loading/resizing is the issue.
-        logger.info(
-            "Merging LoRA weights and saving full AlpamayoR1 model to %s",
-            final_save_dir / "full_model",
+        # Save full merged model (skip under FSDP — stale hooks on the
+        # FSDP wrapper cause state_dict failures after merge_and_unload
+        # changes the model structure; adapter checkpoint above is sufficient)
+        is_fsdp = dist.is_initialized() and dist.get_world_size() > 1 and any(
+            "FullyShardedDataParallel" in type(m).__name__
+            for m in self.full_model.vlm.modules()
         )
+        if not is_fsdp:
+            logger.info(
+                "Merging LoRA weights and saving full AlpamayoR1 model to %s",
+                final_save_dir / "full_model",
+            )
+            if hasattr(self.full_model.vlm, "merge_and_unload"):
+                self.full_model.vlm = self._fsdp_safe_merge_and_unload(self.full_model.vlm)
+            if hasattr(self.full_model.expert, "merge_and_unload"):
+                self.full_model.expert = self.full_model.expert.merge_and_unload()
 
-        # 1. Merge LoRA weights in-place temporarily for saving
-        if hasattr(self.full_model.vlm, "merge_and_unload"):
-            self.full_model.vlm = self.full_model.vlm.merge_and_unload()
-        if hasattr(self.full_model.expert, "merge_and_unload"):
-            self.full_model.expert = self.full_model.expert.merge_and_unload()
+            self.full_model.save_pretrained(str(final_save_dir / "full_model"))
+            self.processor.save_pretrained(str(final_save_dir / "full_model"))
+        else:
+            logger.info(
+                "Skipping full-model save under FSDP (adapter checkpoint saved above)"
+            )
 
-        # 2. Save the full AlpamayoR1 instance
-        # This saves config.json (model_type: alpamayo_r1) and all submodule weights
-        self.full_model.save_pretrained(str(final_save_dir / "full_model"))
-        self.processor.save_pretrained(str(final_save_dir / "full_model"))
-
-        # 3. Reload LoRA for the next iteration (since SelfPlayLoop continues using this model)
-        # Note: In RECAP mode (reset_to_base=True), this doesn't matter as it reloads anyway.
-        # If not resetting, we would need to re-apply the adapter here.
         self.current_policy_path = str(output_dir / "final")
         logger.info("Saved pi_%d to %s", iteration + 1, self.current_policy_path)
 
@@ -1527,16 +1531,64 @@ class SelfPlayLoop:
         # raw model the allocation pattern matches iteration-0's rollout
         # and generation succeeds reliably.
         # The checkpoint was already saved above, so LoRA weights are safe.
-        if hasattr(full_model.vlm, "merge_and_unload"):
-            full_model.vlm = full_model.vlm.merge_and_unload()
-            logger.info("Merged VLM LoRA into base model for clean rollout")
-        if hasattr(full_model.vlm, "peft_config"):
-            delattr(full_model.vlm, "peft_config")
-        if hasattr(full_model.expert, "merge_and_unload"):
-            full_model.expert = full_model.expert.merge_and_unload()
-            logger.info("Merged expert LoRA into base model")
-        if hasattr(full_model.expert, "peft_config"):
-            delattr(full_model.expert, "peft_config")
+        #
+        # Under FSDP, in-place merge is not possible (FSDP flattens params
+        # and the shapes are unrecoverable after the Trainer is deleted).
+        # Instead, reload the model from the base checkpoint so the next
+        # iteration starts fresh. This is equivalent to reset_to_base but
+        # keeps the LoRA weights in the saved adapter for the next iteration
+        # to re-apply.
+        is_fsdp = dist.is_initialized() and dist.get_world_size() > 1
+        if is_fsdp:
+            logger.info(
+                "FSDP active — reloading base model from %s for next iteration",
+                self.base_model_path,
+            )
+            from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+
+            full_model.vlm.cpu()
+            del full_model
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            full_model = AlpamayoR1.from_pretrained(
+                self.base_model_path, dtype=torch.bfloat16
+            )
+            # Load the saved LoRA adapter to merge into base
+            adapter_path = final_save_dir
+            if (adapter_path / "adapter_config.json").exists():
+                from peft import PeftModel
+
+                full_model.vlm = PeftModel.from_pretrained(
+                    full_model.vlm, str(adapter_path)
+                )
+                full_model.vlm = full_model.vlm.merge_and_unload()
+                logger.info("Loaded and merged VLM LoRA from %s", adapter_path)
+            if hasattr(full_model.vlm, "peft_config"):
+                delattr(full_model.vlm, "peft_config")
+            # Load expert checkpoint
+            expert_ckpt = final_save_dir / "expert_checkpoint.pt"
+            if expert_ckpt.exists():
+                from alpamayo_r1.training.selfplay_loop import load_expert_checkpoint
+
+                load_expert_checkpoint(full_model, expert_ckpt)
+                if hasattr(full_model.expert, "merge_and_unload"):
+                    full_model.expert = full_model.expert.merge_and_unload()
+                if hasattr(full_model.expert, "peft_config"):
+                    delattr(full_model.expert, "peft_config")
+                logger.info("Loaded and merged expert from %s", expert_ckpt)
+            self.full_model = full_model
+        else:
+            if hasattr(full_model.vlm, "merge_and_unload"):
+                full_model.vlm = full_model.vlm.merge_and_unload()
+                logger.info("Merged VLM LoRA into base model for clean rollout")
+            if hasattr(full_model.vlm, "peft_config"):
+                delattr(full_model.vlm, "peft_config")
+            if hasattr(full_model.expert, "merge_and_unload"):
+                full_model.expert = full_model.expert.merge_and_unload()
+                logger.info("Merged expert LoRA into base model")
+            if hasattr(full_model.expert, "peft_config"):
+                delattr(full_model.expert, "peft_config")
 
         # Move ALL model components to CPU so gc.collect + empty_cache
         # can fully reclaim GPU memory.
@@ -1610,6 +1662,37 @@ class SelfPlayLoop:
             p_drop=float(adv_cfg.get("p_drop", 0.3)),
             data_cache=self._get_data_cache(),
         )
+
+    @staticmethod
+    def _fsdp_safe_merge_and_unload(model: torch.nn.Module) -> torch.nn.Module:
+        """Merge LoRA weights and unload, handling FSDP-sharded parameters.
+
+        When the model is wrapped with FSDP, base weights are sharded across
+        ranks.  PEFT's ``merge_and_unload`` computes ``delta = B @ A`` and adds
+        it to the base weight, which fails if the base weight is only a shard.
+
+        Fix: temporarily gather full params via ``summon_full_params``, merge,
+        then clone all parameters so they are independent of FSDP's sharded
+        storage before the context exits and re-shards.
+        """
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        is_fsdp = isinstance(model, FSDP) or any(
+            isinstance(m, FSDP) for m in model.modules()
+        )
+
+        if not is_fsdp:
+            return model.merge_and_unload()
+
+        logger.info("FSDP detected — gathering full params before LoRA merge")
+        with FSDP.summon_full_params(model, writeback=True, rank0_only=False):
+            merged = model.merge_and_unload()
+            # Clone params to detach from FSDP's sharded storage so they
+            # survive after the context manager re-shards the original tensors.
+            for p in merged.parameters():
+                p.data = p.data.clone()
+
+        return merged
 
     def _get_data_cache(self):
         """Get or create a ClipDataCache for the current run."""
