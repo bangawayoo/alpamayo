@@ -380,8 +380,9 @@ class RolloutEngine:
 
         pbar.close()
 
-        if use_expert:
-            self._move_expert_to_cpu()
+        # optionally move expert to cpu to save memory
+        # if use_expert:
+            # self._move_expert_to_cpu()
 
         total_time = time.time() - rollout_start
         logger.info(
