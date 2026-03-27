@@ -319,6 +319,7 @@ def compute_segment_advantages_from_rollouts(
         if T_traj > 0:
             r_per_step = seg_rew.get("r_traj_per_step")
             r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
+            r_per_step_t = r_per_step_t / len(r_per_step)
             r_traj_weighted = w_traj * r_per_step_t
             r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
             g_traj_all = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
@@ -452,6 +453,7 @@ def compute_value_targets(
         if T_traj > 0:
             r_per_step = seg_rew.get("r_traj_per_step")
             r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
+            r_per_step_t = r_per_step_t / len(r_per_step)
             r_traj_weighted = w_traj * r_per_step_t
             r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
         else:

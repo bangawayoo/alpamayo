@@ -1353,6 +1353,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
                         (T_traj,), w_traj * r_traj_scalar / max(T_traj, 1), device=vh_device
                     )
                 # Apply weight and add consistency as terminal reward
+                r_per_step_t = r_per_step_t / r_per_step_t.shape[0]
                 r_traj_weighted = w_traj * r_per_step_t
                 r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
             elif T_traj > 0:
