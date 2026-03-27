@@ -749,6 +749,10 @@ def evaluate_batch(
                 pred_xyz, sample["ego_future_xyz"], coc_text
             )
 
+            # Stash trajectories for saving (pred: (S, T, 3), gt: (T, 3))
+            pred_np = pred_xyz.cpu().numpy()[0, 0]  # (S, T, 3)
+            gt_np = sample["ego_future_xyz"].cpu().numpy()[0, 0]  # (T, 3)
+
             results.append(
                 {
                     "clip_id": sample["clip_id"],
@@ -758,6 +762,8 @@ def evaluate_batch(
                     "r_traj": r_traj_val,
                     "r_reason": r_reason_val,
                     "r_consist": r_consist_val,
+                    "pred_xyz": pred_np,
+                    "gt_xyz": gt_np,
                     "success": True,
                     "error": None,
                     "coc": coc_text,
@@ -776,6 +782,8 @@ def evaluate_batch(
                     "r_traj": None,
                     "r_reason": None,
                     "r_consist": None,
+                    "pred_xyz": None,
+                    "gt_xyz": None,
                     "success": False,
                     "error": f"{str(e)}\n{traceback.format_exc()}",
                     "coc": None,
@@ -1209,6 +1217,17 @@ def main():
             )
             all_results.extend(results)
 
+    # Extract and save trajectories before converting to DataFrame
+    traj_data = {}
+    for r in all_results:
+        if r.get("success") and r.get("pred_xyz") is not None:
+            clip_id = r["clip_id"]
+            traj_data[f"{clip_id}/pred"] = r.pop("pred_xyz")
+            traj_data[f"{clip_id}/gt"] = r.pop("gt_xyz")
+        else:
+            r.pop("pred_xyz", None)
+            r.pop("gt_xyz", None)
+
     # Convert to DataFrame
     results_df = pd.DataFrame(all_results)
 
@@ -1273,9 +1292,15 @@ def main():
         for k in ("mean", "median", "std", "min", "max"):
             print(f"  {k.capitalize():7s}: {stats['minFDE'][k]:.4f}")
         print("\nReward signals:")
-        for name, key in [("Trajectory", "trajectory"), ("Reasoning", "reasoning"), ("Consistency", "consistency")]:
+        reward_labels = [
+            ("Trajectory", "trajectory"),
+            ("Reasoning", "reasoning"),
+            ("Consistency", "consistency"),
+        ]
+        for name, key in reward_labels:
             s = stats["rewards"][key]
-            print(f"  {name:12s}: mean={s['mean']:.4f}  std={s['std']:.4f}  min={s['min']:.4f}  max={s['max']:.4f}")
+            print(f"  {name:12s}: mean={s['mean']:.4f}  std={s['std']:.4f}  "
+                  f"min={s['min']:.4f}  max={s['max']:.4f}")
 
     else:
         stats = {
@@ -1291,6 +1316,12 @@ def main():
     results_csv = output_dir / f"results{shard_suffix}.csv"
     results_df.to_csv(results_csv, index=False)
     print(f"\nDetailed results saved to: {results_csv}")
+
+    if traj_data:
+        traj_npz = output_dir / f"trajectories{shard_suffix}.npz"
+        np.savez_compressed(traj_npz, **traj_data)
+        print(f"Trajectories saved to: {traj_npz} ({len(traj_data) // 2} clips, "
+              f"{traj_npz.stat().st_size / 1024:.0f} KB)")
 
     stats_json = output_dir / f"statistics{shard_suffix}.json"
     with open(stats_json, "w") as f:
