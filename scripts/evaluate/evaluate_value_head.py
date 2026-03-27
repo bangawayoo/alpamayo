@@ -574,9 +574,10 @@ def _traj_per_step_stats(results: list[dict]) -> dict:
     overall_r, overall_p = stats.pearsonr(all_v, all_g)
     overall_mse = float(np.mean((all_v - all_g) ** 2))
 
-    # Split into early (first third), mid, late (last third) by position
+    # Split into first step, early (first third), mid, late (last third)
     third = max(1, n_curv // 3)
     bins = {
+        "first": all_pos == 0,
         "early": all_pos < third,
         "mid": (all_pos >= third) & (all_pos < 2 * third),
         "late": all_pos >= 2 * third,
@@ -690,7 +691,7 @@ def plot_correlation(results: list[dict], output_path: Path):
     # --- Panel 3: Early/mid/late breakdown bar chart ---
     ax3 = axes[1, 0]
     if "bins" in traj_step_stats:
-        bin_names = ["early", "mid", "late"]
+        bin_names = ["first", "early", "mid", "late"]
         bin_labels = []
         bin_r = []
         bin_mse = []
@@ -785,7 +786,7 @@ def main():
     parser.add_argument("--split", default="val")
     parser.add_argument("--dataset-revision", default="05e158af89ba",
                         help="HuggingFace dataset revision (default: 05e158af89ba)")
-    parser.add_argument("--output-dir", default="outputs/value_head_eval")
+    parser.add_argument("--output-dir", default="eval_results/value_head_eval")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -922,7 +923,7 @@ def main():
         print(f"  MSE:               {tps['per_step_mse']:.4f}")
         print(f"  N points:          {tps['per_step_n']}")
         if "bins" in tps:
-            for phase in ("early", "mid", "late"):
+            for phase in ("first", "early", "mid", "late"):
                 b = tps["bins"].get(phase, {})
                 print(
                     f"    {phase:5s}: r={b.get('r', 0):.3f}  "
