@@ -595,6 +595,8 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir = output_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -680,7 +682,7 @@ def main():
 
         # Plot individual sample
         out_path = (
-            output_dir
+            plot_dir
             / f"{i:02d}_Vobs{result['v_obs']:.2f}_Gobs{result['g_obs']:.2f}"
             f"_{result['gt_summary_lon']}_{result['gt_summary_lat']}"
             f"_{clip_id[:8]}.png"
@@ -698,7 +700,7 @@ def main():
         return
 
     # Correlation scatter plot
-    corr_path = output_dir / "correlation_summary.png"
+    corr_path = plot_dir / "correlation_summary.png"
     corr_stats = plot_correlation(results, corr_path)
     print(f"\nCorrelation plot -> {corr_path.name}")
 
@@ -742,7 +744,7 @@ def main():
             indent=2,
         )
     print(f"\n  Results saved to {json_path}")
-    print(f"  Figures saved to {output_dir}/")
+    print(f"  Figures saved to {plot_dir}/")
     print("=" * 60)
 
 
