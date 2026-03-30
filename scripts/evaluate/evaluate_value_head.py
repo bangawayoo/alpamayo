@@ -36,6 +36,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import yaml
 from matplotlib.patches import Patch
 from physical_ai_av import PhysicalAIAVDatasetInterface
 from scipy import stats
@@ -75,18 +76,15 @@ _SFT_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "src" / "alpa
 
 
 def _load_reward_weights() -> tuple[float, float, float]:
-    """Load reward weights from sft_default.yaml, falling back to defaults."""
-    try:
-        import yaml
-        with open(_SFT_CONFIG_PATH) as f:
-            cfg = yaml.safe_load(f)
-        rewards = cfg.get("rewards", {})
-        w_traj = float(rewards.get("trajectory_weight", TRAJ_WEIGHT))
-        w_reason = float(rewards.get("reasoning_weight", REASONING_WEIGHT))
-        w_consist = float(rewards.get("consistency_weight", CONSISTENCY_WEIGHT))
-        return w_traj, w_reason, w_consist
-    except Exception:
-        return TRAJ_WEIGHT, REASONING_WEIGHT, CONSISTENCY_WEIGHT
+    """Load reward weights from sft_default.yaml."""
+    with open(_SFT_CONFIG_PATH) as f:
+        cfg = yaml.safe_load(f)
+    rewards = cfg["rewards"]
+    return (
+        float(rewards["trajectory_weight"]),
+        float(rewards["reasoning_weight"]),
+        float(rewards["consistency_weight"]),
+    )
 
 
 # ---------------------------------------------------------------------------
