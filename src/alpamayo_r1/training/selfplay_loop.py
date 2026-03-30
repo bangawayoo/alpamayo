@@ -24,6 +24,7 @@ import math
 import random
 import time
 from pathlib import Path
+import psutil
 from typing import Any
 
 import numpy as np
@@ -924,6 +925,20 @@ class SelfPlayLoop:
                 rollout_results, adv_labels, advantages
             )
             logger.info("Phase 2.5 complete in %.1fs", time.time() - t0)
+
+        # ----- Cleanup before Phase 3 -----
+        del advantages
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        proc = psutil.Process()
+        logger.warning(
+            "Pre-Phase 3 cleanup: RSS=%.1f GB, VRAM=%.1f/%.1f GB alloc/reserved",
+            proc.memory_info().rss / 1e9,
+            torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
+            torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0,
+        )
 
         # ----- Phase 3: TRAIN -----
         logger.warning("Phase 3: TRAIN — advantage-conditioned SFT + expert CFM")
