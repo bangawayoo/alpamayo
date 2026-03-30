@@ -624,11 +624,16 @@ class SelfPlayLoop:
     ) -> None:
         """Stage 0: Pre-train the value head on rollouts from pi_0.
 
-        Iteratively processes small batches of scenes (pretrain_batch_scenes)
-        instead of all scenes at once. Each iteration: rollout -> reward ->
-        hidden states -> VH train. This yields many more gradient steps
-        (one full training pass per batch) and avoids holding all intermediate
-        data in memory simultaneously.
+        Two-phase pipeline to minimize GPU bubbles:
+
+        Phase 1 (rollout): Process scenes in small batches. For each batch,
+        generate completions, compute rewards, and extract h_obs via a single
+        prompt-only VLM forward per scene (not per completion). Accumulate
+        all (h_obs, reward) pairs into CPU memory (~16 MB per 1K completions).
+
+        Phase 2 (train): Train the value head on all accumulated data at once
+        for num_epochs. This avoids repeated GPU mode-switching between
+        inference and training.
 
         The RolloutEngine is created once and reused (pi_0 and expert are frozen).
         After pre-training, saves value_head.pt and clip_ids.json so that
@@ -636,7 +641,7 @@ class SelfPlayLoop:
 
         Args:
             num_scenes: Number of scenes to generate rollouts for.
-            num_epochs: Training epochs per batch (default: value_head.pretrain_epochs
+            num_epochs: Training epochs (default: value_head.pretrain_epochs
                 from config, or 50).
         """
         from alpamayo_r1.training.sft_rollout import RolloutEngine
@@ -716,26 +721,20 @@ class SelfPlayLoop:
         output_dir = Path(self.cfg.get("training", {}).get("output_dir", "outputs/sft_advcond"))
         pretrain_dir = output_dir / "pretrained"
         checkpoint_interval = int(vh_cfg.get("pretrain_checkpoint_interval", 100))
-
-        # Resume from checkpoint if a previous run was interrupted
         start_iter = 0
-        ckpt_path = pretrain_dir / "pretrain_checkpoint.pt"
-        if ckpt_path.exists():
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            value_head.load_state_dict(ckpt["value_head"])
-            if self._value_head_optimizer is not None and "optimizer" in ckpt:
-                self._value_head_optimizer.load_state_dict(ckpt["optimizer"])
-            start_iter = ckpt.get("iteration", 0)
-            self._vh_global_step = ckpt.get("vh_global_step", 0)
-            last_loss = ckpt.get("last_loss", float("nan"))
-            logger.info(
-                "Resumed VH pre-training from checkpoint: iteration %d/%d (loss=%.4f)",
-                start_iter, num_iters, last_loss,
-            )
+
+        # ---------------------------------------------------------------
+        # Phase 1: Accumulate rollout data across all batches
+        # ---------------------------------------------------------------
+        # Generate rollouts in batches (GPU-bound), but accumulate h_obs and
+        # rewards into a single pool. This avoids switching between rollout
+        # and training modes repeatedly, and the VH trains on all data at once.
+        all_hidden_stash: list[dict] = []
+        all_reward_stash: list[dict] = []
 
         pbar = tqdm(
             total=num_iters, initial=start_iter,
-            desc="VH pretrain", unit="iter", disable=pretrain_rank != 0,
+            desc="VH pretrain (rollout)", unit="iter", disable=pretrain_rank != 0,
         )
         for i in range(start_iter, num_iters):
             chunk_start = i * pretrain_batch_scenes
@@ -743,15 +742,6 @@ class SelfPlayLoop:
             chunk_scenes = pretrain_scenes[chunk_start:chunk_end]
             if not chunk_scenes:
                 break
-
-            logger.debug(
-                "Pretrain iter %d/%d: %d scenes (clips %d–%d)",
-                i + 1,
-                num_iters,
-                len(chunk_scenes),
-                chunk_start,
-                chunk_start + len(chunk_scenes) - 1,
-            )
 
             # Prefetch next iteration's scenes so data loads overlap with GPU work
             next_start = chunk_end
@@ -763,27 +753,58 @@ class SelfPlayLoop:
             rollout_results = engine.generate_completions(chunk_scenes, t0_us, G)
             if not rollout_results:
                 logger.warning("No rollouts from iter %d — skipping", i + 1)
+                pbar.update(1)
                 continue
 
-            # 2. Compute rewards
+            # 2. Compute rewards (CPU)
             reward_stash = engine.compute_rewards(rollout_results)
 
-            # 3. Extract segment hidden states
-            segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
-                rollout_results
-            )
+            # 3. Extract h_obs via prompt-only forward (1 per scene, not per completion)
+            segment_hidden_stash, _ = engine.extract_prompt_hidden(rollout_results)
 
-            # 4. Compute value targets
+            all_hidden_stash.extend(segment_hidden_stash)
+            all_reward_stash.extend(reward_stash)
+
+            logger.debug(
+                "Pretrain rollout %d/%d: %d completions (total accumulated: %d)",
+                i + 1, num_iters, len(rollout_results), len(all_hidden_stash),
+            )
+            pbar.update(1)
+            pbar.set_postfix(completions=len(all_hidden_stash))
+
+            del rollout_results, reward_stash, segment_hidden_stash
+
+            # Keep ranks synchronized — without this, faster ranks drift ahead
+            # and eventually trigger NCCL collective timeouts.
+            if dist.is_initialized():
+                dist.barrier(device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None)
+
+            # Periodic GC to free rollout intermediates
+            if (i + 1) % checkpoint_interval == 0:
+                gc.collect()
+
+        pbar.close()
+
+        # ---------------------------------------------------------------
+        # Phase 2: Train value head on all accumulated data at once
+        # ---------------------------------------------------------------
+        # Barrier so all ranks enter DDP training together
+        if dist.is_initialized():
+            dist.barrier(device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None)
+
+        if all_hidden_stash:
             g_obs = compute_value_targets(
-                segment_reward_stash=reward_stash,
+                segment_reward_stash=all_reward_stash,
                 reward_weights=reward_weights,
             )
-
-            # 5. Train value head on this batch (DDP-wrapped if multi-GPU)
+            logger.info(
+                "Training value head on %d completions for %d epochs",
+                len(all_hidden_stash), num_epochs,
+            )
             metrics = train_segment_value_head(
                 value_head=vh_for_training,
                 optimizer=self._value_head_optimizer,
-                segment_hidden_stash=segment_hidden_stash,
+                segment_hidden_stash=all_hidden_stash,
                 g_obs_list=g_obs,
                 num_epochs=num_epochs,
                 batch_size=vh_batch_size,
@@ -793,48 +814,7 @@ class SelfPlayLoop:
             )
             self._vh_global_step += metrics.get("total_steps", 0)
             last_loss = metrics.get("loss", float("nan"))
-
-            logger.debug(
-                "Pretrain iter %d/%d done: loss=%.4f, completions=%d, vh_steps=%d",
-                i + 1,
-                num_iters,
-                last_loss,
-                len(rollout_results),
-                metrics.get("total_steps", 0),
-            )
-            pbar.update(1)
-            pbar.set_postfix(loss=f"{last_loss:.4f}")
-
-            # Free intermediate data to reduce memory pressure
-            del rollout_results, reward_stash, segment_hidden_stash
-            del completion_segment_map, g_obs
-
-            # Periodic checkpoint + GC every N iterations so a killed run
-            # can resume instead of restarting from scratch.
-            if (i + 1) % checkpoint_interval == 0:
-                if pretrain_rank == 0:
-                    pretrain_dir.mkdir(parents=True, exist_ok=True)
-                    torch.save(
-                        {
-                            "value_head": value_head.state_dict(),
-                            "optimizer": self._value_head_optimizer.state_dict()
-                            if self._value_head_optimizer is not None
-                            else None,
-                            "iteration": i + 1,
-                            "vh_global_step": self._vh_global_step,
-                            "last_loss": last_loss,
-                        },
-                        ckpt_path,
-                    )
-                    logger.info(
-                        "VH pretrain checkpoint at iter %d/%d (loss=%.4f)",
-                        i + 1, num_iters, last_loss,
-                    )
-                if dist.is_initialized():
-                    dist.barrier()
-                gc.collect()
-
-        pbar.close()
+            del all_hidden_stash, all_reward_stash, g_obs
 
         # Restore original cache size for subsequent self-play iterations
         data_cache._max_size = original_cache_max
@@ -847,9 +827,6 @@ class SelfPlayLoop:
             torch.save(value_head.state_dict(), pretrain_dir / "value_head.pt")
             with open(pretrain_dir / "clip_ids.json", "w") as f:
                 json.dump(pretrain_scenes, f)
-            # Remove intermediate checkpoint now that training completed
-            if ckpt_path.exists():
-                ckpt_path.unlink()
             logger.info(
                 "Saved pretrained value head and %d clip IDs to %s (final loss=%.4f)",
                 len(pretrain_scenes),
@@ -858,7 +835,7 @@ class SelfPlayLoop:
             )
 
         if dist.is_initialized():
-            dist.barrier()
+            dist.barrier(device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None)
 
         # Exclude pretrain scenes from self-play partitioning
         self._pretrain_clip_ids = pretrain_scenes
@@ -1525,7 +1502,7 @@ class SelfPlayLoop:
 
         # 8. Synchronize NCCL state across ranks before the next iteration.
         if dist.is_initialized():
-            dist.barrier()
+            dist.barrier(device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None)
             logger.debug("Post-training barrier complete")
 
         # Explicitly delete the Trainer (and its DDP wrapper) so the old

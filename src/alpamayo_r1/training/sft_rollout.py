@@ -11,6 +11,7 @@ Adapted from AlpamayoGRPOTrainer._generate_single_turn() in rollout.py.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from typing import Any
@@ -358,6 +359,7 @@ class RolloutEngine:
                     )
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
+                        
                     for clip_id in chunk_ids:
                         try:
                             scene_results = batch_fn(
@@ -1080,6 +1082,108 @@ class RolloutEngine:
                     completion_segment_map.append(seg_map)
 
         logger.debug("Extracted segment hidden states for %d completions", len(segment_hidden_stash))
+        return segment_hidden_stash, completion_segment_map
+
+    def extract_prompt_hidden(
+        self,
+        rollout_results: list[dict],
+    ) -> tuple[list[dict], list[dict]]:
+        """Extract h_obs via batched prompt-only forward passes.
+
+        Batches unique scenes together for a single VLM forward pass per
+        batch, extracting the last-prompt-token hidden state (h_obs) for
+        each scene. Segment maps are built from completion_ids on CPU
+        without any additional VLM forward pass.
+
+        Args:
+            rollout_results: List of rollout dicts with clip_id, t0_us,
+                prompt_ids, and completion_ids.
+
+        Returns:
+            (segment_hidden_stash, completion_segment_map) — same format as
+            extract_segment_hidden.
+        """
+        device = self.device
+        segment_hidden_stash = []
+        completion_segment_map = []
+
+        from collections import defaultdict
+
+        scene_groups: dict[str, list[int]] = defaultdict(list)
+        for i, r in enumerate(rollout_results):
+            scene_groups[r["clip_id"]].append(i)
+
+        unique_clip_ids = list(scene_groups.keys())
+        t0_us = rollout_results[0]["t0_us"]
+
+        self.full_model.vlm.to(device)
+        self.full_model.vlm.eval()
+
+        traj_future_start_id = self.special_token_ids["traj_future_start"]
+
+        # Batched prompt-only forward passes (reuse _prepare_scene_batch)
+        S = self.scene_batch_size or len(unique_clip_ids)
+        h_obs_per_scene: dict[str, torch.Tensor] = {}
+
+        with torch.no_grad():
+            for batch_start in range(0, len(unique_clip_ids), S):
+                batch_clip_ids = unique_clip_ids[batch_start : batch_start + S]
+                batched_inputs, per_scene_meta = self._prepare_scene_batch(
+                    batch_clip_ids, t0_us, device,
+                )
+
+                # Batched VLM forward (prompt only, no generation)
+                fwd_kwargs = {
+                    k: batched_inputs[k]
+                    for k in ("attention_mask", "pixel_values", "image_grid_thw")
+                    if k in batched_inputs
+                }
+                with torch.autocast(str(device), dtype=torch.bfloat16):
+                    out = self.full_model.vlm(
+                        input_ids=batched_inputs["input_ids"],
+                        output_hidden_states=True,
+                        **fwd_kwargs,
+                    )
+
+                # Extract last real token per scene (inputs are left-padded)
+                hidden = out.hidden_states[-1]  # (B, T, D)
+                for j, meta in enumerate(per_scene_meta):
+                    # Last real token is at position -1 since left-padded
+                    # prompts end at the rightmost position
+                    h_obs = hidden[j, -1:, :].cpu()  # (1, D)
+                    h_obs_per_scene[meta["clip_id"]] = h_obs
+
+                del out, hidden
+
+        # Build per-completion stash and segment maps
+        for clip_id, indices in scene_groups.items():
+            h_obs = h_obs_per_scene[clip_id]
+            for global_idx in indices:
+                completion_ids = rollout_results[global_idx]["completion_ids"]
+
+                traj_positions = [
+                    idx for idx, tid in enumerate(completion_ids)
+                    if self.traj_token_start_idx <= tid < self.traj_token_start_idx + self.traj_vocab_size
+                ]
+                traj_start_offset = next(
+                    (idx for idx, tid in enumerate(completion_ids) if tid == traj_future_start_id),
+                    None,
+                )
+                coc_len = traj_start_offset if traj_start_offset is not None else len(completion_ids)
+
+                segment_hidden_stash.append({"h_obs": h_obs})
+                completion_segment_map.append({
+                    "coc_len": coc_len,
+                    "traj_len": len(traj_positions),
+                    "traj_positions": traj_positions,
+                    "total_len": len(completion_ids),
+                })
+
+        logger.debug(
+            "Extracted prompt hidden states: %d completions from %d scenes (%d batches)",
+            len(segment_hidden_stash), len(scene_groups),
+            math.ceil(len(unique_clip_ids) / S),
+        )
         return segment_hidden_stash, completion_segment_map
 
     def compute_rewards(self, rollout_results: list[dict]) -> list[dict]:
