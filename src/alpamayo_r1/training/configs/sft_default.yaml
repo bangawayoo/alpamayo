@@ -55,7 +55,7 @@ training:
 # Advantage conditioning parameters (outer self-play loop)
 advantage_conditioning:
   enabled: true                   # set to false to disable advantage token injection (plain SFT)
-  num_iterations: 2             # self-play outer loop iterations
+  num_iterations: 5             # self-play outer loop iterations
   completions_per_scene: 4      # G completions per scene during rollout
   p_drop: 0.3                   # conditioning dropout probability for CFG
   alpha: 1.0                    # conditional loss weight (unconditional = 1.0)
@@ -64,7 +64,7 @@ advantage_conditioning:
   ema_alpha: 0.99               # EMA decay for obs-level baseline
   adv_mode: text            # "embedding" (learned AdvantageEmbedding hooks) or "text" (plain-text phrases, no hooks)
   augment_with_gt: true         # select bottom-k% rollouts + GT-augmented positives as training set
-  gt_augment_bottom_k: 30       # bottom k% of rollouts by a_traj to use as negatives
+  gt_augment_bottom_k: 50       # bottom k% of rollouts by a_traj to use as negatives
   gt_augment_top_k2: 50         # top k2% of GT-augmented samples to retain by r_consist
   replay_ratio: 0.3             # fraction of training data from historical replay buffer
   replay_buffer_max_size: 50000
@@ -75,7 +75,7 @@ value_head:
   enabled: true
   hidden_dim: 4096              # must match VLM hidden size
   lr: 1e-4
-  load_path: outputs/vh_0324/pretrained/value_head.pt               # pre-trained value head checkpoint (skips pre-training if provided)
+  load_path: null               # pre-trained value head checkpoint (skips pre-training if provided)
   segment_level: true
   train_epochs: 1              # epochs to train value head per iteration (before advantage computation)
   batch_size: 16                 # mini-batch size for value head training
@@ -88,7 +88,7 @@ value_head:
 # Uses deferred GPU scheduling: expert step runs after VLM SFT backward
 expert_finetune:
   enabled: true
-  lr: 1e-3
+  lr: 2e-4
   weight_decay: 0.01
   num_noisy_samples: 2          # noise samples per GT action for CFM loss
   every_n_steps: 1              # run expert CFM step every N VLM SFT steps
@@ -109,7 +109,7 @@ expert_finetune:
 data:
   split: train
   t0_us: 5100000                # 5.1 seconds into each clip
-  max_samples: 6000             # total scenes, partitioned across iterations
+  max_samples: 4500             # total scenes, partitioned across iterations
   clip_ids_file: null
   exclude_clip_ids_file: notebooks/clip_ids.parquet
   dataset_revision: 05e158af89ba
@@ -117,13 +117,13 @@ data:
 # Reward function weights (must sum to 1.0)
 rewards:
   trajectory_weight: 0.50
-  reasoning_weight: 0.1
-  consistency_weight: 0.4
+  reasoning_weight: 0.0
+  consistency_weight: 0.50
 
 # Rollout generation parameters
 rollout:
   mode: expert                  # "vlm_only" or "expert" — expert uses action expert + diffusion
-  temperature: 0.8              # higher than GRPO (0.6) for exploration
+  temperature: 1.0              # higher than GRPO (0.6) for exploration
   top_p: 0.98
   max_generation_length: 256
   logprob_mini_batch_size: 2
