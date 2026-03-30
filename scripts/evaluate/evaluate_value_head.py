@@ -66,10 +66,27 @@ from alpamayo_r1.training.rewards import (
 from alpamayo_r1.training.sft_rollout import _compute_batch_logprobs, _extract_segment_hidden
 from alpamayo_r1.training.value_head import SceneValueHead, SegmentValueHead
 
-# Reward weights (from grpo_default.yaml)
+# Default reward weights — overridden by sft_default.yaml if available
 TRAJ_WEIGHT = 0.50
 REASONING_WEIGHT = 0.25
 CONSISTENCY_WEIGHT = 0.25
+
+_SFT_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "src" / "alpamayo_r1" / "training" / "configs" / "sft_default.yaml"
+
+
+def _load_reward_weights() -> tuple[float, float, float]:
+    """Load reward weights from sft_default.yaml, falling back to defaults."""
+    try:
+        import yaml
+        with open(_SFT_CONFIG_PATH) as f:
+            cfg = yaml.safe_load(f)
+        rewards = cfg.get("rewards", {})
+        w_traj = float(rewards.get("trajectory_weight", TRAJ_WEIGHT))
+        w_reason = float(rewards.get("reasoning_weight", REASONING_WEIGHT))
+        w_consist = float(rewards.get("consistency_weight", CONSISTENCY_WEIGHT))
+        return w_traj, w_reason, w_consist
+    except Exception:
+        return TRAJ_WEIGHT, REASONING_WEIGHT, CONSISTENCY_WEIGHT
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +753,11 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+
+    # Load reward weights from config
+    global TRAJ_WEIGHT, REASONING_WEIGHT, CONSISTENCY_WEIGHT
+    TRAJ_WEIGHT, REASONING_WEIGHT, CONSISTENCY_WEIGHT = _load_reward_weights()
+    print(f"Reward weights: traj={TRAJ_WEIGHT}, reason={REASONING_WEIGHT}, consist={CONSISTENCY_WEIGHT}")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
