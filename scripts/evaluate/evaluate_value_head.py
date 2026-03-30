@@ -10,13 +10,19 @@ For each sampled clip, runs VLM inference to:
 After all samples, produces a correlation scatter plot and prints
 summary statistics (Pearson/Spearman correlation, MSE).
 
+Automatically uses all available GPUs — clips are sharded across GPUs
+for parallel inference, then results are gathered for analysis.
+
 Usage:
     python scripts/evaluate/evaluate_value_head.py \
         --value-head-path checkpoints/value_head.pt \
         --num-samples 12
     python scripts/evaluate/evaluate_value_head.py \
         --value-head-path checkpoints/value_head.pt \
-        --num-samples 20 --seed 99 --output-dir outputs/value_head_eval
+        --num-samples 200 --seed 99
+    CUDA_VISIBLE_DEVICES=0,1 python scripts/evaluate/evaluate_value_head.py \
+        --value-head-path checkpoints/value_head.pt \
+        --num-samples 200
 """
 
 import argparse
@@ -565,6 +571,145 @@ def plot_correlation(results: list[dict], output_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Multi-GPU evaluation
+# ---------------------------------------------------------------------------
+
+
+def _evaluate_worker(
+    rank: int,
+    clip_ids: list[str],
+    args,
+    avdi,
+    plot_dir,
+    return_dict: dict,
+) -> None:
+    """Evaluate a shard of clips on a single GPU."""
+    device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+
+    model = AlpamayoR1.from_pretrained(args.model_name, dtype=torch.bfloat16).to(device)
+    model.eval()
+    processor = helper.get_processor(model.tokenizer)
+
+    value_head = SegmentValueHead(hidden_dim=args.hidden_dim)
+    state_dict = torch.load(args.value_head_path, map_location="cpu", weights_only=True)
+    value_head.load_state_dict(state_dict)
+    value_head.eval()
+    value_head.to(device)
+
+    # Default camera calibration from the first clip in this shard
+    try:
+        first_intrinsics = avdi.get_clip_feature(
+            clip_ids[0], avdi.features.CALIBRATION.CAMERA_INTRINSICS, maybe_stream=True,
+        )
+        first_extrinsics = avdi.get_clip_feature(
+            clip_ids[0], avdi.features.CALIBRATION.SENSOR_EXTRINSICS, maybe_stream=True,
+        )
+        cam_model = first_intrinsics.camera_models["camera_front_wide_120fov"]
+        cam_pose = first_extrinsics.sensor_poses["camera_front_wide_120fov"]
+    except Exception:
+        cam_model, cam_pose = None, None
+
+    results = []
+    for i, clip_id in enumerate(tqdm(
+        clip_ids, desc=f"GPU {rank}", unit="clip", disable=rank != 0,
+    )):
+        if rank == 0:
+            tqdm.write(f"[GPU {rank}] [{i+1}/{len(clip_ids)}] {clip_id}")
+
+        result = evaluate_sample(
+            model=model, value_head=value_head, processor=processor,
+            avdi=avdi, clip_id=clip_id, t0_us=args.t0_us,
+            num_traj_samples=args.num_traj_samples,
+            temperature=args.temperature, top_p=args.top_p,
+            ade_threshold=args.ade_threshold, device=device,
+        )
+        if result is None:
+            continue
+
+        if rank == 0:
+            tqdm.write(
+                f"  obs: V={result['v_obs']:.3f} G={result['g_obs']:.3f}  "
+                f"({result['gt_summary_lon']} + {result['gt_summary_lat']})"
+            )
+
+        # Plot individual sample
+        if cam_model is not None:
+            try:
+                clip_intrinsics = avdi.get_clip_feature(
+                    clip_id, avdi.features.CALIBRATION.CAMERA_INTRINSICS, maybe_stream=True,
+                )
+                clip_extrinsics = avdi.get_clip_feature(
+                    clip_id, avdi.features.CALIBRATION.SENSOR_EXTRINSICS, maybe_stream=True,
+                )
+                clip_cam_model = clip_intrinsics.camera_models["camera_front_wide_120fov"]
+                clip_cam_pose = clip_extrinsics.sensor_poses["camera_front_wide_120fov"]
+            except Exception:
+                clip_cam_model, clip_cam_pose = cam_model, cam_pose
+
+            global_idx = rank + i * torch.cuda.device_count()
+            out_path = (
+                plot_dir
+                / f"{global_idx:03d}_Vobs{result['v_obs']:.2f}_Gobs{result['g_obs']:.2f}"
+                f"_{result['gt_summary_lon']}_{result['gt_summary_lat']}"
+                f"_{clip_id[:8]}.png"
+            )
+            try:
+                plot_sample_with_value(result, clip_cam_model, clip_cam_pose, out_path)
+            except Exception:
+                pass
+
+        results.append(result)
+
+    return_dict[rank] = results
+
+
+def _evaluate_on_gpus(
+    sampled_clips,
+    num_gpus: int,
+    args,
+    avdi,
+    plot_dir,
+) -> list[dict]:
+    """Shard clips across GPUs using multiprocessing, gather results."""
+    if num_gpus <= 1:
+        # Single-GPU fast path — no spawning overhead
+        return_dict = {}
+        _evaluate_worker(0, list(sampled_clips), args, avdi, plot_dir, return_dict)
+        return return_dict.get(0, [])
+
+    import torch.multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
+
+    # Shard clips round-robin across GPUs
+    shards = [[] for _ in range(num_gpus)]
+    for i, clip_id in enumerate(sampled_clips):
+        shards[i % num_gpus].append(clip_id)
+
+    manager = mp.Manager()
+    return_dict = manager.dict()
+
+    processes = []
+    for rank in range(num_gpus):
+        if not shards[rank]:
+            continue
+        p = mp.Process(
+            target=_evaluate_worker,
+            args=(rank, shards[rank], args, avdi, plot_dir, return_dict),
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    # Gather results in original clip order
+    all_results = []
+    for rank in range(num_gpus):
+        all_results.extend(return_dict.get(rank, []))
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -598,26 +743,13 @@ def main():
     plot_dir = output_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cpu":
-        print("WARNING: running on CPU, this will be very slow.")
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if num_gpus == 0:
+        print("WARNING: no GPUs found, running on CPU (very slow).")
+        num_gpus = 1  # CPU fallback uses 1 "device"
+    print(f"Using {num_gpus} GPU(s)")
 
-    # Load model
-    print("Loading AlpamayoR1...")
-    model = AlpamayoR1.from_pretrained(args.model_name, dtype=torch.bfloat16).to(device)
-    model.eval()
-    processor = helper.get_processor(model.tokenizer)
-
-    # Load value head
-    print(f"Loading value head from {args.value_head_path}...")
-    value_head = SceneValueHead(hidden_dim=args.hidden_dim)
-    state_dict = torch.load(args.value_head_path, map_location="cpu", weights_only=True)
-    value_head.load_state_dict(state_dict)
-    value_head.eval()
-    value_head.to(device)
-    print(f"  Value head loaded ({sum(p.numel() for p in value_head.parameters()):,} params)")
-
-    # Sample clips
+    # Sample clips (before forking so all workers agree)
     print(f"Loading {args.split} clip index...")
     avdi = PhysicalAIAVDatasetInterface(revision=args.dataset_revision)
     print(f"  Dataset revision: {avdi.revision}")
@@ -630,70 +762,10 @@ def main():
     sampled = rng.choice(all_clips, size=min(args.num_samples, len(all_clips)), replace=False)
     print(f"  Sampling {len(sampled)} clips\n")
 
-    # Get camera calibration for visualization
-    print("Loading camera calibration from first clip...")
-    first_intrinsics = avdi.get_clip_feature(
-        sampled[0], avdi.features.CALIBRATION.CAMERA_INTRINSICS, maybe_stream=True,
+    # Shard clips across GPUs and evaluate in parallel
+    results = _evaluate_on_gpus(
+        sampled, num_gpus, args, avdi, plot_dir,
     )
-    first_extrinsics = avdi.get_clip_feature(
-        sampled[0], avdi.features.CALIBRATION.SENSOR_EXTRINSICS, maybe_stream=True,
-    )
-    cam_model = first_intrinsics.camera_models["camera_front_wide_120fov"]
-    cam_pose = first_extrinsics.sensor_poses["camera_front_wide_120fov"]
-
-    # Evaluate all samples
-    results = []
-    for i, clip_id in enumerate(tqdm(sampled, desc="Evaluating")):
-        tqdm.write(f"[{i+1}/{len(sampled)}] {clip_id}")
-
-        result = evaluate_sample(
-            model=model,
-            value_head=value_head,
-            processor=processor,
-            avdi=avdi,
-            clip_id=clip_id,
-            t0_us=args.t0_us,
-            num_traj_samples=args.num_traj_samples,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            ade_threshold=args.ade_threshold,
-            device=device,
-        )
-        if result is None:
-            continue
-
-        tqdm.write(
-            f"  obs: V={result['v_obs']:.3f} G={result['g_obs']:.3f}  "
-            f"({result['gt_summary_lon']} + {result['gt_summary_lat']})"
-        )
-
-        # Per-clip camera calibration for accurate projection
-        try:
-            clip_intrinsics = avdi.get_clip_feature(
-                clip_id, avdi.features.CALIBRATION.CAMERA_INTRINSICS, maybe_stream=True,
-            )
-            clip_extrinsics = avdi.get_clip_feature(
-                clip_id, avdi.features.CALIBRATION.SENSOR_EXTRINSICS, maybe_stream=True,
-            )
-            clip_cam_model = clip_intrinsics.camera_models["camera_front_wide_120fov"]
-            clip_cam_pose = clip_extrinsics.sensor_poses["camera_front_wide_120fov"]
-        except Exception:
-            clip_cam_model, clip_cam_pose = cam_model, cam_pose
-
-        # Plot individual sample
-        out_path = (
-            plot_dir
-            / f"{i:02d}_Vobs{result['v_obs']:.2f}_Gobs{result['g_obs']:.2f}"
-            f"_{result['gt_summary_lon']}_{result['gt_summary_lat']}"
-            f"_{clip_id[:8]}.png"
-        )
-        try:
-            plot_sample_with_value(result, clip_cam_model, clip_cam_pose, out_path)
-            tqdm.write(f"  -> {out_path.name}")
-        except Exception as e:
-            tqdm.write(f"  plot failed: {e}")
-
-        results.append(result)
 
     if len(results) < 2:
         print(f"\nOnly {len(results)} successful sample(s). Need >=2 for correlation analysis.")
