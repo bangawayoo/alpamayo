@@ -253,7 +253,46 @@ class AdvantageBuffer:
 
 
 # ---------------------------------------------------------------------------
-# 3c. Segment advantage computation (generalized from rollout.py)
+# 3c. Return-to-go helpers
+# ---------------------------------------------------------------------------
+
+
+def compute_trajectory_returns(
+    r_per_step: list[float] | np.ndarray | torch.Tensor,
+    w_traj: float,
+    w_consist: float,
+    r_consist: float,
+) -> torch.Tensor:
+    """Compute per-timestep returns-to-go for trajectory tokens.
+
+    Shared by advantage computation, value-head target computation, and
+    evaluation so that the reward-to-return mapping is defined in one place.
+
+    Steps:
+        1. Normalize per-step rewards by sequence length.
+        2. Scale by trajectory reward weight.
+        3. Add consistency reward to the last timestep.
+        4. Reverse cumulative sum to get returns-to-go.
+
+    Args:
+        r_per_step: Per-waypoint raw rewards, shape (T,).
+        w_traj: Trajectory reward weight.
+        w_consist: Consistency reward weight.
+        r_consist: Scalar consistency reward for this completion.
+
+    Returns:
+        Returns-to-go tensor of shape (T,), or empty (0,) tensor if input is empty.
+    """
+    r_per_step_t = r_per_step.float()
+    T = r_per_step_t.shape[0]
+    r_per_step_t = r_per_step_t / T
+    r_weighted = w_traj * r_per_step_t
+    r_weighted[-1] = r_weighted[-1] + w_consist * r_consist
+    return torch.flip(torch.cumsum(torch.flip(r_weighted, [0]), dim=0), [0])
+
+
+# ---------------------------------------------------------------------------
+# 3d. Segment advantage computation (generalized from rollout.py)
 # ---------------------------------------------------------------------------
 
 
@@ -318,14 +357,10 @@ def compute_segment_advantages_from_rollouts(
         T_traj = seg_map["traj_len"]
         if T_traj > 0:
             r_per_step = seg_rew.get("r_traj_per_step")
-            r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
-            r_per_step_t = r_per_step_t / len(r_per_step)
-            r_traj_weighted = w_traj * r_per_step_t
-            r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
-            g_traj_all = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
+            g_traj_all = compute_trajectory_returns(r_per_step, w_traj, w_consist, r_consist)
             g_traj_curv_list.append(g_traj_all)
             traj_lens.append(len(g_traj_all))
-            traj_total = r_traj_weighted.sum().item()
+            traj_total = g_traj_all[0].item()  # first element = total return
         else:
             g_traj_curv_list.append(torch.zeros(0))
             traj_lens.append(0)
@@ -452,23 +487,15 @@ def compute_value_targets(
         T_traj = seg_map["traj_len"]
         if T_traj > 0:
             r_per_step = seg_rew.get("r_traj_per_step")
-            r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32)
-            r_per_step_t = r_per_step_t / len(r_per_step)
-            r_traj_weighted = w_traj * r_per_step_t
-            r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
-        else:
-            r_traj_weighted = torch.zeros(0)
-
-        traj_total = r_traj_weighted.sum().item() if T_traj > 0 else 0.0
-        g_obs = w_reason * r_reason + traj_total
-
-        g_obs_list.append(g_obs)
-
-        if T_traj > 0:
-            g_traj = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
+            g_traj = compute_trajectory_returns(r_per_step, w_traj, w_consist, r_consist)
             g_traj_list.append(g_traj)
+            traj_total = g_traj[0].item()
         else:
             g_traj_list.append(torch.zeros(0))
+            traj_total = 0.0
+
+        g_obs = w_reason * r_reason + traj_total
+        g_obs_list.append(g_obs)
 
     return g_obs_list, g_traj_list
 

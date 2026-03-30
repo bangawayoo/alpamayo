@@ -51,6 +51,7 @@ from alpamayo_r1.training.meta_actions import (
     extract_meta_actions,
     extract_meta_actions_summary,
 )
+from alpamayo_r1.training.advantage_conditioning import compute_trajectory_returns
 from alpamayo_r1.training.rewards import (
     consistency_reward,
     reasoning_quality_reward,
@@ -328,23 +329,13 @@ def evaluate_sample(
             for p in per_sample_preds
         ]
         valid_arrs = [a for a in r_per_step_arrs if a is not None]
-        r_per_step_t = torch.tensor(
-            np.mean(valid_arrs, axis=0), dtype=torch.float32
-        )
-        # Normalize to match training: training divides r_per_step by count
-        # so that sum(r_per_step_t) ≈ mean per-step reward (not total).
-        r_per_step_t = r_per_step_t / len(r_per_step_t)
-        # r_per_step_t has one entry per waypoint. Each waypoint corresponds
-        # to one curvature token (the value head evaluation point), so
-        # returns-to-go over waypoints align 1:1 with curvature positions.
-        r_traj_weighted = TRAJ_WEIGHT * r_per_step_t
-        r_traj_weighted[-1] = r_traj_weighted[-1] + CONSISTENCY_WEIGHT * consist_mean
-        g_traj_all = torch.flip(
-            torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0]
+        r_per_step = np.mean(valid_arrs, axis=0)
+        g_traj_all = compute_trajectory_returns(
+            r_per_step, TRAJ_WEIGHT, CONSISTENCY_WEIGHT, consist_mean,
         )
         g_traj_curv = g_traj_all.tolist()
         g_traj_mean = float(np.mean(g_traj_curv)) if g_traj_curv else 0.0
-        traj_total = r_traj_weighted.sum().item()
+        traj_total = g_traj_all[0].item()
     else:
         g_traj_curv = []
         g_traj_mean = 0.0

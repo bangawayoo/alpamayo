@@ -53,6 +53,7 @@ from trl.models import unwrap_model_for_generation
 from alpamayo_r1 import helper
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1.models.token_utils import StopAfterEOS, extract_traj_tokens
+from alpamayo_r1.training.advantage_conditioning import compute_trajectory_returns
 from alpamayo_r1.training.rollout_utils import (
     ClipDataCache,
     collapse_image_pad_tokens,
@@ -1345,28 +1346,27 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             if T_traj > 0 and i < len(self._segment_reward_stash):
                 seg_rew = self._segment_reward_stash[i]
                 r_per_step = seg_rew.get("r_traj_per_step")
-                if r_per_step is not None and len(r_per_step) == T_traj:
-                    r_per_step_t = torch.tensor(r_per_step, dtype=torch.float32, device=vh_device)
-                else:
-                    # Uniform fallback
-                    r_per_step_t = torch.full(
-                        (T_traj,), w_traj * r_traj_scalar / max(T_traj, 1), device=vh_device
-                    )
-                # Apply weight and add consistency as terminal reward
-                r_per_step_t = r_per_step_t / r_per_step_t.shape[0]
-                r_traj_weighted = w_traj * r_per_step_t
-                r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
+                if r_per_step is None or len(r_per_step) != T_traj:
+                    # Uniform fallback: spread scalar reward evenly
+                    r_per_step = [r_traj_scalar] * T_traj
             elif T_traj > 0:
-                # No per-step stash — uniform
-                r_traj_weighted = torch.full(
-                    (T_traj,), w_traj * r_traj_scalar / max(T_traj, 1), device=vh_device
-                )
-                r_traj_weighted[-1] = r_traj_weighted[-1] + w_consist * r_consist
+                r_per_step = [r_traj_scalar] * T_traj
             else:
-                r_traj_weighted = torch.zeros(0, device=vh_device)
+                r_per_step = []
 
             # --- Value targets (returns-to-go) ---
-            traj_total = r_traj_weighted.sum().item() if T_traj > 0 else 0.0
+            if T_traj > 0:
+                g_traj = compute_trajectory_returns(
+                    r_per_step, w_traj, w_consist, r_consist,
+                )
+                traj_total = g_traj[0].item()
+                all_g_traj.append(g_traj)
+                all_v_traj.append(v_traj.cpu())
+            else:
+                traj_total = 0.0
+                all_g_traj.append(torch.zeros(0))
+                all_v_traj.append(torch.zeros(0))
+
             g_obs = w_reason * r_reason + traj_total  # total return
             g_coc = traj_total  # remaining after CoC
 
@@ -1374,15 +1374,6 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
             all_g_coc.append(g_coc)
             all_v_obs.append(v_obs.item())
             all_v_coc.append(v_coc.item())
-
-            # Per-timestep return-to-go for trajectory tokens
-            if T_traj > 0:
-                g_traj = torch.flip(torch.cumsum(torch.flip(r_traj_weighted, [0]), dim=0), [0])
-                all_g_traj.append(g_traj.cpu())
-                all_v_traj.append(v_traj.cpu())
-            else:
-                all_g_traj.append(torch.zeros(0))
-                all_v_traj.append(torch.zeros(0))
 
             # --- Advantage computation ---
             # CoC advantage: return-minus-baseline at the CoC information level.
