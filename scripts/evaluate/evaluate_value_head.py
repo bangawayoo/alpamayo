@@ -596,18 +596,15 @@ def _evaluate_worker(
     value_head.eval()
     value_head.to(device)
 
-    # Default camera calibration from the first clip in this shard
-    try:
-        first_intrinsics = avdi.get_clip_feature(
-            clip_ids[0], avdi.features.CALIBRATION.CAMERA_INTRINSICS, maybe_stream=True,
+    # Determine how many plots this rank should produce
+    do_plot = not args.no_plot
+    if do_plot:
+        num_gpus = max(1, torch.cuda.device_count())
+        max_plots_per_rank = max(0, args.max_plots - rank) // num_gpus + (
+            1 if rank < args.max_plots % num_gpus else 0
         )
-        first_extrinsics = avdi.get_clip_feature(
-            clip_ids[0], avdi.features.CALIBRATION.SENSOR_EXTRINSICS, maybe_stream=True,
-        )
-        cam_model = first_intrinsics.camera_models["camera_front_wide_120fov"]
-        cam_pose = first_extrinsics.sensor_poses["camera_front_wide_120fov"]
-    except Exception:
-        cam_model, cam_pose = None, None
+        # Simpler: just cap at ceil(max_plots / num_gpus) per rank
+        max_plots_per_rank = (args.max_plots + num_gpus - 1) // num_gpus
 
     results = []
     for i, clip_id in enumerate(tqdm(
@@ -632,8 +629,8 @@ def _evaluate_worker(
                 f"({result['gt_summary_lon']} + {result['gt_summary_lat']})"
             )
 
-        # Plot individual sample
-        if cam_model is not None:
+        # Plot individual sample (up to max_plots_per_rank)
+        if do_plot and len(results) < max_plots_per_rank:
             try:
                 clip_intrinsics = avdi.get_clip_feature(
                     clip_id, avdi.features.CALIBRATION.CAMERA_INTRINSICS, maybe_stream=True,
@@ -643,17 +640,15 @@ def _evaluate_worker(
                 )
                 clip_cam_model = clip_intrinsics.camera_models["camera_front_wide_120fov"]
                 clip_cam_pose = clip_extrinsics.sensor_poses["camera_front_wide_120fov"]
-            except Exception:
-                clip_cam_model, clip_cam_pose = cam_model, cam_pose
 
-            global_idx = rank + i * torch.cuda.device_count()
-            out_path = (
-                plot_dir
-                / f"{global_idx:03d}_Vobs{result['v_obs']:.2f}_Gobs{result['g_obs']:.2f}"
-                f"_{result['gt_summary_lon']}_{result['gt_summary_lat']}"
-                f"_{clip_id[:8]}.png"
-            )
-            try:
+                num_gpus = max(1, torch.cuda.device_count())
+                global_idx = rank + len(results) * num_gpus
+                out_path = (
+                    plot_dir
+                    / f"{global_idx:03d}_Vobs{result['v_obs']:.2f}_Gobs{result['g_obs']:.2f}"
+                    f"_{result['gt_summary_lon']}_{result['gt_summary_lat']}"
+                    f"_{clip_id[:8]}.png"
+                )
                 plot_sample_with_value(result, clip_cam_model, clip_cam_pose, out_path)
             except Exception:
                 pass
@@ -733,6 +728,10 @@ def main():
     parser.add_argument("--dataset-revision", default="05e158af89ba",
                         help="HuggingFace dataset revision (default: 05e158af89ba)")
     parser.add_argument("--output-dir", default="eval_results/value_head_eval")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="Skip per-sample plot generation")
+    parser.add_argument("--max-plots", type=int, default=10,
+                        help="Maximum number of per-sample plots to generate (default: 10)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -772,9 +771,25 @@ def main():
         return
 
     # Correlation scatter plot
-    corr_path = plot_dir / "correlation_summary.png"
-    corr_stats = plot_correlation(results, corr_path)
-    print(f"\nCorrelation plot -> {corr_path.name}")
+    if not args.no_plot:
+        corr_path = plot_dir / "correlation_summary.png"
+        corr_stats = plot_correlation(results, corr_path)
+        print(f"\nCorrelation plot -> {corr_path.name}")
+    else:
+        # Compute stats without plotting
+        from scipy import stats as _stats
+        v_obs = [r["v_obs"] for r in results]
+        g_obs = [r["g_obs"] for r in results]
+        obs_pearson, obs_p = _stats.pearsonr(v_obs, g_obs)
+        obs_spearman, _ = _stats.spearmanr(v_obs, g_obs)
+        obs_mse = float(np.mean([(v - g) ** 2 for v, g in zip(v_obs, g_obs)]))
+        obs_residuals = [v - g for v, g in zip(v_obs, g_obs)]
+        corr_stats = {
+            "obs_pearson_r": obs_pearson, "obs_pearson_p": obs_p,
+            "obs_spearman_r": obs_spearman, "obs_mse": obs_mse,
+            "obs_residual_mean": float(np.mean(obs_residuals)),
+            "obs_residual_std": float(np.std(obs_residuals)),
+        }
 
     # Print summary
     print("\n" + "=" * 60)
