@@ -795,10 +795,10 @@ class TestSceneValueHead:
 
         vh = SceneValueHead(hidden_dim=32)
         # MLP: Layer 1: 32*512 + 512 = 16896, Layer 2: 512*128 + 128 = 65664, Layer 3: 128*1 + 1 = 129
-        # Level embedding: 2 * 32 = 64
+        # Level embedding: 1 * 32 = 32
         total_params = sum(p.numel() for p in vh.parameters())
         mlp_params = (32 * 512 + 512) + (512 * 128 + 128) + (128 * 1 + 1)
-        level_embed_params = 2 * 32
+        level_embed_params = 1 * 32
         expected = mlp_params + level_embed_params
         assert total_params == expected, f"Expected {expected} params, got {total_params}"
 
@@ -936,20 +936,8 @@ class TestSegmentValueHead:
         """Level embedding should have (num_levels, hidden_dim) shape."""
         from alpamayo_r1.training.value_head import SegmentValueHead
 
-        vh = SegmentValueHead(hidden_dim=64, num_levels=2)
-        assert vh.level_embed.weight.shape == (2, 64)
-
-    def test_level_changes_output(self):
-        """Different levels should produce different values for the same input."""
-        import torch
-        from alpamayo_r1.training.value_head import SegmentValueHead
-
-        vh = SegmentValueHead(hidden_dim=32)
-        h = torch.randn(2, 32)
-        v0 = vh(h, level=0)
-        v1 = vh(h, level=1)
-        # At init with random weights, different level embeddings should give different outputs
-        assert not torch.allclose(v0, v1, atol=1e-6)
+        vh = SegmentValueHead(hidden_dim=64)
+        assert vh.level_embed.weight.shape == (1, 64)
 
     def test_3d_input_shape(self):
         """SegmentValueHead should accept (B, T, D) input and return (B, T)."""
@@ -958,7 +946,7 @@ class TestSegmentValueHead:
 
         vh = SegmentValueHead(hidden_dim=32)
         h = torch.randn(2, 10, 32)  # batch=2, seq_len=10
-        v = vh(h, level=1)
+        v = vh(h, level=0)
         assert v.shape == (2, 10), f"Expected (2, 10), got {v.shape}"
 
     def test_2d_input_shape(self):
@@ -994,13 +982,11 @@ class TestSegmentValueHead:
 
         vh = SegmentValueHead(hidden_dim=32)
         h = torch.randn(2, 32)
-        v = vh(h, level=1)
+        v = vh(h, level=0)
         loss = v.sum()
         loss.backward()
         assert vh.level_embed.weight.grad is not None
-        # Only level 1 (traj) row should have non-zero gradients
-        assert vh.level_embed.weight.grad[1].abs().sum() > 0
-        assert vh.level_embed.weight.grad[0].abs().sum() == 0
+        assert vh.level_embed.weight.grad[0].abs().sum() > 0
 
 
 # ===================================================================

@@ -1161,31 +1161,11 @@ def _extract_segment_hidden(
     # h_obs: last prompt token
     h_obs = hidden_states[0, 0:1, :]  # (1, D)
 
-    # Find <cot_end> position
-    cot_end_offset = None
-    for idx, tid in enumerate(completion_ids):
-        if tid == cot_end_id:
-            cot_end_offset = idx
-            break
-
-    if cot_end_offset is not None:
-        h_coc = hidden_states[0, cot_end_offset + 1 : cot_end_offset + 2, :]
-    else:
-        h_coc = h_obs
-
     # Find trajectory token positions
     traj_positions = []
     for idx, tid in enumerate(completion_ids):
         if traj_token_start_idx <= tid < traj_token_start_idx + traj_vocab_size:
             traj_positions.append(idx)
-
-    if traj_positions:
-        traj_indices = [p + 1 for p in traj_positions]
-        h_traj_all = hidden_states[0, traj_indices, :]
-        curv_sel = list(range(1, len(traj_positions), 2))
-        h_traj = h_traj_all[curv_sel]  # curvature positions only (T_curv, D)
-    else:
-        h_traj = torch.zeros(0, hidden_states.shape[-1])
 
     # CoC length
     traj_start_offset = None
@@ -1195,7 +1175,7 @@ def _extract_segment_hidden(
             break
     coc_len = traj_start_offset if traj_start_offset is not None else len(completion_ids)
 
-    segment_hidden = {"h_obs": h_obs, "h_coc": h_coc, "h_traj": h_traj}
+    segment_hidden = {"h_obs": h_obs}
     segment_map = {
         "coc_len": coc_len,
         "traj_len": len(traj_positions),

@@ -53,7 +53,6 @@ from trl.models import unwrap_model_for_generation
 from alpamayo_r1 import helper
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1.models.token_utils import StopAfterEOS, extract_traj_tokens
-from alpamayo_r1.training.advantage_conditioning import compute_trajectory_returns
 from alpamayo_r1.training.rollout_utils import (
     ClipDataCache,
     collapse_image_pad_tokens,
@@ -502,7 +501,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self._traj_mask_ratio: float = 0.5
         self._advantage_enabled: bool = True
         # Segment-level stashes: per-completion hidden states and decomposed rewards
-        self._segment_hidden_stash: list[dict] = []  # {h_obs, h_coc, h_traj, ...}
+        self._segment_hidden_stash: list[dict] = []  # {h_obs}
         self._segment_reward_stash: list[dict] = []  # {r_reason, r_consist, r_traj, r_traj_per_step}
         # Per-completion metadata for building (B, T) advantages after scoring
         self._completion_segment_map: list[dict] = []  # {coc_len, traj_len, ...}
@@ -1169,7 +1168,7 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         token (h_obs). Index 1+j corresponds to completion_ids[j] — the
         j-th completion token (0-indexed).
 
-        Finds <cot_end> and trajectory token positions, extracts h_obs, h_coc,
+        Finds trajectory token positions, extracts h_obs,
         h_traj, and stashes metadata about segment boundaries.
 
         Args:
@@ -1188,34 +1187,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         # Index 0 = last prompt token = h_obs
         h_obs = hidden_states[0, 0:1, :]  # (1, D)
 
-        # Find <cot_end> position in completion_ids
-        cot_end_offset = None
-        for idx, tid in enumerate(completion_ids):
-            if tid == cot_end_id:
-                cot_end_offset = idx
-                break
-
-        # h_coc: hidden state at <cot_end> position
-        # In hidden_states, completion position idx maps to hidden_states[0, idx+1]
-        if cot_end_offset is not None:
-            h_coc = hidden_states[0, cot_end_offset + 1 : cot_end_offset + 2, :]  # (1, D)
-        else:
-            h_coc = h_obs  # fallback: use h_obs if no CoC segment
-
         # Find trajectory token positions
         traj_positions = []
         for idx, tid in enumerate(completion_ids):
             if traj_token_start_idx <= tid < traj_token_start_idx + traj_vocab_size:
                 traj_positions.append(idx)
-
-        if traj_positions:
-            # h_traj: hidden states at curvature token positions only (stride-2)
-            traj_indices = [p + 1 for p in traj_positions]  # +1 for the h_obs offset
-            h_traj_all = hidden_states[0, traj_indices, :]  # (T_traj, D)
-            curv_sel = list(range(1, len(traj_positions), 2))
-            h_traj = h_traj_all[curv_sel]  # (T_curv, D)
-        else:
-            h_traj = torch.zeros(0, hidden_states.shape[-1])
 
         # Find traj_future_start position — CoC tokens are between start of completion
         # and traj_future_start (exclusive of special tokens)
@@ -1231,8 +1207,6 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         self._segment_hidden_stash.append(
             {
                 "h_obs": h_obs,  # (1, D)
-                "h_coc": h_coc,  # (1, D)
-                "h_traj": h_traj,  # (T_traj, D)
             }
         )
         self._completion_segment_map.append(
@@ -1250,14 +1224,11 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         rewards_per_func: torch.Tensor,
         num_generations: int,
     ) -> torch.Tensor:
-        """Compute (B, T) segment-level advantages using the value head.
+        """Compute (B, T) advantages using V(obs) as the sole baseline.
 
-        For each completion (return-minus-baseline at each level):
-        - CoC tokens get: A_coc = G(s_coc) - V(s_coc)
-        - Trajectory tokens get: A_traj_t via GAE(gamma, lambda) on per-timestep rewards
-        - Random masking of trajectory positions to balance gradient contribution
-
-        Also trains the value head on the three-level targets and logs metrics.
+        All tokens (CoC and trajectory) receive A = G(obs) - V(obs).
+        Rewards are normalized per-component before combining.
+        Also trains the value head on obs-level targets and logs metrics.
 
         Args:
             completion_mask: (B, T) binary mask for valid completion tokens.
@@ -1267,6 +1238,10 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         Returns:
             (B, T) advantage tensor on the same device as completion_mask.
         """
+        from alpamayo_r1.training.advantage_conditioning import (
+            compute_obs_return,
+            normalize_reward_components,
+        )
         from alpamayo_r1.training.value_head import SegmentValueHead
 
         device = completion_mask.device
@@ -1276,164 +1251,70 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         if not self._segment_hidden_stash or len(self._segment_hidden_stash) != B:
             logger.warning(
                 "Segment hidden stash size %d != batch size %d — falling back to scalar advantage",
-                len(self._segment_hidden_stash),
-                B,
+                len(self._segment_hidden_stash), B,
             )
             return None
 
-        # Reward function order must match train_grpo.py:
-        #   index 0 = trajectory_quality_reward
-        #   index 1 = reasoning_quality_reward
-        #   index 2 = consistency_reward
-        # The weights below are unpacked in the same order.
         if rewards_per_func.shape[1] < 2:
             logger.warning(
                 "rewards_per_func has %d columns, need at least 2 — falling back",
                 rewards_per_func.shape[1],
             )
             return None
+
         w_traj, w_reason, w_consist = self._value_reward_weights
         mode = "train" if self.model.training else "eval"
         vh_device = next(self.value_head.parameters()).device
 
-        # Collect segment-level value targets and train the value head
+        # Build reward stash for normalization
+        raw_rewards = []
+        for i in range(B):
+            raw_rewards.append({
+                "r_traj": rewards_per_func[i, 0].item(),
+                "r_reason": rewards_per_func[i, 1].item(),
+                "r_consist": rewards_per_func[i, 2].item() if rewards_per_func.shape[1] > 2 else 0.0,
+            })
+        normed = normalize_reward_components(raw_rewards)
+
+        # Batched V(obs) inference
+        h_obs_all = torch.cat(
+            [self._segment_hidden_stash[i]["h_obs"] for i in range(B)], dim=0
+        ).to(vh_device)
+
+        with torch.no_grad():
+            v_obs_all = self.value_head(h_obs_all, level=SegmentValueHead.LEVEL_OBS)
+
+        # Compute G(obs) and fill advantages
         all_v_obs = []
-        all_v_coc = []
-        all_v_traj = []  # list of (T_traj,) tensors
         all_g_obs = []
-        all_g_coc = []
-        all_g_traj = []  # list of (T_traj,) tensors
 
         for i in range(B):
-            seg = self._segment_hidden_stash[i]
-            seg_map = self._completion_segment_map[i]
-
-            h_obs = seg["h_obs"].to(vh_device)  # (1, D)
-            h_coc = seg["h_coc"].to(vh_device)  # (1, D)
-            h_traj = seg["h_traj"].to(vh_device)  # (T_traj, D)
-
-            # Value predictions (detached for advantage computation, will backprop in training)
-            # Trajectory V is evaluated at curvature positions only (idx % 2 == 1),
-            # then expanded to per-token for GAE compatibility. Both tokens in each
-            # (acceleration, curvature) pair receive the same V since the curvature
-            # token is the natural evaluation point for the timestep.
-            with torch.no_grad():
-                v_obs = self.value_head(h_obs, level=SegmentValueHead.LEVEL_OBS)  # (1,)
-                v_coc = self.value_head(h_coc, level=SegmentValueHead.LEVEL_COC)  # (1,)
-                if h_traj.shape[0] > 0:
-                    n_curv = h_traj.shape[0]
-                    traj_pos = (torch.arange(n_curv, device=vh_device) + SegmentValueHead.POS_TRAJ_START).unsqueeze(0)
-                    v_traj_ts = self.value_head(
-                        h_traj.unsqueeze(0),
-                        level=SegmentValueHead.LEVEL_TRAJ,
-                        positions=traj_pos,
-                    ).squeeze(0)  # (n_curv,)
-                    # Expand to per-token: both tokens in a pair get same V
-                    T_tokens = seg_map["traj_len"]
-                    v_traj = v_traj_ts.repeat_interleave(2)
-                    if v_traj.shape[0] < T_tokens:  # odd T_traj
-                        v_traj = torch.cat([v_traj, v_traj_ts[-1:]])
-                else:
-                    v_traj = torch.zeros(0, device=vh_device)
-
-            # Per-function rewards for this sample
-            r_traj_scalar = rewards_per_func[i, 0].item()  # trajectory
-            r_reason = rewards_per_func[i, 1].item()  # reasoning
-            r_consist = rewards_per_func[i, 2].item() if rewards_per_func.shape[1] > 2 else 0.0
-
-            # Compute per-timestep trajectory rewards if we have stashed data
-            T_traj = seg_map["traj_len"]
-            if T_traj > 0 and i < len(self._segment_reward_stash):
-                seg_rew = self._segment_reward_stash[i]
-                r_per_step = seg_rew.get("r_traj_per_step")
-                if r_per_step is None or len(r_per_step) != T_traj:
-                    # Uniform fallback: spread scalar reward evenly
-                    r_per_step = [r_traj_scalar] * T_traj
-            elif T_traj > 0:
-                r_per_step = [r_traj_scalar] * T_traj
-            else:
-                r_per_step = []
-
-            # --- Value targets (returns-to-go) ---
-            if T_traj > 0:
-                g_traj = compute_trajectory_returns(
-                    r_per_step, w_traj, w_consist, r_consist,
-                )
-                traj_total = g_traj[0].item()
-                all_g_traj.append(g_traj)
-                all_v_traj.append(v_traj.cpu())
-            else:
-                traj_total = 0.0
-                all_g_traj.append(torch.zeros(0))
-                all_v_traj.append(torch.zeros(0))
-
-            g_obs = w_reason * r_reason + traj_total  # total return
-            g_coc = traj_total  # remaining after CoC
+            seg_rew = normed[i]
+            g_obs = compute_obs_return(
+                seg_rew["r_traj"], seg_rew["r_reason"], seg_rew["r_consist"],
+                w_traj, w_reason, w_consist,
+            )
+            v_obs = v_obs_all[i].item()
+            a = g_obs - v_obs
 
             all_g_obs.append(g_obs)
-            all_g_coc.append(g_coc)
-            all_v_obs.append(v_obs.item())
-            all_v_coc.append(v_coc.item())
+            all_v_obs.append(v_obs)
 
-            # --- Advantage computation ---
-            # CoC advantage: return-minus-baseline at the CoC information level.
-            # G(s_coc) = traj_total (R_reasoning already collected at s_coc).
-            # A_coc = G(s_coc) - V(s_coc)
-            a_coc = g_coc - v_coc.item()
-
-            # Trajectory advantages: GAE(gamma, lambda)
-            if T_traj > 0:
-                a_traj = _compute_gae(r_traj_weighted, v_traj, self._gamma, self._gae_lambda)
-
-                # Random masking of trajectory positions
-                if self._traj_mask_ratio > 0 and self.model.training:
-                    mask = torch.rand(T_traj, device=device) > self._traj_mask_ratio
-                    # Always keep at least one traj position
-                    if not mask.any():
-                        mask[0] = True
-                    a_traj_masked = a_traj.to(device) * mask.float()
-                else:
-                    a_traj_masked = a_traj.to(device)
-            else:
-                a_traj_masked = torch.zeros(0, device=device)
-
-            # Fill the (B, T) advantage tensor
+            # Fill all valid completion tokens with same advantage
+            seg_map = self._completion_segment_map[i]
             coc_len = seg_map["coc_len"]
             traj_positions = seg_map["traj_positions"]
 
-            # CoC tokens: positions 0..coc_len-1
             if coc_len > 0 and coc_len <= T:
-                advantages[i, :coc_len] = a_coc
+                advantages[i, :coc_len] = a
+            for pos in traj_positions:
+                if pos < T:
+                    advantages[i, pos] = a
 
-            # Trajectory tokens: at their specific positions
-            for t_idx, pos in enumerate(traj_positions):
-                if pos < T and t_idx < len(a_traj_masked):
-                    advantages[i, pos] = a_traj_masked[t_idx]
+        # Train value head (obs-level only)
+        self._train_segment_value_head(all_v_obs, all_g_obs)
 
-        # --- Train value head on all three levels ---
-        self._train_segment_value_head(
-            all_v_obs,
-            all_v_coc,
-            all_v_traj,
-            all_g_obs,
-            all_g_coc,
-            all_g_traj,
-        )
-
-        # --- Log metrics ---
-        if B > 0:
-            coc_advs = [all_g_coc[i] - all_v_coc[i] for i in range(B)]
-            self._metrics[mode]["advantages/coc_mean"].append(float(np.mean(coc_advs)))
-        if any(m["traj_len"] > 0 for m in self._completion_segment_map):
-            traj_adv_vals = []
-            for i in range(B):
-                traj_pos = self._completion_segment_map[i]["traj_positions"]
-                for pos in traj_pos:
-                    if pos < T:
-                        traj_adv_vals.append(advantages[i, pos].item())
-            if traj_adv_vals:
-                self._metrics[mode]["advantages/traj_mean"].append(float(np.mean(traj_adv_vals)))
-
+        # Log metrics
         self._metrics[mode]["advantages/mean"].append(
             advantages[completion_mask.bool()].mean().item() if completion_mask.any() else 0.0
         )
@@ -1447,17 +1328,9 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
     def _train_segment_value_head(
         self,
         all_v_obs: list[float],
-        all_v_coc: list[float],
-        all_v_traj: list[torch.Tensor],
         all_g_obs: list[float],
-        all_g_coc: list[float],
-        all_g_traj: list[torch.Tensor],
     ) -> None:
-        """Train the value head on all three levels jointly.
-
-        Uses per-completion targets for obs and coc levels, and sub-samples
-        trajectory tokens to prevent them from dominating the loss.
-        """
+        """Train the value head on obs-level targets only."""
         from alpamayo_r1.training.value_head import SegmentValueHead
 
         B = len(all_g_obs)
@@ -1467,83 +1340,20 @@ class AlpamayoGRPOTrainer(GRPOTrainer):
         vh_device = next(self.value_head.parameters()).device
         mode = "train" if self.model.training else "eval"
 
-        # Obs-level loss: train on per-completion (h_obs, g_obs) pairs
-        obs_preds = []
-        obs_targets = []
-        for i in range(B):
-            h_obs = self._segment_hidden_stash[i]["h_obs"].to(vh_device)
-            v = self.value_head(h_obs, level=SegmentValueHead.LEVEL_OBS)
-            obs_preds.append(v)
-            obs_targets.append(all_g_obs[i])
-
-        obs_pred_t = torch.cat(obs_preds)
-        obs_target_t = torch.tensor(obs_targets, device=vh_device, dtype=torch.float32)
-        loss_obs = F.mse_loss(obs_pred_t, obs_target_t)
-
-        # CoC-level loss
-        coc_preds = []
-        coc_targets = []
-        for i in range(B):
-            h_coc = self._segment_hidden_stash[i]["h_coc"].to(vh_device)
-            v = self.value_head(h_coc, level=SegmentValueHead.LEVEL_COC)
-            coc_preds.append(v)
-            coc_targets.append(all_g_coc[i])
-
-        coc_pred_t = torch.cat(coc_preds)
-        coc_target_t = torch.tensor(coc_targets, device=vh_device, dtype=torch.float32)
-        loss_coc = F.mse_loss(coc_pred_t, coc_target_t)
-
-        # Traj-level loss: sub-sample at curvature positions only.
-        # Trajectory tokens come in (acceleration, curvature) pairs per timestep.
-        # We evaluate V only at curvature positions (idx % 2 == 1) because the
-        # curvature token has seen both components and rewards are per-timestep.
-        traj_preds = []
-        traj_targets = []
-        max_traj_samples = max(B * 2, 16)  # limit traj samples relative to obs+coc
-        total_traj = 0
-
-        for i in range(B):
-            h_traj = self._segment_hidden_stash[i]["h_traj"]  # (T_curv, D)
-            g_traj = all_g_traj[i]  # (T_curv,)
-            if h_traj.shape[0] == 0:
-                continue
-            n_curv = h_traj.shape[0]
-            n_keep = min(n_curv, max(1, max_traj_samples - total_traj))
-            if n_keep < n_curv:
-                sel = torch.randperm(n_curv)[:n_keep]
-            else:
-                sel = torch.arange(n_curv)
-            h_sub = h_traj[sel].to(vh_device)
-            g_sub = g_traj[sel].to(vh_device)
-            traj_pos = (sel + SegmentValueHead.POS_TRAJ_START).unsqueeze(0).to(vh_device)
-            v = self.value_head(
-                h_sub.unsqueeze(0), level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos
-            ).squeeze(0)
-            traj_preds.append(v)
-            traj_targets.append(g_sub)
-            total_traj += n_keep
-
-        if traj_preds:
-            traj_pred_t = torch.cat(traj_preds)
-            traj_target_t = torch.cat(traj_targets)
-            loss_traj = F.mse_loss(traj_pred_t, traj_target_t)
-        else:
-            loss_traj = torch.tensor(0.0, device=vh_device)
-
-        # Combined loss (equal weight for now)
-        total_loss = (loss_obs + loss_coc + loss_traj) / 3.0
+        h_obs_all = torch.cat(
+            [self._segment_hidden_stash[i]["h_obs"] for i in range(B)], dim=0
+        ).to(vh_device)
+        obs_pred = self.value_head(h_obs_all, level=SegmentValueHead.LEVEL_OBS)
+        obs_target = torch.tensor(all_g_obs, device=vh_device, dtype=torch.float32)
+        loss = F.mse_loss(obs_pred, obs_target)
 
         self.value_optimizer.zero_grad()
-        total_loss.backward()
+        loss.backward()
         self.value_optimizer.step()
 
-        # Log per-level losses
-        self._metrics[mode]["value_head/loss"].append(total_loss.item())
-        self._metrics[mode]["value_head/loss_obs"].append(loss_obs.item())
-        self._metrics[mode]["value_head/loss_coc"].append(loss_coc.item())
-        self._metrics[mode]["value_head/loss_traj"].append(loss_traj.item())
-        self._metrics[mode]["value_head/pred_mean"].append(obs_pred_t.detach().mean().item())
-        self._metrics[mode]["value_head/target_mean"].append(obs_target_t.mean().item())
+        self._metrics[mode]["value_head/loss"].append(loss.item())
+        self._metrics[mode]["value_head/pred_mean"].append(obs_pred.detach().mean().item())
+        self._metrics[mode]["value_head/target_mean"].append(obs_target.mean().item())
 
     def _stash_value_rewards(self, inputs: list[dict], completions: list[str]) -> None:
         """Compute composite rewards and stash them for value head training.

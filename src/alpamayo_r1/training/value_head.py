@@ -1,9 +1,8 @@
 """Segment-level value head for GRPO baseline estimation.
 
-SegmentValueHead maps VLM hidden states to scalar value estimates at two
-semantic levels: observation (scene) and trajectory tokens.
-A shared MLP with additive level embeddings and rotary positional encoding
-predicts V(s) at each level.
+SegmentValueHead maps a VLM hidden state to a scalar value estimate at the
+observation (scene) level. A shared MLP with additive level embedding and
+rotary positional encoding predicts V(s_obs).
 """
 
 from __future__ import annotations
@@ -13,35 +12,24 @@ import torch.nn as nn
 
 
 class SegmentValueHead(nn.Module):
-    """Shared MLP with level embedding and rotary positional encoding.
+    """MLP with level embedding and rotary positional encoding.
 
-    Two levels correspond to the two semantic segments of a VLA generation:
-      - Level 0 (obs): last prompt token — scene understanding before generation
-      - Level 1 (traj): each trajectory token — scene + reasoning + trajectory-so-far
-
-    The level embedding is additive: h' = h + level_embed[level], giving the
-    MLP an explicit signal about which stage of generation it's evaluating.
-
-    Rotary positional encoding (RoPE) provides a parameter-free sinusoidal
-    position signal. Default positions place obs at 0 and trajectory tokens at
-    1, 2, ..., T — enabling the MLP to learn that earlier positions have higher
-    returns-to-go.
+    Predicts V(s_obs) from the last-prompt-token hidden state. The level
+    embedding is additive: h' = h + level_embed[level].
 
     Args:
         hidden_dim: VLM hidden state dimension (4096 for Qwen3-VL-7B/10B).
-        num_levels: Number of distinct levels (default 2).
+        num_levels: Number of distinct levels (default 1, obs-only).
         rope_base: Base frequency for RoPE (default 10000.0).
     """
 
     LEVEL_OBS = 0
-    LEVEL_TRAJ = 1
 
-    # Default position offsets for each level
+    # Default position offset
     POS_OBS = 0
-    POS_TRAJ_START = 1
 
     def __init__(
-        self, hidden_dim: int = 4096, num_levels: int = 2, rope_base: float = 10000.0
+        self, hidden_dim: int = 4096, num_levels: int = 1, rope_base: float = 10000.0
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -88,36 +76,21 @@ class SegmentValueHead(nn.Module):
         return out
 
     def _default_positions(self, h: torch.Tensor, level: int) -> torch.Tensor:
-        """Generate default position indices based on level and input shape.
-
-        Default mapping:
-          - obs:  position 0
-          - traj: positions 1, 2, ..., T
+        """Generate default position indices (always POS_OBS=0).
 
         Args:
             h: Input hidden state, (B, D) or (B, T, D).
-            level: Segment level index.
+            level: Segment level index (unused, kept for API compat).
 
         Returns:
             Position tensor broadcastable with h's non-feature dims.
         """
         device = h.device
-        if level == self.LEVEL_OBS:
-            pos_val = self.POS_OBS
-        else:
-            pos_val = self.POS_TRAJ_START
-
         if h.dim() == 2:
-            # (B, D) — single position per sample
-            return torch.full((h.shape[0],), pos_val, device=device)
+            return torch.full((h.shape[0],), self.POS_OBS, device=device)
         elif h.dim() == 3:
             B, T, _ = h.shape
-            if level == self.LEVEL_TRAJ:
-                # Sequential positions: [POS_TRAJ_START, POS_TRAJ_START+1, ...]
-                pos = torch.arange(T, device=device) + self.POS_TRAJ_START
-                return pos.unsqueeze(0).expand(B, -1)
-            else:
-                return torch.full((B, T), pos_val, device=device)
+            return torch.full((B, T), self.POS_OBS, device=device)
         else:
             raise ValueError(f"Expected 2D or 3D input, got {h.dim()}D")
 
@@ -131,10 +104,9 @@ class SegmentValueHead(nn.Module):
 
         Args:
             h: Hidden state, shape (B, D) or (B, T, D).
-            level: 0=obs, 1=traj. Additive embedding.
+            level: Level index (default 0=obs). Additive embedding.
             positions: Position indices for RoPE encoding. Shape (B,) for
-                2D h or (B, T) for 3D h. If None, uses default positions
-                based on level (obs=0, coc=1, traj=2..T+1).
+                2D h or (B, T) for 3D h. If None, uses default position 0.
 
         Returns:
             Value estimates, shape (B,) or (B, T).

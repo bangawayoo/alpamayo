@@ -160,17 +160,13 @@ class AdvantageEmbedding(torch.nn.Module):
 class AdvantageBuffer:
     """Rolling buffer for percentile-based advantage binarization.
 
-    Maintains separate deques for each advantage level (obs, traj).
-    Uses percentile thresholds to binarize continuous advantages into
-    positive/negative labels for conditioning.
-
-    For the observation level, an EMA baseline is used to compute
-    scene-difficulty-adjusted advantages: A_obs = G(s_obs) - ema.
+    Uses a single advantage buffer (obs-level) with percentile thresholds
+    to binarize continuous advantages into positive/negative labels.
 
     Args:
         k_obs: Percentile threshold for obs-level (0-100). Values above
             the k-th percentile are labeled positive.
-        k_traj: Percentile threshold for traj-level.
+        k_traj: Percentile threshold for traj-level (uses same buffer as obs).
         ema_alpha: EMA decay for observation-level baseline.
         max_size: Maximum number of entries per buffer.
     """
@@ -188,25 +184,22 @@ class AdvantageBuffer:
         self.max_size = max_size
 
         self._buf_obs: deque[float] = deque(maxlen=max_size)
-        self._buf_traj: deque[float] = deque(maxlen=max_size)
         self._ema_obs: float | None = None
 
     def update(
         self,
         a_obs_list: list[float],
-        a_traj_list: list[float],
+        a_traj_list: list[float] | None = None,
     ) -> None:
-        """Append new advantages to the rolling buffers.
+        """Append new advantages to the rolling buffer.
 
         Args:
             a_obs_list: Per-completion observation-level advantages.
-            a_traj_list: Per-completion trajectory-level advantages
-                (mean across timesteps for each completion).
+            a_traj_list: Ignored (kept for backward compat). Traj advantages
+                are the same as obs advantages with obs-only value head.
         """
         self._buf_obs.extend(a_obs_list)
-        self._buf_traj.extend(a_traj_list)
 
-        # Update EMA for observation level
         for a in a_obs_list:
             if self._ema_obs is None:
                 self._ema_obs = a
@@ -217,19 +210,18 @@ class AdvantageBuffer:
         """Compute current percentile thresholds for binarization.
 
         Returns:
-            (eps_obs, eps_traj) threshold values. Advantages above
-            the threshold are labeled positive.
+            (eps_obs, eps_traj) threshold values. Both use the same buffer.
         """
         eps_obs = float(np.percentile(self._buf_obs, self.k_obs)) if self._buf_obs else 0.0
-        eps_traj = float(np.percentile(self._buf_traj, self.k_traj)) if self._buf_traj else 0.0
+        eps_traj = float(np.percentile(self._buf_obs, self.k_traj)) if self._buf_obs else 0.0
         return eps_obs, eps_traj
 
     def binarize(self, a_obs: float, a_traj: float) -> tuple[bool, bool]:
-        """Binarize per-level advantages using current thresholds.
+        """Binarize advantages using current thresholds.
 
         Args:
             a_obs: Observation-level advantage.
-            a_traj: Trajectory-level advantage (mean over timesteps).
+            a_traj: Trajectory-level advantage (same as a_obs with obs-only VH).
 
         Returns:
             (i_obs, i_traj): True = positive, False = negative.
@@ -241,54 +233,70 @@ class AdvantageBuffer:
         """Serialize buffer state for checkpointing."""
         return {
             "buf_obs": list(self._buf_obs),
-            "buf_traj": list(self._buf_traj),
             "ema_obs": self._ema_obs,
         }
 
     def load_state_dict(self, state: dict) -> None:
         """Restore buffer state from checkpoint."""
         self._buf_obs = deque(state["buf_obs"], maxlen=self.max_size)
-        self._buf_traj = deque(state["buf_traj"], maxlen=self.max_size)
         self._ema_obs = state.get("ema_obs")
 
 
 # ---------------------------------------------------------------------------
-# 3c. Return-to-go helpers
+# 3c. Reward normalization
 # ---------------------------------------------------------------------------
 
 
-def compute_trajectory_returns(
-    r_per_step: list[float] | np.ndarray | torch.Tensor,
-    w_traj: float,
-    w_consist: float,
-    r_consist: float,
-) -> torch.Tensor:
-    """Compute per-timestep returns-to-go for trajectory tokens.
+def normalize_reward_components(
+    reward_stash: list[dict],
+    eps: float = 1e-8,
+) -> list[dict]:
+    """Per-component z-score normalization across a batch of completions.
 
-    Shared by advantage computation, value-head target computation, and
-    evaluation so that the reward-to-return mapping is defined in one place.
-
-    Steps:
-        1. Normalize per-step rewards by sequence length.
-        2. Scale by trajectory reward weight.
-        3. Add consistency reward to the last timestep.
-        4. Reverse cumulative sum to get returns-to-go.
+    Normalizes r_traj, r_reason, r_consist independently to zero mean and
+    unit variance so that no single component dominates the combined return
+    due to scale differences.
 
     Args:
-        r_per_step: Per-waypoint raw rewards, shape (T,).
-        w_traj: Trajectory reward weight.
-        w_consist: Consistency reward weight.
-        r_consist: Scalar consistency reward for this completion.
+        reward_stash: List of {r_traj, r_reason, r_consist, ...} per completion.
+        eps: Small constant to avoid division by zero.
 
     Returns:
-        Returns-to-go tensor of shape (T,), or empty (0,) tensor if input is empty.
+        New list of dicts with normalized r_traj, r_reason, r_consist.
+        Other keys are preserved unchanged.
     """
-    r_per_step_t = r_per_step.float()
-    T = r_per_step_t.shape[0]
-    r_per_step_t = r_per_step_t / T
-    r_weighted = w_traj * r_per_step_t
-    r_weighted[-1] = r_weighted[-1] + w_consist * r_consist
-    return torch.flip(torch.cumsum(torch.flip(r_weighted, [0]), dim=0), [0])
+    if len(reward_stash) < 2:
+        return reward_stash
+
+    keys = ("r_traj", "r_reason", "r_consist")
+    arrays = {}
+    for k in keys:
+        vals = np.array([s.get(k, 0.0) for s in reward_stash])
+        std = vals.std()
+        if std > eps:
+            arrays[k] = (vals - vals.mean()) / std
+        else:
+            arrays[k] = np.zeros_like(vals)
+
+    result = []
+    for i, s in enumerate(reward_stash):
+        new_s = dict(s)
+        for k in keys:
+            new_s[k] = float(arrays[k][i])
+        result.append(new_s)
+    return result
+
+
+def compute_obs_return(
+    r_traj: float,
+    r_reason: float,
+    r_consist: float,
+    w_traj: float,
+    w_reason: float,
+    w_consist: float,
+) -> float:
+    """Compute observation-level return G(s_obs) = weighted sum of rewards."""
+    return w_traj * r_traj + w_reason * r_reason + w_consist * r_consist
 
 
 # ---------------------------------------------------------------------------
@@ -303,32 +311,21 @@ def compute_segment_advantages_from_rollouts(
     value_head: torch.nn.Module,
     reward_weights: tuple[float, float, float] = (0.5, 0.25, 0.25),
 ) -> list[dict]:
-    """Compute per-completion segment-level advantages (return minus baseline).
+    """Compute per-completion advantages using V(obs) as the sole baseline.
 
-    Uses the return-minus-baseline formulation: at each information level,
-    the advantage is the actual return from that state minus the value head's
-    prediction. See docs/value-head.md "Approach A" for details.
-
-    Batches all obs-level and traj-level value head calls for efficiency:
-    obs hidden states are stacked into a single (B, D) tensor, and traj
-    curvature tokens are concatenated into a flat (N_total, D) tensor for
-    one forward pass (no padding — the MLP is pointwise).
+    Rewards are normalized per-component before weighting, so no single
+    reward dominates due to variance differences.
 
     Args:
-        segment_hidden_stash: List of {h_obs, h_coc, h_traj} per completion.
-            h_obs: (1, D), h_coc: (1, D), h_traj: (T_traj, D).
-        segment_reward_stash: List of {r_traj, r_reason, r_consist,
-            r_traj_per_step} per completion.
-        completion_segment_map: List of {coc_len, traj_len, traj_positions}
-            per completion.
+        segment_hidden_stash: List of {h_obs} per completion.
+        segment_reward_stash: List of {r_traj, r_reason, r_consist} per completion.
+        completion_segment_map: List of {coc_len, traj_len, traj_positions}.
         value_head: SegmentValueHead instance.
         reward_weights: (w_traj, w_reason, w_consist).
 
     Returns:
-        List of dicts per completion: {a_obs, a_traj, a_traj_per_step}.
-        a_obs: observation-level advantage — G(s_obs) - V(s_obs)
-        a_traj: mean trajectory advantage (over timesteps)
-        a_traj_per_step: per-timestep trajectory advantages
+        List of dicts per completion: {a_obs, a_traj}.
+        Both use V(obs) as baseline: A = G(s_obs) - V(s_obs).
     """
     from alpamayo_r1.training.value_head import SegmentValueHead
 
@@ -336,113 +333,23 @@ def compute_segment_advantages_from_rollouts(
     if B == 0:
         return []
 
-    w_traj, w_reason, w_consist = reward_weights
     vh_device = next(value_head.parameters()).device
 
-    # ------------------------------------------------------------------
-    # 1. Compute returns-to-go on CPU (no GPU needed)
-    # ------------------------------------------------------------------
-    g_obs_list: list[float] = []
-    g_traj_curv_list: list[torch.Tensor] = []  # per-completion, curvature positions only
-    traj_lens: list[int] = []  # number of curvature positions per completion
+    g_obs_list = compute_value_targets(segment_reward_stash, reward_weights)
 
-    for i in range(B):
-        seg_rew = segment_reward_stash[i]
-        seg_map = completion_segment_map[i]
-
-        r_traj_scalar = seg_rew.get("r_traj", 0.0)
-        r_reason = seg_rew.get("r_reason", 0.0)
-        r_consist = seg_rew.get("r_consist", 0.0)
-
-        T_traj = seg_map["traj_len"]
-        if T_traj > 0:
-            r_per_step = seg_rew.get("r_traj_per_step")
-            g_traj_all = compute_trajectory_returns(r_per_step, w_traj, w_consist, r_consist)
-            g_traj_curv_list.append(g_traj_all)
-            traj_lens.append(len(g_traj_all))
-            traj_total = g_traj_all[0].item()  # first element = total return
-        else:
-            g_traj_curv_list.append(torch.zeros(0))
-            traj_lens.append(0)
-            traj_total = 0.0
-
-        g_obs = w_reason * r_reason + traj_total
-        g_obs_list.append(g_obs)
-
-    # ------------------------------------------------------------------
-    # 2. Bulk-transfer obs hidden states to GPU, batched forward pass
-    # ------------------------------------------------------------------
-    # Concatenate on CPU first, then single transfer to GPU
+    # Batched V(obs) inference
     h_obs_all = torch.cat(
         [segment_hidden_stash[i]["h_obs"] for i in range(B)], dim=0
-    ).to(vh_device)  # (B, D)
+    ).to(vh_device)
 
     with torch.no_grad():
-        v_obs_all = value_head(
-            h_obs_all, level=SegmentValueHead.LEVEL_OBS
-        )  # (B,)
+        v_obs_all = value_head(h_obs_all, level=SegmentValueHead.LEVEL_OBS)
 
-    # ------------------------------------------------------------------
-    # 3. Flat-batched traj-level value head inference (no padding)
-    # ------------------------------------------------------------------
-    # The value head MLP is pointwise — concatenate all curvature tokens
-    # from all completions into a single (N_total, D) tensor with their
-    # respective positions, run one forward pass, then split results back.
-    traj_indices = [i for i in range(B) if traj_lens[i] > 0]
-
-    v_traj_per_completion: list[torch.Tensor | None] = [None] * B
-
-    if traj_indices:
-        curv_hiddens = []
-        curv_positions = []
-        curv_lens = []
-        for i in traj_indices:
-            h_traj = segment_hidden_stash[i]["h_traj"]  # already curvature-only
-            n_curv = h_traj.shape[0]
-            curv_hiddens.append(h_traj)
-            curv_positions.append(torch.arange(n_curv) + SegmentValueHead.POS_TRAJ_START)
-            curv_lens.append(n_curv)
-
-        # Concatenate on CPU, single transfer — no padding waste
-        h_traj_flat = torch.cat(curv_hiddens, dim=0).to(vh_device)  # (N_total, D)
-        pos_flat = torch.cat(curv_positions, dim=0).to(vh_device)  # (N_total,)
-
-        with torch.no_grad():
-            v_traj_flat = value_head(
-                h_traj_flat, level=SegmentValueHead.LEVEL_TRAJ, positions=pos_flat
-            )  # (N_total,)
-
-        # Split results back per completion
-        v_splits = v_traj_flat.split(curv_lens)
-        for j, i in enumerate(traj_indices):
-            v_traj_per_completion[i] = v_splits[j]
-
-    # ------------------------------------------------------------------
-    # 4. Assemble per-completion advantages
-    # ------------------------------------------------------------------
+    # Assemble advantages: A = G(obs) - V(obs) for both obs and traj levels
     results = []
     for i in range(B):
-        g_obs = g_obs_list[i]
-        v_obs = v_obs_all[i].item()
-        a_obs = g_obs - v_obs
-
-        if traj_lens[i] > 0:
-            g_traj = g_traj_curv_list[i].to(vh_device)
-            v_traj = v_traj_per_completion[i]
-            a_traj_per_step = g_traj - v_traj
-            a_traj_mean = a_traj_per_step.mean().item()
-            a_traj_list = a_traj_per_step.cpu().tolist()
-        else:
-            a_traj_mean = 0.0
-            a_traj_list = []
-
-        results.append(
-            {
-                "a_obs": a_obs,
-                "a_traj": a_traj_mean,
-                "a_traj_per_step": a_traj_list,
-            }
-        )
+        a = g_obs_list[i] - v_obs_all[i].item()
+        results.append({"a_obs": a, "a_traj": a})
 
     return results
 
@@ -454,50 +361,31 @@ def compute_segment_advantages_from_rollouts(
 
 def compute_value_targets(
     segment_reward_stash: list[dict],
-    completion_segment_map: list[dict],
     reward_weights: tuple[float, float, float] = (0.5, 0.25, 0.25),
-) -> tuple[list[float], list[torch.Tensor]]:
-    """Compute returns-to-go targets for value head training at obs and traj levels.
+) -> list[float]:
+    """Compute obs-level return targets G(s_obs) for value head training.
 
-    Uses the same reward decomposition as compute_segment_advantages_from_rollouts,
-    but returns the raw targets (not advantages) for MSE training.
+    Rewards are normalized per-component before weighting.
 
     Args:
-        segment_reward_stash: Per-completion {r_traj, r_reason, r_consist, r_traj_per_step}.
-        completion_segment_map: Per-completion {coc_len, traj_len, traj_positions}.
+        segment_reward_stash: Per-completion {r_traj, r_reason, r_consist}.
         reward_weights: (w_traj, w_reason, w_consist).
 
     Returns:
-        (g_obs_list, g_traj_list):
-        - g_obs_list: per-completion total return G(s_obs)
-        - g_traj_list: per-completion return-to-go tensors G(s_traj_j), shape (T_traj,) each
+        g_obs_list: per-completion total return G(s_obs).
     """
     w_traj, w_reason, w_consist = reward_weights
+    normed_stash = normalize_reward_components(segment_reward_stash)
+
     g_obs_list = []
-    g_traj_list = []
-
-    for i in range(len(segment_reward_stash)):
-        seg_rew = segment_reward_stash[i]
-        seg_map = completion_segment_map[i]
-
-        r_traj_scalar = seg_rew.get("r_traj", 0.0)
-        r_reason = seg_rew.get("r_reason", 0.0)
-        r_consist = seg_rew.get("r_consist", 0.0)
-
-        T_traj = seg_map["traj_len"]
-        if T_traj > 0:
-            r_per_step = seg_rew.get("r_traj_per_step")
-            g_traj = compute_trajectory_returns(r_per_step, w_traj, w_consist, r_consist)
-            g_traj_list.append(g_traj)
-            traj_total = g_traj[0].item()
-        else:
-            g_traj_list.append(torch.zeros(0))
-            traj_total = 0.0
-
-        g_obs = w_reason * r_reason + traj_total
+    for seg_rew in normed_stash:
+        g_obs = compute_obs_return(
+            seg_rew.get("r_traj", 0.0), seg_rew.get("r_reason", 0.0),
+            seg_rew.get("r_consist", 0.0), w_traj, w_reason, w_consist,
+        )
         g_obs_list.append(g_obs)
 
-    return g_obs_list, g_traj_list
+    return g_obs_list
 
 
 def train_segment_value_head(
@@ -505,179 +393,94 @@ def train_segment_value_head(
     optimizer: torch.optim.Optimizer,
     segment_hidden_stash: list[dict],
     g_obs_list: list[float],
-    g_traj_list: list[torch.Tensor],
     num_epochs: int = 10,
     batch_size: int = 64,
     log_interval: int = 10,
     tb_writer: Any | None = None,
     global_step_offset: int = 0,
 ) -> dict[str, float]:
-    """Train the two-level value head on returns-to-go targets.
+    """Train the obs-level value head on G(s_obs) targets.
 
-    Uses mini-batch SGD with shuffled indices each epoch. Obs hidden states
-    are pre-stacked for efficient batched forward passes; traj tokens are
-    processed per-completion within each mini-batch (variable-length sequences
-    cannot be stacked without padding).
-
-    Both obs and traj losses are per-completion averages: obs uses MSE over
-    the batch, traj computes per-completion MSE across all curvature timesteps
-    and then averages across completions. This keeps the two loss terms at
-    comparable scales.
-
-    Under DDP (multi-GPU), each rank processes a different shard of each
-    mini-batch. A fixed seed per epoch ensures all ranks agree on the
-    shuffled order, then each rank takes its slice. Gradients are
-    synchronized automatically if ``value_head`` is DDP-wrapped.
+    Uses mini-batch SGD with shuffled indices each epoch. Under DDP,
+    each rank processes a different shard; gradients are synchronized
+    automatically if ``value_head`` is DDP-wrapped.
 
     Args:
         value_head: SegmentValueHead instance (optionally DDP-wrapped).
         optimizer: Optimizer for the value head parameters.
-        segment_hidden_stash: Per-completion {h_obs, h_traj}.
+        segment_hidden_stash: Per-completion {h_obs}.
         g_obs_list: Per-completion G(s_obs) targets.
-        g_traj_list: Per-completion G(s_traj_j) tensors.
         num_epochs: Number of training epochs over the data.
         batch_size: Mini-batch size (default 64, **per rank** under DDP).
         log_interval: Log to display every N steps (default 10).
         tb_writer: Optional TensorBoard SummaryWriter for scalar logging.
-        global_step_offset: Starting global step for TensorBoard (allows
-            monotonically increasing steps across pretrain + iterations).
+        global_step_offset: Starting global step for TensorBoard.
 
     Returns:
-        Dict of final-step metrics: {loss, loss_obs, loss_traj,
-        pred_obs_mean, target_obs_mean, total_steps}.
+        Dict of final-step metrics: {loss, pred_obs_mean, target_obs_mean,
+        total_steps}.
     """
     import torch.distributed as dist
     from alpamayo_r1.training.value_head import SegmentValueHead
 
     B = len(g_obs_list)
     if B == 0 or num_epochs <= 0:
-        return {"loss": 0.0, "loss_obs": 0.0, "loss_traj": 0.0,
-                "pred_obs_mean": 0.0, "target_obs_mean": 0.0, "total_steps": 0}
+        return {"loss": 0.0, "pred_obs_mean": 0.0, "target_obs_mean": 0.0, "total_steps": 0}
 
     vh_device = next(value_head.parameters()).device
 
-    # DDP info: shard mini-batches across ranks
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     rank = dist.get_rank() if dist.is_initialized() else 0
 
-    # Pre-stack obs into (B, D) / (B,) tensors on CPU for efficient indexing
     h_obs_all = torch.cat([segment_hidden_stash[i]["h_obs"] for i in range(B)], dim=0)
     g_obs_all = torch.tensor(g_obs_list, dtype=torch.float32)
 
     from tqdm import tqdm
 
-    metrics = {"loss": 0.0, "loss_obs": 0.0, "loss_traj": 0.0,
-               "pred_obs_mean": 0.0, "target_obs_mean": 0.0}
+    metrics = {"loss": 0.0, "pred_obs_mean": 0.0, "target_obs_mean": 0.0}
     global_step = 0
     total_batches = num_epochs * math.ceil(math.ceil(B / world_size) / batch_size)
     pbar = tqdm(total=total_batches, desc="VH train", unit="step", disable=rank != 0)
 
     for epoch in range(num_epochs):
-        # Fixed seed so all ranks get the same permutation
         g = torch.Generator().manual_seed(epoch * 31337)
         perm = torch.randperm(B, generator=g)
 
-        # Shard across ranks: each rank gets every world_size-th sample.
-        # Pad so all ranks have the same number of samples (DDP requires
-        # all ranks to participate in every forward/backward step).
         rank_indices = perm[rank::world_size]
         max_per_rank = math.ceil(B / world_size)
         if len(rank_indices) < max_per_rank:
-            # Wrap around to pad with duplicates
             extra = perm[: max_per_rank - len(rank_indices)]
             rank_indices = torch.cat([rank_indices, extra])
 
         for batch_start in range(0, len(rank_indices), batch_size):
             idx = rank_indices[batch_start : batch_start + batch_size]
 
-            # --- Obs-level loss ---
             h_obs_batch = h_obs_all[idx].to(vh_device)
             g_obs_batch = g_obs_all[idx].to(vh_device)
             obs_pred = value_head(h_obs_batch, level=SegmentValueHead.LEVEL_OBS)
-            loss_obs = F.mse_loss(obs_pred, g_obs_batch)
-
-            # --- Traj-level loss (flat-batched over curvature positions) ---
-            # Trajectory tokens come in (acceleration, curvature) pairs per timestep.
-            # We evaluate V only at curvature positions (idx % 2 == 1) because:
-            # (1) the curvature token has seen both components of the timestep,
-            # (2) rewards are per-timestep, so the value function is naturally
-            #     timestep-level rather than token-level.
-            # Per-completion MSE is averaged across completions so that each
-            # completion contributes equally regardless of trajectory length.
-            #
-            # Concatenate all curvature tokens into a flat (N_total, D) tensor
-            # for one forward pass (MLP is pointwise — no padding needed).
-            traj_h_list = []
-            traj_g_list = []
-            traj_p_list = []
-            traj_curv_lens = []
-            for i_local in idx.tolist():
-                h_traj = segment_hidden_stash[i_local]["h_traj"]  # already curvature-only
-                g_traj = g_traj_list[i_local]
-                if h_traj.shape[0] == 0:
-                    continue
-                n_curv = h_traj.shape[0]
-                traj_h_list.append(h_traj)
-                traj_g_list.append(g_traj)
-                traj_p_list.append(torch.arange(n_curv) + SegmentValueHead.POS_TRAJ_START)
-                traj_curv_lens.append(n_curv)
-
-            if traj_h_list:
-                # Flat concat on CPU, single transfer — no padding waste
-                h_flat = torch.cat(traj_h_list, dim=0).to(vh_device)  # (N_total, D)
-                g_flat = torch.cat(traj_g_list, dim=0).to(vh_device)  # (N_total,)
-                p_flat = torch.cat(traj_p_list, dim=0).to(vh_device)  # (N_total,)
-
-                v_flat = value_head(
-                    h_flat, level=SegmentValueHead.LEVEL_TRAJ, positions=p_flat
-                )  # (N_total,)
-
-                # Per-completion MSE averaged across completions
-                v_splits = v_flat.split(traj_curv_lens)
-                g_splits = g_flat.split(traj_curv_lens)
-                traj_losses = [
-                    F.mse_loss(v_s, g_s) for v_s, g_s in zip(v_splits, g_splits)
-                ]
-                loss_traj = torch.stack(traj_losses).mean()
-            else:
-                loss_traj = torch.tensor(0.0, device=vh_device)
-
-            # --- Combined loss ---
-            total_loss = (loss_obs + loss_traj) / 2.0
+            loss = F.mse_loss(obs_pred, g_obs_batch)
 
             optimizer.zero_grad()
-            total_loss.backward()
+            loss.backward()
             optimizer.step()
 
-            target_traj_mean = g_flat.mean().item() if traj_h_list else 0.0
             metrics = {
-                "loss": total_loss.item(),
-                "loss_obs": loss_obs.item(),
-                "loss_traj": loss_traj.item(),
+                "loss": loss.item(),
                 "pred_obs_mean": obs_pred.detach().mean().item(),
                 "target_obs_mean": g_obs_batch.mean().item(),
-                "target_traj_mean": target_traj_mean,
             }
 
-            # TensorBoard: log every step
             if tb_writer is not None:
                 step = global_step_offset + global_step
                 for key, val in metrics.items():
                     tb_writer.add_scalar(f"value_head/{key}", val, step)
 
-            # Display: log every log_interval steps or at epoch boundaries
             at_epoch_start = (batch_start == 0)
             at_log_interval = (global_step + 1) % max(1, log_interval) == 0
             if global_step == 0 or at_log_interval or at_epoch_start:
                 logger.debug(
-                    "  Value head step %d (epoch %d/%d): "
-                    "loss=%.4f (obs=%.4f traj=%.4f)",
-                    global_step + 1,
-                    epoch + 1,
-                    num_epochs,
-                    metrics["loss"],
-                    metrics["loss_obs"],
-                    metrics["loss_traj"],
+                    "  Value head step %d (epoch %d/%d): loss=%.4f",
+                    global_step + 1, epoch + 1, num_epochs, metrics["loss"],
                 )
 
             global_step += 1
@@ -685,26 +488,16 @@ def train_segment_value_head(
             pbar.set_postfix(loss=f"{metrics['loss']:.4f}")
 
     pbar.close()
-    total_steps = global_step
-    metrics["total_steps"] = total_steps
+    metrics["total_steps"] = global_step
 
     if tb_writer is not None:
         tb_writer.flush()
 
     logger.debug(
         "Value head training: %d epochs, %d steps, %d samples (batch_size=%d) | "
-        "loss=%.4f (obs=%.4f, traj=%.4f) | "
-        "pred_obs=%.3f target_obs=%.3f target_traj=%.3f",
-        num_epochs,
-        total_steps,
-        B,
-        batch_size,
-        metrics["loss"],
-        metrics["loss_obs"],
-        metrics["loss_traj"],
-        metrics["pred_obs_mean"],
-        metrics["target_obs_mean"],
-        metrics["target_traj_mean"],
+        "loss=%.4f | pred_obs=%.3f target_obs=%.3f",
+        num_epochs, global_step, B, batch_size,
+        metrics["loss"], metrics["pred_obs_mean"], metrics["target_obs_mean"],
     )
     return metrics
 

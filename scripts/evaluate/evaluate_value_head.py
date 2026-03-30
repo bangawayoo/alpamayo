@@ -51,7 +51,7 @@ from alpamayo_r1.training.meta_actions import (
     extract_meta_actions,
     extract_meta_actions_summary,
 )
-from alpamayo_r1.training.advantage_conditioning import compute_trajectory_returns
+from alpamayo_r1.training.advantage_conditioning import compute_obs_return
 from alpamayo_r1.training.rewards import (
     consistency_reward,
     reasoning_quality_reward,
@@ -137,13 +137,13 @@ def compute_segment_values(
     completion_ids: list[int],
     device: str,
 ) -> dict:
-    """Compute obs-level and trajectory-level value predictions.
+    """Compute obs-level value prediction.
 
     Runs a teacher-forced VLM forward to extract hidden states at segment
-    boundaries, then evaluates the value head at both obs and traj levels.
+    boundaries, then evaluates the value head at obs level.
 
     Returns:
-        Dict with v_obs, v_traj_mean, v_traj_per_step, and segment_map.
+        Dict with v_obs and segment_map.
     """
     from alpamayo_r1.inference import prepare_vlm_inputs
 
@@ -166,31 +166,12 @@ def compute_segment_values(
 
     vh_device = next(value_head.parameters()).device
 
-    # Obs-level value
     h_obs = seg_hidden["h_obs"].to(vh_device)  # (1, D)
     with torch.no_grad():
         v_obs = value_head(h_obs, level=SegmentValueHead.LEVEL_OBS).item()
 
-    # Trajectory-level values (h_traj is already curvature-only from _extract_segment_hidden)
-    h_traj = seg_hidden["h_traj"]  # (T_curv, D)
-    v_traj_mean = 0.0
-    v_traj_per_step = []
-
-    n_curv = h_traj.shape[0]
-    if n_curv > 0:
-        h_traj_curv = h_traj.to(vh_device)
-        traj_pos = (torch.arange(n_curv) + SegmentValueHead.POS_TRAJ_START).to(vh_device)
-        with torch.no_grad():
-            v_traj = value_head(
-                h_traj_curv, level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos,
-            )
-        v_traj_per_step = v_traj.cpu().tolist()
-        v_traj_mean = float(v_traj.mean().item())
-
     return {
         "v_obs": v_obs,
-        "v_traj_mean": v_traj_mean,
-        "v_traj_per_step": v_traj_per_step,
         "segment_map": seg_map,
     }
 
@@ -267,7 +248,6 @@ def evaluate_sample(
             model, value_head, model_inputs, first_gen_ids, device,
         )
         v_obs = seg_values["v_obs"]
-        v_traj_mean = seg_values["v_traj_mean"]
 
     except Exception as e:
         print(f"  inference failed: {e}")
@@ -316,32 +296,11 @@ def evaluate_sample(
         + CONSISTENCY_WEIGHT * consist_mean
     )
 
-    # 4. Compute return targets G(s_obs) and G(s_traj) to match training
-    # G(s_obs) = w_reason * r_reason + sum(w_traj * r_per_step_j + w_consist * r_consist)
-    # G(s_traj_j) = cumulative reward from position j to end
-    T_traj = seg_values["segment_map"]["traj_len"]
-    if T_traj > 0:
-        # Per-waypoint displacement-relative rewards, matching training
-        from alpamayo_r1.training.rewards import trajectory_per_timestep_rewards
-
-        r_per_step_arrs = [
-            trajectory_per_timestep_rewards(p, gt_flat)
-            for p in per_sample_preds
-        ]
-        valid_arrs = [a for a in r_per_step_arrs if a is not None]
-        r_per_step = np.mean(valid_arrs, axis=0)
-        g_traj_all = compute_trajectory_returns(
-            r_per_step, TRAJ_WEIGHT, CONSISTENCY_WEIGHT, consist_mean,
-        )
-        g_traj_curv = g_traj_all.tolist()
-        g_traj_mean = float(np.mean(g_traj_curv)) if g_traj_curv else 0.0
-        traj_total = g_traj_all[0].item()
-    else:
-        g_traj_curv = []
-        g_traj_mean = 0.0
-        traj_total = 0.0
-
-    g_obs = REASONING_WEIGHT * reason_mean + traj_total
+    # 4. Compute return target G(s_obs) = weighted sum of rewards
+    g_obs = compute_obs_return(
+        traj_r_scalar, reason_mean, consist_mean,
+        TRAJ_WEIGHT, REASONING_WEIGHT, CONSISTENCY_WEIGHT,
+    )
 
     # Meta-action summary from ground truth
     gt_summary = extract_meta_actions_summary(gt)
@@ -350,10 +309,6 @@ def evaluate_sample(
         "clip_id": clip_id,
         "v_obs": v_obs,
         "g_obs": g_obs,
-        "v_traj_mean": v_traj_mean,
-        "g_traj_mean": g_traj_mean,
-        "v_traj_per_step": seg_values["v_traj_per_step"],
-        "g_traj_per_step": g_traj_curv,
         "composite_reward": composite,
         "traj_reward": traj_r_scalar,
         "reasoning_reward": reason_mean,
@@ -515,7 +470,6 @@ def plot_sample_with_value(
     # Stats box on BEV
     stats_text = (
         f"v_obs:   {result['v_obs']:.3f}  G_obs:  {result['g_obs']:.3f}\n"
-        f"v_traj:  {result['v_traj_mean']:.3f}  G_traj: {result['g_traj_mean']:.3f}\n"
         f"\n"
         f"traj_r:    {result['traj_reward']:.3f}\n"
         f"reason_r:  {result['reasoning_reward']:.3f}\n"
@@ -545,100 +499,18 @@ def plot_sample_with_value(
 # ---------------------------------------------------------------------------
 
 
-def _traj_per_step_stats(results: list[dict]) -> dict:
-    """Compute per-step traj V vs G statistics with early/mid/late breakdown.
-
-    Pools per-step values across all samples and splits curvature positions
-    into three equal-sized bins (early/mid/late in the trajectory).
-    """
-    all_v = []
-    all_g = []
-    all_pos = []
-    for r in results:
-        v_steps = r["v_traj_per_step"]
-        g_steps = r["g_traj_per_step"]
-        if not v_steps or not g_steps:
-            continue
-        n = min(len(v_steps), len(g_steps))
-        all_v.extend(v_steps[:n])
-        all_g.extend(g_steps[:n])
-        all_pos.extend(range(n))
-
-    if len(all_v) < 3:
-        return {"per_step_n": len(all_v)}
-
-    all_v = np.array(all_v)
-    all_g = np.array(all_g)
-    all_pos = np.array(all_pos)
-    n_curv = int(all_pos.max()) + 1
-
-    # Overall per-step correlation
-    overall_r, overall_p = stats.pearsonr(all_v, all_g)
-    overall_mse = float(np.mean((all_v - all_g) ** 2))
-
-    # Split into first step, early (first third), mid, late (last third)
-    third = max(1, n_curv // 3)
-    bins = {
-        "first": all_pos == 0,
-        "early": all_pos < third,
-        "mid": (all_pos >= third) & (all_pos < 2 * third),
-        "late": all_pos >= 2 * third,
-    }
-
-    bin_stats = {}
-    for name, mask in bins.items():
-        if mask.sum() < 2:
-            bin_stats[name] = {"n": int(mask.sum()), "r": 0.0, "mse": 0.0,
-                               "v_mean": 0.0, "g_mean": 0.0}
-            continue
-        bv, bg = all_v[mask], all_g[mask]
-        r_val, _ = stats.pearsonr(bv, bg)
-        bin_stats[name] = {
-            "n": int(mask.sum()),
-            "r": float(r_val),
-            "mse": float(np.mean((bv - bg) ** 2)),
-            "v_mean": float(bv.mean()),
-            "g_mean": float(bg.mean()),
-        }
-
-    return {
-        "per_step_n": len(all_v),
-        "per_step_pearson_r": float(overall_r),
-        "per_step_pearson_p": float(overall_p),
-        "per_step_mse": overall_mse,
-        "n_curv_positions": n_curv,
-        "bins": bin_stats,
-        "all_v": all_v,
-        "all_g": all_g,
-        "all_pos": all_pos,
-    }
-
-
 def plot_correlation(results: list[dict], output_path: Path):
-    """Scatter plots of V vs G at obs and traj levels with per-step breakdown."""
+    """Scatter plot of V vs G at obs level with residual histogram."""
     v_obs = [r["v_obs"] for r in results]
     g_obs = [r["g_obs"] for r in results]
-    v_traj = [r["v_traj_mean"] for r in results]
-    g_traj = [r["g_traj_mean"] for r in results]
 
     obs_pearson, obs_p = stats.pearsonr(v_obs, g_obs)
     obs_spearman, _ = stats.spearmanr(v_obs, g_obs)
     obs_mse = float(np.mean([(v - g) ** 2 for v, g in zip(v_obs, g_obs)]))
 
-    has_traj = any(v != 0.0 or g != 0.0 for v, g in zip(v_traj, g_traj))
-    if has_traj:
-        traj_pearson, traj_p = stats.pearsonr(v_traj, g_traj)
-        traj_spearman, _ = stats.spearmanr(v_traj, g_traj)
-        traj_mse = float(np.mean([(v - g) ** 2 for v, g in zip(v_traj, g_traj)]))
-    else:
-        traj_pearson = traj_mse = 0.0
-
-    traj_step_stats = _traj_per_step_stats(results)
-
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig, (ax, ax4) = plt.subplots(1, 2, figsize=(16, 6))
 
     # --- Panel 1: V_obs vs G_obs ---
-    ax = axes[0, 0]
     ax.scatter(g_obs, v_obs, c="#4488FF", s=60, alpha=0.7, edgecolors="white", linewidths=0.5)
     lims = [
         min(min(g_obs), min(v_obs)) - 0.05,
@@ -664,75 +536,9 @@ def plot_correlation(results: list[dict], output_path: Path):
         bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9),
     )
 
-    # --- Panel 2: V_traj vs G_traj (per-step, colored by position) ---
-    ax2 = axes[0, 1]
-    if "all_v" in traj_step_stats:
-        sc = ax2.scatter(
-            traj_step_stats["all_g"], traj_step_stats["all_v"],
-            c=traj_step_stats["all_pos"], cmap="viridis",
-            s=30, alpha=0.6, edgecolors="white", linewidths=0.3,
-        )
-        plt.colorbar(sc, ax=ax2, label="Curvature position (0=early)")
-        all_vals = np.concatenate([traj_step_stats["all_g"], traj_step_stats["all_v"]])
-        lims2 = [all_vals.min() - 0.05, all_vals.max() + 0.05]
-        ax2.plot(lims2, lims2, "--", color="gray", alpha=0.5)
-        ax2.text(
-            0.03, 0.97,
-            f"Per-step r: {traj_step_stats['per_step_pearson_r']:.3f}\n"
-            f"MSE:        {traj_step_stats['per_step_mse']:.4f}\n"
-            f"N:          {traj_step_stats['per_step_n']}",
-            transform=ax2.transAxes, fontsize=9, fontfamily="monospace",
-            verticalalignment="top",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9),
-        )
-    ax2.set_xlabel("G(s_traj) per step", fontsize=11)
-    ax2.set_ylabel("V(s_traj) per step", fontsize=11)
-    ax2.set_title("Traj Per-Step Calibration", fontsize=12, fontweight="bold")
-    ax2.grid(True, alpha=0.3)
-
-    # --- Panel 3: Early/mid/late breakdown bar chart ---
-    ax3 = axes[1, 0]
-    if "bins" in traj_step_stats:
-        bin_names = ["first", "early", "mid", "late"]
-        bin_labels = []
-        bin_r = []
-        bin_mse = []
-        bin_v_means = []
-        bin_g_means = []
-        for name in bin_names:
-            b = traj_step_stats["bins"].get(name, {})
-            bin_labels.append(f"{name}\n(n={b.get('n', 0)})")
-            bin_r.append(b.get("r", 0.0))
-            bin_mse.append(b.get("mse", 0.0))
-            bin_v_means.append(b.get("v_mean", 0.0))
-            bin_g_means.append(b.get("g_mean", 0.0))
-
-        x = np.arange(len(bin_names))
-        w = 0.35
-        ax3.bar(x - w / 2, bin_g_means, w, label="G (target)", color="#4488FF", alpha=0.7)
-        ax3.bar(x + w / 2, bin_v_means, w, label="V (predicted)", color="#FF4444", alpha=0.7)
-        ax3.set_xticks(x)
-        ax3.set_xticklabels(bin_labels)
-        ax3.set_ylabel("Mean value", fontsize=11)
-        ax3.set_title("V vs G by Trajectory Phase", fontsize=12, fontweight="bold")
-        ax3.legend(fontsize=9)
-        ax3.grid(True, alpha=0.3, axis="y")
-
-        # Annotate with correlation
-        for i, name in enumerate(bin_names):
-            b = traj_step_stats["bins"].get(name, {})
-            ax3.text(
-                i, max(bin_g_means[i], bin_v_means[i]) + 0.02,
-                f"r={b.get('r', 0):.2f}", ha="center", fontsize=8,
-            )
-
-    # --- Panel 4: Residual histograms ---
-    ax4 = axes[1, 1]
+    # --- Panel 2: Residual histogram ---
     obs_residuals = [v - g for v, g in zip(v_obs, g_obs)]
     ax4.hist(obs_residuals, bins=15, color="#4488FF", alpha=0.7, edgecolor="white", label="Obs")
-    if has_traj:
-        traj_residuals = [v - g for v, g in zip(v_traj, g_traj)]
-        ax4.hist(traj_residuals, bins=15, color="#FF4444", alpha=0.5, edgecolor="white", label="Traj (mean)")
     ax4.axvline(0, color="black", linestyle="--", alpha=0.5)
     ax4.set_xlabel("Residual (V - G)", fontsize=11)
     ax4.set_ylabel("Count", fontsize=11)
@@ -741,8 +547,7 @@ def plot_correlation(results: list[dict], output_path: Path):
     ax4.grid(True, alpha=0.3)
 
     fig.suptitle(
-        f"Value Head Evaluation  |  Obs r={obs_pearson:.3f}  "
-        f"Traj per-step r={traj_step_stats.get('per_step_pearson_r', 0):.3f}",
+        f"Value Head Evaluation  |  Obs r={obs_pearson:.3f}",
         fontsize=14, fontweight="bold", y=1.02,
     )
     fig.tight_layout()
@@ -756,12 +561,6 @@ def plot_correlation(results: list[dict], output_path: Path):
         "obs_mse": obs_mse,
         "obs_residual_mean": float(np.mean(obs_residuals)),
         "obs_residual_std": float(np.std(obs_residuals)),
-        "traj_mean_pearson_r": traj_pearson,
-        "traj_mean_mse": traj_mse,
-        "traj_per_step": {
-            k: v for k, v in traj_step_stats.items()
-            if k not in ("all_v", "all_g", "all_pos")
-        },
     }
 
 
@@ -863,7 +662,6 @@ def main():
 
         tqdm.write(
             f"  obs: V={result['v_obs']:.3f} G={result['g_obs']:.3f}  "
-            f"traj: V={result['v_traj_mean']:.3f} G={result['g_traj_mean']:.3f}  "
             f"({result['gt_summary_lon']} + {result['gt_summary_lat']})"
         )
 
@@ -915,25 +713,6 @@ def main():
     print(f"  MSE:               {corr_stats['obs_mse']:.4f}")
     print(f"  Residual mean:     {corr_stats['obs_residual_mean']:+.4f}")
     print(f"  Residual std:      {corr_stats['obs_residual_std']:.4f}")
-    print("  --- Traj level (per-sample mean) ---")
-    print(f"  Pearson r:         {corr_stats['traj_mean_pearson_r']:.4f}")
-    print(f"  MSE:               {corr_stats['traj_mean_mse']:.4f}")
-    tps = corr_stats.get("traj_per_step", {})
-    if "per_step_pearson_r" in tps:
-        print("  --- Traj level (per-step, pooled) ---")
-        print(f"  Pearson r:         {tps['per_step_pearson_r']:.4f}")
-        print(f"  MSE:               {tps['per_step_mse']:.4f}")
-        print(f"  N points:          {tps['per_step_n']}")
-        if "bins" in tps:
-            for phase in ("first", "early", "mid", "late"):
-                b = tps["bins"].get(phase, {})
-                print(
-                    f"    {phase:5s}: r={b.get('r', 0):.3f}  "
-                    f"MSE={b.get('mse', 0):.4f}  "
-                    f"V_mean={b.get('v_mean', 0):.3f}  "
-                    f"G_mean={b.get('g_mean', 0):.3f}  "
-                    f"(n={b.get('n', 0)})"
-                )
 
     # Save JSON results (strip non-serializable fields)
     json_results = []
@@ -942,10 +721,6 @@ def main():
             "clip_id": r["clip_id"],
             "v_obs": r["v_obs"],
             "g_obs": r["g_obs"],
-            "v_traj_mean": r["v_traj_mean"],
-            "g_traj_mean": r["g_traj_mean"],
-            "v_traj_per_step": r["v_traj_per_step"],
-            "g_traj_per_step": r["g_traj_per_step"],
             "composite_reward": r["composite_reward"],
             "traj_reward": r["traj_reward"],
             "reasoning_reward": r["reasoning_reward"],

@@ -774,9 +774,8 @@ class SelfPlayLoop:
             )
 
             # 4. Compute value targets
-            g_obs, g_traj = compute_value_targets(
+            g_obs = compute_value_targets(
                 segment_reward_stash=reward_stash,
-                completion_segment_map=completion_segment_map,
                 reward_weights=reward_weights,
             )
 
@@ -786,7 +785,6 @@ class SelfPlayLoop:
                 optimizer=self._value_head_optimizer,
                 segment_hidden_stash=segment_hidden_stash,
                 g_obs_list=g_obs,
-                g_traj_list=g_traj,
                 num_epochs=num_epochs,
                 batch_size=vh_batch_size,
                 log_interval=vh_log_interval,
@@ -797,14 +795,10 @@ class SelfPlayLoop:
             last_loss = metrics.get("loss", float("nan"))
 
             logger.debug(
-                "Pretrain iter %d/%d done: loss=%.4f (obs=%.4f traj=%.4f), "
-                "target_traj=%.3f, completions=%d, vh_steps=%d",
+                "Pretrain iter %d/%d done: loss=%.4f, completions=%d, vh_steps=%d",
                 i + 1,
                 num_iters,
                 last_loss,
-                metrics.get("loss_obs", float("nan")),
-                metrics.get("loss_traj", float("nan")),
-                metrics.get("target_traj_mean", float("nan")),
                 len(rollout_results),
                 metrics.get("total_steps", 0),
             )
@@ -813,7 +807,7 @@ class SelfPlayLoop:
 
             # Free intermediate data to reduce memory pressure
             del rollout_results, reward_stash, segment_hidden_stash
-            del completion_segment_map, g_obs, g_traj
+            del completion_segment_map, g_obs
 
             # Periodic checkpoint + GC every N iterations so a killed run
             # can resume instead of restarting from scratch.
@@ -1082,9 +1076,8 @@ class SelfPlayLoop:
 
             # 4. THEN update value head on current data (for next iteration)
             t_ = time.time()
-            g_obs, g_traj = compute_value_targets(
+            g_obs = compute_value_targets(
                 segment_reward_stash=reward_stash,
-                completion_segment_map=completion_segment_map,
                 reward_weights=reward_weights,
             )
             vh_train_epochs = int(vh_cfg.get("train_epochs", 10))
@@ -1103,7 +1096,6 @@ class SelfPlayLoop:
                 optimizer=self._value_head_optimizer,
                 segment_hidden_stash=segment_hidden_stash,
                 g_obs_list=g_obs,
-                g_traj_list=g_traj,
                 num_epochs=vh_train_epochs,
                 batch_size=vh_batch_size,
                 log_interval=vh_log_interval,
@@ -1112,15 +1104,14 @@ class SelfPlayLoop:
             )
             if isinstance(vh_for_train, torch.nn.parallel.DistributedDataParallel):
                 del vh_for_train  # release DDP wrapper
+            del segment_hidden_stash, completion_segment_map, reward_stash
+            del g_obs
             self._vh_global_step += vh_metrics.get("total_steps", 0)
             logger.info(
-                "  Stage 4 (train_value_head): %.1fs (%d epochs, loss=%.4f obs=%.4f traj=%.4f, target_traj=%.3f)",
+                "  Stage 4 (train_value_head): %.1fs (%d epochs, loss=%.4f)",
                 time.time() - t_,
                 vh_train_epochs,
                 vh_metrics.get("loss", float("nan")),
-                vh_metrics.get("loss_obs", float("nan")),
-                vh_metrics.get("loss_traj", float("nan")),
-                vh_metrics.get("target_traj_mean", float("nan")),
             )
         else:
             # Fallback: use composite reward as a_obs, no segment-level detail
@@ -1134,6 +1125,7 @@ class SelfPlayLoop:
                     + w_consist * rew["r_consist"]
                 )
                 advantages.append({"a_obs": composite, "a_traj": composite})
+            del reward_stash
 
         # 5. Update advantage buffer
         a_obs_list = [a["a_obs"] for a in advantages]
