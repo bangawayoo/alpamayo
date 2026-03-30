@@ -170,23 +170,21 @@ def compute_segment_values(
     with torch.no_grad():
         v_obs = value_head(h_obs, level=SegmentValueHead.LEVEL_OBS).item()
 
-    # Trajectory-level values (curvature positions only, matching training)
-    h_traj = seg_hidden["h_traj"]  # (T_traj, D)
-    T_traj = seg_map["traj_len"]
+    # Trajectory-level values (h_traj is already curvature-only from _extract_segment_hidden)
+    h_traj = seg_hidden["h_traj"]  # (T_curv, D)
     v_traj_mean = 0.0
     v_traj_per_step = []
 
-    if T_traj > 0:
-        curv_idx = torch.arange(1, T_traj, 2)
-        if len(curv_idx) > 0:
-            h_traj_curv = h_traj[curv_idx].to(vh_device)  # (T_curv, D)
-            traj_pos = (curv_idx // 2 + SegmentValueHead.POS_TRAJ_START).to(vh_device)
-            with torch.no_grad():
-                v_traj = value_head(
-                    h_traj_curv, level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos,
-                )
-            v_traj_per_step = v_traj.cpu().tolist()
-            v_traj_mean = float(v_traj.mean().item())
+    n_curv = h_traj.shape[0]
+    if n_curv > 0:
+        h_traj_curv = h_traj.to(vh_device)
+        traj_pos = (torch.arange(n_curv) + SegmentValueHead.POS_TRAJ_START).to(vh_device)
+        with torch.no_grad():
+            v_traj = value_head(
+                h_traj_curv, level=SegmentValueHead.LEVEL_TRAJ, positions=traj_pos,
+            )
+        v_traj_per_step = v_traj.cpu().tolist()
+        v_traj_mean = float(v_traj.mean().item())
 
     return {
         "v_obs": v_obs,
@@ -333,6 +331,9 @@ def evaluate_sample(
         r_per_step_t = torch.tensor(
             np.mean(valid_arrs, axis=0), dtype=torch.float32
         )
+        # Normalize to match training: training divides r_per_step by count
+        # so that sum(r_per_step_t) ≈ mean per-step reward (not total).
+        r_per_step_t = r_per_step_t / len(r_per_step_t)
         # r_per_step_t has one entry per waypoint. Each waypoint corresponds
         # to one curvature token (the value head evaluation point), so
         # returns-to-go over waypoints align 1:1 with curvature positions.
