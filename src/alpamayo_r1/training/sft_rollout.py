@@ -1033,6 +1033,7 @@ class RolloutEngine:
         device = self.device
         segment_hidden_stash = []
         completion_segment_map = []
+        t_total_start = time.time()
 
         # Group by clip_id to share model_inputs across completions from same scene
         from collections import defaultdict
@@ -1041,21 +1042,47 @@ class RolloutEngine:
         for i, r in enumerate(rollout_results):
             scene_groups[r["clip_id"]].append(i)
 
+        t_grouping = time.time() - t_total_start
+
         # Ensure VLM is on the target device
+        t_vlm_setup_start = time.time()
         self.full_model.vlm.to(device)
         self.full_model.vlm.eval()
+        t_vlm_setup = time.time() - t_vlm_setup_start
+
+        t_data_load_total = 0.0
+        t_prepare_inputs_total = 0.0
+        t_logprob_fwd_total = 0.0
+        t_extract_hidden_total = 0.0
+        n_scenes = len(scene_groups)
+        n_completions = 0
+
+        # Memory tracking
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+            mem_before = torch.cuda.memory_allocated(device) / (1024 ** 3)
+        peak_per_scene: list[float] = []
+
         with torch.no_grad():
             for clip_id, indices in scene_groups.items():
                 t0_us = rollout_results[indices[0]]["t0_us"]
+
+                t_ = time.time()
                 model_inputs, _ = self.data_cache.get(clip_id, t0_us, device)
+                t_data_load_total += time.time() - t_
 
                 # Prepare prompt input_ids with fused history
+                t_ = time.time()
                 input_ids, _ = prepare_vlm_inputs(self.full_model, model_inputs)
                 prompt_len = input_ids.shape[1]
                 prompt_input_ids = input_ids.clone()
+                t_prepare_inputs_total += time.time() - t_
 
                 # Process each completion from this scene
                 comp_ids_list = [rollout_results[i]["completion_ids"] for i in indices]
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
+                t_ = time.time()
                 logprob_result = _compute_batch_logprobs(
                     self.full_model,
                     model_inputs,
@@ -1066,8 +1093,14 @@ class RolloutEngine:
                     mini_batch_size=self.logprob_mini_batch_size,
                     output_hidden_states=True,
                 )
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                t_logprob_fwd_total += time.time() - t_
+                if device.type == "cuda":
+                    peak_per_scene.append(torch.cuda.max_memory_allocated(device) / (1024 ** 3))
                 _, batch_hidden = logprob_result
 
+                t_ = time.time()
                 for local_idx, global_idx in enumerate(indices):
                     hidden_states = batch_hidden[local_idx]
                     completion_ids = rollout_results[global_idx]["completion_ids"]
@@ -1080,7 +1113,31 @@ class RolloutEngine:
                     )
                     segment_hidden_stash.append(seg_hidden)
                     completion_segment_map.append(seg_map)
+                    n_completions += 1
+                t_extract_hidden_total += time.time() - t_
 
+        t_total = time.time() - t_total_start
+
+        # Memory summary
+        mem_str = ""
+        if device.type == "cuda":
+            mem_after = torch.cuda.memory_allocated(device) / (1024 ** 3)
+            mem_peak = max(peak_per_scene) if peak_per_scene else 0.0
+            mem_avg = sum(peak_per_scene) / len(peak_per_scene) if peak_per_scene else 0.0
+            mem_str = (
+                f" | mem: before={mem_before:.2f}GB, after={mem_after:.2f}GB, "
+                f"peak_avg={mem_avg:.2f}GB, peak_max={mem_peak:.2f}GB"
+            )
+
+        logger.info(
+            "[profile] extract_segment_hidden: total=%.2fs | "
+            "grouping=%.3fs, vlm_setup=%.3fs, data_load=%.3fs, "
+            "prepare_inputs=%.3fs, logprob_fwd=%.3fs, extract_hidden=%.3fs | "
+            "%d scenes, %d completions, mini_batch_size=%d%s",
+            t_total, t_grouping, t_vlm_setup, t_data_load_total,
+            t_prepare_inputs_total, t_logprob_fwd_total, t_extract_hidden_total,
+            n_scenes, n_completions, self.logprob_mini_batch_size, mem_str,
+        )
         logger.debug("Extracted segment hidden states for %d completions", len(segment_hidden_stash))
         return segment_hidden_stash, completion_segment_map
 
@@ -1106,6 +1163,7 @@ class RolloutEngine:
         device = self.device
         segment_hidden_stash = []
         completion_segment_map = []
+        t_total_start = time.time()
 
         from collections import defaultdict
 
@@ -1116,8 +1174,10 @@ class RolloutEngine:
         unique_clip_ids = list(scene_groups.keys())
         t0_us = rollout_results[0]["t0_us"]
 
+        t_vlm_setup_start = time.time()
         self.full_model.vlm.to(device)
         self.full_model.vlm.eval()
+        t_vlm_setup = time.time() - t_vlm_setup_start
 
         traj_future_start_id = self.special_token_ids["traj_future_start"]
 
@@ -1125,12 +1185,21 @@ class RolloutEngine:
         S = self.scene_batch_size or len(unique_clip_ids)
         h_obs_per_scene: dict[str, torch.Tensor] = {}
 
+        t_prepare_batch_total = 0.0
+        t_vlm_fwd_total = 0.0
+        t_extract_obs_total = 0.0
+        n_batches = 0
+
         with torch.no_grad():
             for batch_start in range(0, len(unique_clip_ids), S):
                 batch_clip_ids = unique_clip_ids[batch_start : batch_start + S]
+                n_batches += 1
+
+                t_ = time.time()
                 batched_inputs, per_scene_meta = self._prepare_scene_batch(
                     batch_clip_ids, t0_us, device,
                 )
+                t_prepare_batch_total += time.time() - t_
 
                 # Batched VLM forward (prompt only, no generation)
                 fwd_kwargs = {
@@ -1138,24 +1207,31 @@ class RolloutEngine:
                     for k in ("attention_mask", "pixel_values", "image_grid_thw")
                     if k in batched_inputs
                 }
+                t_ = time.time()
                 with torch.autocast(str(device), dtype=torch.bfloat16):
                     out = self.full_model.vlm(
                         input_ids=batched_inputs["input_ids"],
                         output_hidden_states=True,
                         **fwd_kwargs,
                     )
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                t_vlm_fwd_total += time.time() - t_
 
                 # Extract last real token per scene (inputs are left-padded)
+                t_ = time.time()
                 hidden = out.hidden_states[-1]  # (B, T, D)
                 for j, meta in enumerate(per_scene_meta):
                     # Last real token is at position -1 since left-padded
                     # prompts end at the rightmost position
                     h_obs = hidden[j, -1:, :].cpu()  # (1, D)
                     h_obs_per_scene[meta["clip_id"]] = h_obs
+                t_extract_obs_total += time.time() - t_
 
                 del out, hidden
 
         # Build per-completion stash and segment maps
+        t_build_maps_start = time.time()
         for clip_id, indices in scene_groups.items():
             h_obs = h_obs_per_scene[clip_id]
             for global_idx in indices:
@@ -1178,7 +1254,18 @@ class RolloutEngine:
                     "traj_positions": traj_positions,
                     "total_len": len(completion_ids),
                 })
+        t_build_maps = time.time() - t_build_maps_start
 
+        t_total = time.time() - t_total_start
+        logger.info(
+            "[profile] extract_prompt_hidden: total=%.2fs | "
+            "vlm_setup=%.3fs, prepare_batch=%.3fs, vlm_fwd=%.3fs, "
+            "extract_obs=%.3fs, build_maps=%.3fs | "
+            "%d scenes, %d batches (batch_size=%d), %d completions",
+            t_total, t_vlm_setup, t_prepare_batch_total, t_vlm_fwd_total,
+            t_extract_obs_total, t_build_maps,
+            len(unique_clip_ids), n_batches, S, len(segment_hidden_stash),
+        )
         logger.debug(
             "Extracted prompt hidden states: %d completions from %d scenes (%d batches)",
             len(segment_hidden_stash), len(scene_groups),
