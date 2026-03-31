@@ -96,6 +96,7 @@ if [[ "$SMOKE" -eq 1 ]]; then
         "training.report_to=none"
         "advantage_conditioning.num_iterations=1"
         "advantage_conditioning.completions_per_scene=2"
+        "advantage_conditioning.skip_checkpoint=true"
         "rollout.max_generation_length=128"
     )
 fi
