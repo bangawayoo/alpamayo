@@ -1054,6 +1054,7 @@ class RolloutEngine:
         t_prepare_inputs_total = 0.0
         t_logprob_fwd_total = 0.0
         t_extract_hidden_total = 0.0
+        t_gather_hidden = 0.0
         n_scenes = len(scene_groups)
         n_completions = 0
 
@@ -1065,10 +1066,18 @@ class RolloutEngine:
 
 
 
-        rank = int(os.environ.get("RANK", 0))
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+
         scene_list = list(scene_groups.items())
+        local_scene_list = scene_list[rank::world_size]
+        local_segment_hidden_by_idx: dict[int, tuple[dict, dict]] = {}
         pbar = tqdm(
-            scene_list, desc="extract_segment_hidden", unit="scene",
+            local_scene_list, desc="extract_segment_hidden", unit="scene",
             disable=rank != 0,
         )
         with torch.no_grad():
@@ -1083,8 +1092,8 @@ class RolloutEngine:
                 prefetch_ids = []
                 for offset in range(1, 3):
                     ni = scene_idx + offset
-                    if ni < len(scene_list):
-                        next_clip_id, next_indices = scene_list[ni]
+                    if ni < len(local_scene_list):
+                        next_clip_id, _next_indices = local_scene_list[ni]
                         prefetch_ids.append(next_clip_id)
                 if prefetch_ids:
                     self.data_cache.prefetch(prefetch_ids, t0_us)
@@ -1129,13 +1138,40 @@ class RolloutEngine:
                         self.traj_token_start_idx,
                         self.traj_vocab_size,
                     )
-                    segment_hidden_stash.append(seg_hidden)
-                    completion_segment_map.append(seg_map)
+                    local_segment_hidden_by_idx[global_idx] = (seg_hidden, seg_map)
                     n_completions += 1
                 t_extract_hidden_total += time.time() - t_
                 pbar.set_postfix(completions=n_completions)
 
         pbar.close()
+
+        # Gather per-completion segment hidden outputs from all ranks, then
+        # restore original rollout order for downstream code.
+        if world_size > 1 and dist.is_available() and dist.is_initialized():
+            t_ = time.time()
+            gathered_hidden = [None] * world_size
+            dist.all_gather_object(gathered_hidden, local_segment_hidden_by_idx)
+            merged_hidden: dict[int, tuple[dict, dict]] = {}
+            for rank_map in gathered_hidden:
+                if rank_map:
+                    merged_hidden.update(rank_map)
+            local_segment_hidden_by_idx = merged_hidden
+            t_gather_hidden = time.time() - t_
+
+        missing_indices = [i for i in range(len(rollout_results)) if i not in local_segment_hidden_by_idx]
+        if missing_indices:
+            raise RuntimeError(
+                "extract_segment_hidden missing outputs for "
+                f"{len(missing_indices)}/{len(rollout_results)} completions "
+                f"(rank={rank}, world_size={world_size})"
+            )
+
+        for i in range(len(rollout_results)):
+            seg_hidden, seg_map = local_segment_hidden_by_idx[i]
+            segment_hidden_stash.append(seg_hidden)
+            completion_segment_map.append(seg_map)
+
+        n_completions = len(segment_hidden_stash)
         t_total = time.time() - t_total_start
 
         # Memory summary
@@ -1152,11 +1188,11 @@ class RolloutEngine:
         logger.info(
             "[profile] extract_segment_hidden: total=%.2fs | "
             "grouping=%.3fs, vlm_setup=%.3fs, data_load=%.3fs, "
-            "prepare_inputs=%.3fs, logprob_fwd=%.3fs, extract_hidden=%.3fs | "
-            "%d scenes, %d completions, mini_batch_size=%d%s",
+            "prepare_inputs=%.3fs, logprob_fwd=%.3fs, extract_hidden=%.3fs, gather_hidden=%.3fs | "
+            "%d scenes (%d local), %d completions, mini_batch_size=%d, rank=%d/%d%s",
             t_total, t_grouping, t_vlm_setup, t_data_load_total,
-            t_prepare_inputs_total, t_logprob_fwd_total, t_extract_hidden_total,
-            n_scenes, n_completions, self.logprob_mini_batch_size, mem_str,
+            t_prepare_inputs_total, t_logprob_fwd_total, t_extract_hidden_total, t_gather_hidden,
+            n_scenes, len(local_scene_list), n_completions, self.logprob_mini_batch_size, rank, world_size, mem_str,
         )
         logger.debug("Extracted segment hidden states for %d completions", len(segment_hidden_stash))
         return segment_hidden_stash, completion_segment_map
