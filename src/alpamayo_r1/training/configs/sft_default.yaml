@@ -134,7 +134,7 @@ rollout:
   mode: expert                  # "vlm_only" or "expert" — expert uses action expert + diffusion
   temperature: 1.0              # higher than GRPO (0.6) for exploration
   top_p: 0.98
-  max_generation_length: 128
+  max_generation_length: 64
   logprob_mini_batch_size: 2
   data_cache_max_size: 16      # LRU cache entries (~130 MB each with PIL images)
   vllm_server_url: null         # optional: URL for vLLM server mode (null = use HF generate)
