@@ -673,6 +673,7 @@ class RolloutEngine:
             for k in ("attention_mask", "pixel_values", "image_grid_thw")
             if k in expanded
         }
+        max_new_tokens = self.max_generation_length + self.tokens_per_future_traj + 10
         vlm_output = generate_coc(
             self.full_model,
             expanded["input_ids"],
@@ -681,6 +682,7 @@ class RolloutEngine:
             temperature=self.temperature,
             top_p=self.top_p,
             num_samples=1,
+            max_new_tokens=max_new_tokens,
             max_new_tokens=self.max_generation_length + self.tokens_per_future_traj + 10,
             pad_token_id=self.pad_token_id,
             autocast_device=device,
@@ -710,6 +712,7 @@ class RolloutEngine:
         # 4. Build per-completion result dicts
         t_ = time.time()
         results = []
+        likely_truncated: list[tuple[str, int, int]] = []  # (clip_id, sample_idx, raw_len)
         for s_idx, meta in enumerate(per_scene_meta):
             for g_idx in range(G):
                 flat_idx = s_idx * G + g_idx
@@ -724,6 +727,9 @@ class RolloutEngine:
                 if traj_future_end_id not in completion_ids:
                     while completion_ids and completion_ids[-1] == self.pad_token_id:
                         completion_ids.pop()
+                    # Likely hit max_new_tokens before <traj_future_end>
+                    if len(completion_ids) >= max_new_tokens:
+                        likely_truncated.append((meta["clip_id"], g_idx, len(completion_ids)))
                 if not completion_ids:
                     completion_ids = [self.processor.tokenizer.eos_token_id]
 
@@ -762,6 +768,20 @@ class RolloutEngine:
                     }
                 )
         timings["postprocess"] = time.time() - t_
+
+        if likely_truncated:
+            ex = ", ".join(
+                f"{cid}[g{gi}] len={ln}" for cid, gi, ln in likely_truncated[:5]
+            )
+            logger.warning(
+                "[vlm_only_batch] %d/%d completions likely truncated by rollout.max_generation_length=%d "
+                "(max_new_tokens=%d before <traj_future_end>). Examples: %s",
+                len(likely_truncated),
+                len(results),
+                self.max_generation_length,
+                max_new_tokens,
+                ex,
+            )
 
         logger.debug(
             "[vlm_only_batch] S=%d, G=%d (%d results) timings: %s | total=%.2fs",
@@ -827,6 +847,7 @@ class RolloutEngine:
             for k in ("attention_mask", "pixel_values", "image_grid_thw")
             if k in expanded
         }
+        max_new_tokens = self.max_generation_length + 10
         vlm_output = generate_coc(
             self.full_model,
             expanded["input_ids"],
@@ -835,7 +856,7 @@ class RolloutEngine:
             temperature=self.temperature,
             top_p=self.top_p,
             num_samples=1,
-            max_new_tokens=self.max_generation_length + 10,
+            max_new_tokens=max_new_tokens,
             pad_token_id=self.pad_token_id,
             autocast_device=device,
         )
@@ -846,6 +867,7 @@ class RolloutEngine:
 
         # Parse completions and filter to valid ones (those with <traj_future_start>)
         valid_items: list[dict] = []
+        likely_truncated_coc: list[tuple[str, int, int]] = []  # (clip_id, sample_idx, raw_len)
         for s_idx in range(S):
             meta = per_scene_meta[s_idx]
             for g_idx in range(G):
@@ -856,11 +878,23 @@ class RolloutEngine:
                 try:
                     traj_pos = raw.index(traj_future_start_id)
                 except ValueError:
-                    logger.warning(
-                        "No <traj_future_start> in batch output for %s sample %d, skipping",
-                        meta["clip_id"],
-                        g_idx,
-                    )
+                    if len(raw) >= max_new_tokens:
+                        likely_truncated_coc.append((meta["clip_id"], g_idx, len(raw)))
+                        logger.warning(
+                            "No <traj_future_start> for %s sample %d (len=%d) — likely truncated by "
+                            "rollout.max_generation_length=%d (max_new_tokens=%d)",
+                            meta["clip_id"],
+                            g_idx,
+                            len(raw),
+                            self.max_generation_length,
+                            max_new_tokens,
+                        )
+                    else:
+                        logger.warning(
+                            "No <traj_future_start> in batch output for %s sample %d, skipping",
+                            meta["clip_id"],
+                            g_idx,
+                        )
                     continue
                 coc_tokens = raw[:traj_pos]
                 valid_items.append(
@@ -874,6 +908,20 @@ class RolloutEngine:
                         ).strip(),
                     }
                 )
+
+        if likely_truncated_coc:
+            ex = ", ".join(
+                f"{cid}[g{gi}] len={ln}" for cid, gi, ln in likely_truncated_coc[:5]
+            )
+            logger.warning(
+                "[expert_batch] %d/%d CoC samples likely truncated by rollout.max_generation_length=%d "
+                "(max_new_tokens=%d before <traj_future_start>). Examples: %s",
+                len(likely_truncated_coc),
+                S * G,
+                self.max_generation_length,
+                max_new_tokens,
+                ex,
+            )
 
         if not valid_items:
             logger.warning("No valid completions in batch of %d scenes", S)
