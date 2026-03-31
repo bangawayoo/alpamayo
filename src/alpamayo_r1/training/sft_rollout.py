@@ -18,6 +18,7 @@ from typing import Any
 
 import einops
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 import torch.nn.functional as F
 from alpamayo_r1.inference import decode_vlm_trajectories, generate_coc, prepare_vlm_inputs
@@ -1204,25 +1205,34 @@ class RolloutEngine:
         S = self.scene_batch_size or len(unique_clip_ids)
         h_obs_per_scene: dict[str, torch.Tensor] = {}
 
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
 
+        # Shard scenes across ranks to avoid duplicated VLM forwards.
+        # We gather h_obs maps across ranks after local extraction.
+        local_clip_ids = unique_clip_ids[rank::world_size]
 
-        rank = int(os.environ.get("RANK", 0))
         t_prepare_batch_total = 0.0
         t_vlm_fwd_total = 0.0
         t_extract_obs_total = 0.0
+        t_gather_obs = 0.0
         n_batches = 0
-        total_batches = math.ceil(len(unique_clip_ids) / S)
+        total_batches = math.ceil(len(local_clip_ids) / S) if local_clip_ids else 0
 
         pbar = tqdm(
             total=total_batches, desc="extract_prompt_hidden", unit="batch",
             disable=rank != 0,
         )
-        # Prefetch first 2 batches so they're ready when the loop starts
-        self.data_cache.prefetch(unique_clip_ids[:S * 2], t0_us)
+        # Prefetch first 2 local batches so they're ready when the loop starts
+        self.data_cache.prefetch(local_clip_ids[:S * 2], t0_us)
 
         with torch.no_grad():
-            for batch_start in range(0, len(unique_clip_ids), S):
-                batch_clip_ids = unique_clip_ids[batch_start : batch_start + S]
+            for batch_start in range(0, len(local_clip_ids), S):
+                batch_clip_ids = local_clip_ids[batch_start : batch_start + S]
                 n_batches += 1
 
                 t_ = time.time()
@@ -1232,10 +1242,10 @@ class RolloutEngine:
                 t_prep = time.time() - t_
                 t_prepare_batch_total += t_prep
 
-                # Prefetch next 2 batches while GPU processes current one
+                # Prefetch next 2 local batches while GPU processes current one
                 next_batch_start = batch_start + S
                 self.data_cache.prefetch(
-                    unique_clip_ids[next_batch_start : next_batch_start + S * 2], t0_us
+                    local_clip_ids[next_batch_start : next_batch_start + S * 2], t0_us
                 )
 
                 # Batched VLM forward (prompt only, no generation)
@@ -1277,8 +1287,29 @@ class RolloutEngine:
                 pbar.set_postfix(scenes=len(h_obs_per_scene))
 
         pbar.close()
+
+        # Gather per-scene h_obs from all ranks so each rank has full data.
+        if world_size > 1 and dist.is_available() and dist.is_initialized():
+            t_ = time.time()
+            gathered_h_obs = [None] * world_size
+            dist.all_gather_object(gathered_h_obs, h_obs_per_scene)
+            merged_h_obs: dict[str, torch.Tensor] = {}
+            for rank_map in gathered_h_obs:
+                if rank_map:
+                    merged_h_obs.update(rank_map)
+            h_obs_per_scene = merged_h_obs
+            t_gather_obs = time.time() - t_
+
         # Build per-completion stash and segment maps
         t_build_maps_start = time.time()
+        missing_clip_ids = [cid for cid in unique_clip_ids if cid not in h_obs_per_scene]
+        if missing_clip_ids:
+            raise RuntimeError(
+                "extract_prompt_hidden missing h_obs for "
+                f"{len(missing_clip_ids)}/{len(unique_clip_ids)} scenes "
+                f"(rank={rank}, world_size={world_size})"
+            )
+
         for clip_id, indices in scene_groups.items():
             h_obs = h_obs_per_scene[clip_id]
             for global_idx in indices:
@@ -1307,11 +1338,11 @@ class RolloutEngine:
         logger.info(
             "[profile] extract_prompt_hidden: total=%.2fs | "
             "vlm_setup=%.3fs, prepare_batch=%.3fs, vlm_fwd=%.3fs, "
-            "extract_obs=%.3fs, build_maps=%.3fs | "
-            "%d scenes, %d batches (batch_size=%d), %d completions",
+            "extract_obs=%.3fs, gather_obs=%.3fs, build_maps=%.3fs | "
+            "%d scenes (%d local), %d local batches (batch_size=%d), %d completions, rank=%d/%d",
             t_total, t_vlm_setup, t_prepare_batch_total, t_vlm_fwd_total,
-            t_extract_obs_total, t_build_maps,
-            len(unique_clip_ids), n_batches, S, len(segment_hidden_stash),
+            t_extract_obs_total, t_gather_obs, t_build_maps,
+            len(unique_clip_ids), len(local_clip_ids), n_batches, S, len(segment_hidden_stash), rank, world_size,
         )
         logger.debug(
             "Extracted prompt hidden states: %d completions from %d scenes (%d batches)",
