@@ -683,7 +683,6 @@ class RolloutEngine:
             top_p=self.top_p,
             num_samples=1,
             max_new_tokens=max_new_tokens,
-            max_new_tokens=self.max_generation_length + self.tokens_per_future_traj + 10,
             pad_token_id=self.pad_token_id,
             autocast_device=device,
         )
