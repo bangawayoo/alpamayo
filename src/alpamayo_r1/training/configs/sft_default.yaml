@@ -78,6 +78,7 @@ value_head:
   lr: 1e-4
   load_path: null               # pre-trained value head checkpoint (skips pre-training if provided)
   segment_level: true
+  extract_mode: segment            # "segment" = full TF forward per completion, "prompt" = prompt-only forward (faster, h_obs only)
   train_epochs: 1              # epochs to train value head per iteration (before advantage computation)
   batch_size: 16                 # mini-batch size for value head training
   pretrain_scenes: 0           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)

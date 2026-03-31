@@ -1035,11 +1035,18 @@ class SelfPlayLoop:
         # 2. Extract segment hidden states
         vh_cfg = self.cfg.get("value_head", {})
         if vh_cfg.get("enabled", False) and vh_cfg.get("segment_level", False):
+            extract_mode = vh_cfg.get("extract_mode", "segment")
             t_ = time.time()
-            segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
-                rollout_results
-            )
-            logger.info("  Stage 2 (extract_segment_hidden): %.1fs for %d completions", time.time() - t_, len(rollout_results))
+            if extract_mode == "prompt":
+                segment_hidden_stash, completion_segment_map = engine.extract_prompt_hidden(
+                    rollout_results
+                )
+                logger.info("  Stage 2 (extract_prompt_hidden): %.1fs for %d completions", time.time() - t_, len(rollout_results))
+            else:
+                segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
+                    rollout_results
+                )
+                logger.info("  Stage 2 (extract_segment_hidden): %.1fs for %d completions", time.time() - t_, len(rollout_results))
 
             reward_weights = self._get_reward_weights()
             value_head = self._get_or_create_value_head()
