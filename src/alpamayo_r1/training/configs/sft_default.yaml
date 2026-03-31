@@ -51,7 +51,7 @@ training:
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   report_to: tensorboard
-  dataloader_num_workers: 0         # increase to overlap CPU batch prep with GPU work
+  dataloader_num_workers: 8         # increase to overlap CPU batch prep with GPU work
   dataloader_pin_memory: true
   dataloader_persistent_workers: true
   enable_profiling: false           # self-play phase/stage profiling JSONL
@@ -72,7 +72,7 @@ advantage_conditioning:
   adv_mode: text            # "embedding" (learned AdvantageEmbedding hooks) or "text" (plain-text phrases, no hooks)
   augment_with_gt: true         # select bottom-k% rollouts + GT-augmented positives as training set
   gt_augment_bottom_k: 50       # bottom k% of rollouts by a_traj to use as negatives
-  gt_augment_top_k2: 50         # top k2% of GT-augmented samples to retain by r_consist
+  gt_augment_top_k2: 10         # top k2% of GT-augmented samples to retain by r_consist
   replay_ratio: 0.3             # fraction of training data from historical replay buffer
   replay_buffer_max_size: 50000
   reset_to_base: false          # true = reload pi_0 each iteration (RECAP), false = continue from previous iteration's weights
@@ -118,7 +118,7 @@ expert_finetune:
 data:
   split: train
   t0_us: 5100000                # 5.1 seconds into each clip
-  max_samples: 4500             # total scenes, partitioned across iterations
+  max_samples: 5000             # total scenes, partitioned across iterations
   clip_ids_file: null
   exclude_clip_ids_file: notebooks/clip_ids.parquet
   dataset_revision: 05e158af89ba
