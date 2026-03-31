@@ -1158,12 +1158,20 @@ class SelfPlayLoop:
             extra={"num_completions": len(rollout_results)},
         ):
             reward_stash = engine.compute_rewards(rollout_results)
+        consist_one_ratio = 0.0
+        consist_one_count = 0
         if reward_stash:
+            for r, rew in zip(rollout_results, reward_stash):
+                r["r_traj"] = float(rew["r_traj"])
+                r["r_reason"] = float(rew["r_reason"])
+                r["r_consist"] = float(rew["r_consist"])
             r_traj_vals = [r["r_traj"] for r in reward_stash]
             r_reason_vals = [r["r_reason"] for r in reward_stash]
             r_consist_vals = [r["r_consist"] for r in reward_stash]
+            consist_one_count = sum(1 for v in r_consist_vals if float(v) >= 0.999)
+            consist_one_ratio = consist_one_count / len(r_consist_vals)
             logger.info(
-                "  Rewards: traj=[%.3f, %.3f, %.3f] reason=[%.3f, %.3f, %.3f] consist=[%.3f, %.3f, %.3f]",
+                "  Rewards: traj=[%.3f, %.3f, %.3f] reason=[%.3f, %.3f, %.3f] consist=[%.3f, %.3f, %.3f] consist@1.0=%d/%d (%.1f%%)",
                 min(r_traj_vals),
                 np.mean(r_traj_vals),
                 max(r_traj_vals),
@@ -1173,6 +1181,9 @@ class SelfPlayLoop:
                 min(r_consist_vals),
                 np.mean(r_consist_vals),
                 max(r_consist_vals),
+                consist_one_count,
+                len(r_consist_vals),
+                100.0 * consist_one_ratio,
             )
 
         # 2. Extract segment hidden states
@@ -1291,10 +1302,13 @@ class SelfPlayLoop:
 
         n_pos = sum(1 for lab in adv_labels if lab["i_obs"] and lab["i_traj"])
         logger.info(
-            "Evaluate phase: %d/%d all-positive, thresholds=%s",
+            "Evaluate phase: %d/%d all-positive, thresholds=%s, consist@1.0=%d/%d (%.1f%%)",
             n_pos,
             len(adv_labels),
             self.advantage_buffer.compute_thresholds(),
+            consist_one_count,
+            len(advantages),
+            100.0 * consist_one_ratio,
         )
         return adv_labels, advantages
 
@@ -1304,15 +1318,13 @@ class SelfPlayLoop:
         adv_labels: list[dict],
         advantages: list[dict],
     ) -> tuple[list[dict], list[dict]]:
-        """Select bottom-k% rollouts and build GT-augmented positive counterparts.
+        """Build GT-augmented and online positive samples from rollout data.
 
-        The returned training set contains ONLY:
-        - The bottom-k% rollouts by trajectory advantage (negative examples)
-        - GT-augmented copies of those rollouts, filtered by top-k2% consistency
-          (positive trajectory examples)
-
-        All other rollouts are used for buffer/binarization only and are discarded
-        from the training set.
+        The returned training set combines:
+        - Bottom-k% rollout negatives (by a_traj)
+        - GT-augmented positives built from all rollouts, then re-scored and
+          selected by augmented a_traj percentile threshold
+        - Top-k2% online rollout positives (by a_traj)
 
         Args:
             rollout_results: All rollout completions from this iteration.
@@ -1328,22 +1340,31 @@ class SelfPlayLoop:
         bottom_k = float(adv_cfg.get("gt_augment_bottom_k", 30))
         top_k2 = float(adv_cfg.get("gt_augment_top_k2", 50))
 
-        # 1. Select bottom-k% by trajectory advantage
+        # 1) Online negatives / positives from rollout trajectory advantage
         n_total = len(rollout_results)
         indexed_a_traj = [(i, advantages[i]["a_traj"]) for i in range(n_total)]
         indexed_a_traj.sort(key=lambda x: x[1])
+
         n_bottom = max(1, int(n_total * bottom_k / 100))
-        bottom_indices = [i for i, _ in indexed_a_traj[:n_bottom]]
+        neg_indices = [i for i, _ in indexed_a_traj[:n_bottom]]
+        neg_set = set(neg_indices)
+
+        n_top_online = max(1, int(n_total * top_k2 / 100))
+        online_pos_indices = [
+            i for i, _ in sorted(indexed_a_traj, key=lambda x: x[1], reverse=True)[:n_top_online]
+        ]
+        online_pos_indices = [i for i in online_pos_indices if i not in neg_set]
 
         logger.info(
-            "GT augmentation: selected bottom %d/%d rollouts (k=%.0f%%, a_traj threshold=%.4f)",
-            n_bottom,
+            "GT augmentation: negatives=%d/%d (bottom %.0f%%), online positives=%d (top %.0f%%)",
+            len(neg_indices),
             n_total,
             bottom_k,
-            indexed_a_traj[n_bottom - 1][1] if n_bottom > 0 else 0.0,
+            len(online_pos_indices),
+            top_k2,
         )
 
-        # 2. Build GT-augmented copies for selected rollouts
+        # 2) Build GT-augmented copies for ALL rollouts
         traj_future_start_id = self.full_model.special_token_ids["traj_future_start"]
         traj_future_end_id = self.full_model.special_token_ids["traj_future_end"]
         traj_tokenizer = self.full_model.traj_tokenizer
@@ -1351,16 +1372,18 @@ class SelfPlayLoop:
         traj_vocab_size = self.full_model.config.traj_vocab_size
         data_cache = self._get_data_cache()
 
-        augmented = []
-        augmented_source_indices = []  # tracks which bottom_indices entry produced each augmented
-        for i in bottom_indices:
-            r = rollout_results[i]
+        # NOTE: Do not prefetch all scenes at once here; cache size may be small.
+        # We prefetch per-sample inside the loop below instead.
 
+        augmented = []
+        augmented_source_indices = []
+        for i, r in enumerate(rollout_results):
             if "clip_id" not in r or "hist_xyz" not in r:
                 continue
 
             clip_id = r["clip_id"]
             t0_us = r.get("t0_us", 5_100_000)
+            data_cache.prefetch([clip_id], int(t0_us))
             _, ego_future_xyz = data_cache.get(clip_id, t0_us, device="cpu")
             ego_future_rot = data_cache.get_ego_future_rot(clip_id, t0_us)
 
@@ -1383,7 +1406,6 @@ class SelfPlayLoop:
             new_completion_ids = (
                 coc_part + [traj_future_start_id] + gt_traj_token_ids + [traj_future_end_id]
             )
-
             pred_xyz, _, _ = traj_tokenizer.decode(hist_xyz, hist_rot, discrete_tokens)
             gt_pred_xyz = pred_xyz[0].cpu().numpy().flatten().tolist()
 
@@ -1401,12 +1423,14 @@ class SelfPlayLoop:
             augmented_source_indices.append(i)
 
         if not augmented:
-            logger.info("GT augmentation: no augmented completions built, returning negatives only")
-            neg_rollouts = [rollout_results[i] for i in bottom_indices]
-            neg_labels = [adv_labels[i] for i in bottom_indices]
-            return neg_rollouts, neg_labels
+            logger.warning(
+                "GT augmentation: no augmented rollouts built,"
+            )
+            raise Exception
 
-        # 3. Score augmented completions to get consistency reward
+        # 3) Recompute rewards for augmented rollouts.
+        #    Reuse existing rollout advantages + old rewards to avoid extra
+        #    value-head forward: new_adv = old_adv - old_reward + new_reward.
         rollout_cfg = self.cfg.get("rollout", {})
         engine = RolloutEngine(
             full_model=self.full_model,
@@ -1415,64 +1439,101 @@ class SelfPlayLoop:
             rollout_cfg=rollout_cfg,
             adv_token_ids=self.adv_token_ids,
         )
-        aug_rewards = engine.compute_rewards(augmented)
+        aug_reward_stash = engine.compute_rewards(augmented)
+        for r, rew in zip(augmented, aug_reward_stash):
+            r["r_traj"] = float(rew["r_traj"])
+            r["r_reason"] = float(rew["r_reason"])
+            r["r_consist"] = float(rew["r_consist"])
 
-        # Log per-sample reward comparison
-        for j, (aug_r, src_i) in enumerate(zip(aug_rewards, augmented_source_indices)):
-            clip_id = rollout_results[src_i]["clip_id"]
-            logger.info(
-                "GT aug [%s] sample %d: "
-                "r_traj=%.3f r_reason=%.3f r_consist=%.3f",
-                clip_id,
-                j,
-                aug_r["r_traj"],
-                aug_r["r_reason"],
-                aug_r["r_consist"],
-            )
+        reward_weights = self._get_reward_weights()
+        w_traj, w_reason, w_consist = reward_weights
 
-        # 4. Filter augmented: keep top-k2% by r_consist
-        consist_scores = [(j, aug_rewards[j]["r_consist"]) for j in range(len(augmented))]
-        consist_scores.sort(key=lambda x: x[1], reverse=True)
-        n_keep = max(1, int(len(augmented) * top_k2 / 100))
-        kept_indices = [j for j, _ in consist_scores[:n_keep]]
-        kept_indices.sort()  # preserve original order
+        # Old rollout rewards were stashed in evaluate_phase into rollout_results.
+        old_reward_stash = [
+            {
+                "r_traj": float(r.get("r_traj", 0.0)),
+                "r_reason": float(r.get("r_reason", 0.0)),
+                "r_consist": float(r.get("r_consist", 0.0)),
+            }
+            for r in rollout_results
+        ]
 
-        filtered_augmented = [augmented[j] for j in kept_indices]
+        # Compute reward terms with the same definition used to produce old advantages.
+        # Value-head mode: A = G(obs) - V(obs), so use G(obs) deltas.
+        old_reward_term = compute_value_targets(old_reward_stash, reward_weights)
+        new_reward_term = compute_value_targets(aug_reward_stash, reward_weights)
 
-        # 5. Assign labels for kept augmented samples:
-        #    i_traj = True (GT trajectory, positive by construction)
-        #    i_obs = binarize from buffer (preserving independent obs semantics)
-        filtered_aug_labels = []
-        for j in kept_indices:
-            src_i = augmented_source_indices[j]
-            a_obs = advantages[src_i]["a_obs"]
-            i_obs, _ = self.advantage_buffer.binarize(a_obs, 0.0)
-            filtered_aug_labels.append({"i_obs": i_obs, "i_traj": True})
+        aug_advantages = []
+        for j, src_i in enumerate(augmented_source_indices):
+            old_a = float(advantages[src_i]["a_traj"])
+            new_a = old_a - float(old_reward_term[src_i]) + float(new_reward_term[j])
+            aug_advantages.append({"a_obs": new_a, "a_traj": new_a})
 
-        # 6. Assemble training set: negatives + filtered GT positives
-        neg_rollouts = [rollout_results[i] for i in bottom_indices]
-        neg_labels = [adv_labels[i] for i in bottom_indices]
+        # Positive GT-augmented samples: threshold = old a_traj k-percentile + 0.5 * std(old a_traj)
+        old_a_traj = np.array([advantages[i]["a_traj"] for i in range(n_total)], dtype=np.float32)
+        old_k_percentile = float(np.percentile(old_a_traj, bottom_k))
+        old_std = float(np.std(old_a_traj))
+        aug_traj_threshold = old_k_percentile + 0.5 * old_std
+        gt_pos_local_indices = [
+            j for j, a in enumerate(aug_advantages) if float(a["a_traj"]) > aug_traj_threshold
+        ]
+        gt_pos_rollouts = [augmented[j] for j in gt_pos_local_indices]
+        gt_pos_labels = [{"i_obs": True, "i_traj": True} for _ in gt_pos_rollouts]
 
-        train_rollouts = neg_rollouts + filtered_augmented
-        train_labels = neg_labels + filtered_aug_labels
+        # 4) Assemble training set: bottom-k negatives + GT positives + top-k2 online positives
+        neg_rollouts = [rollout_results[i] for i in neg_indices]
+        neg_labels = [adv_labels[i] for i in neg_indices]
 
-        # 7. Log summary
-        n_neg = len(neg_rollouts)
-        n_pos = len(filtered_augmented)
+        online_pos_rollouts = [rollout_results[i] for i in online_pos_indices]
+        online_pos_labels = [{"i_obs": True, "i_traj": True} for _ in online_pos_rollouts]
+
+        # Distribution summary for trajectory advantages in each selected bucket
+        def _traj_stats(vals: list[float], percentile: float = 50.0) -> tuple[float, float, float]:
+            if not vals:
+                return float("nan"), float("nan"), float("nan")
+            arr = np.asarray(vals, dtype=np.float32)
+            return float(np.min(arr)), float(np.percentile(arr, percentile)), float(np.max(arr))
+
+        neg_traj_adv = [float(advantages[i]["a_traj"]) for i in neg_indices]
+        gt_pos_traj_adv = [float(aug_advantages[j]["a_traj"]) for j in gt_pos_local_indices]
+        online_pos_traj_adv = [float(advantages[i]["a_traj"]) for i in online_pos_indices]
+        pctl = 50.0
+        n_min, n_pct, n_max = _traj_stats(neg_traj_adv, pctl)
+        g_min, g_pct, g_max = _traj_stats(gt_pos_traj_adv, pctl)
+        o_min, o_pct, o_max = _traj_stats(online_pos_traj_adv, pctl)
         logger.warning(
-            "GT augmentation summary: "
-            "%d total rollouts → %d negatives (bottom %.0f%%) + %d GT positives "
-            "(%.0f%% of %d augmented passed r_consist filter, top %.0f%%) "
-            "= %d training samples (pos/neg ratio: %.2f)",
+            "a_traj stats (min/p%.0f/max): neg=[%.4f, %.4f, %.4f] gt_pos=[%.4f, %.4f, %.4f] online_pos=[%.4f, %.4f, %.4f]",
+            pctl,
+            n_min,
+            n_pct,
+            n_max,
+            g_min,
+            g_pct,
+            g_max,
+            o_min,
+            o_pct,
+            o_max,
+        )
+
+        train_rollouts = neg_rollouts + gt_pos_rollouts + online_pos_rollouts
+        train_labels = neg_labels + gt_pos_labels + online_pos_labels
+
+        logger.warning(
+            "GT augmentation summary: total=%d neg=%d (bottom %.0f%%) gt_pos=%d "
+            "(a_traj > p%.0f(old)=%.4f + 0.5*std(old)=%.4f => %.4f) "
+            "online_pos=%d (top %.0f%%) -> train=%d (pos/neg=%.2f)",
             n_total,
-            n_neg,
+            len(neg_rollouts),
             bottom_k,
-            n_pos,
-            n_pos / max(len(augmented), 1) * 100,
-            len(augmented),
+            len(gt_pos_rollouts),
+            bottom_k,
+            old_k_percentile,
+            0.5 * old_std,
+            aug_traj_threshold,
+            len(online_pos_rollouts),
             top_k2,
-            n_neg + n_pos,
-            n_pos / max(n_neg, 1),
+            len(train_rollouts),
+            (len(gt_pos_rollouts) + len(online_pos_rollouts)) / max(len(neg_rollouts), 1),
         )
 
         return train_rollouts, train_labels
