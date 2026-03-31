@@ -746,8 +746,7 @@ class SelfPlayLoop:
             # Prefetch next iteration's scenes so data loads overlap with GPU work
             next_start = chunk_end
             next_end = next_start + pretrain_batch_scenes
-            for cid in pretrain_scenes[next_start:next_end]:
-                data_cache.prefetch(cid, t0_us)
+            data_cache.prefetch(pretrain_scenes[next_start:next_end], t0_us)
 
             # 1. Generate rollouts
             rollout_results = engine.generate_completions(chunk_scenes, t0_us, G)
@@ -871,6 +870,7 @@ class SelfPlayLoop:
         t0 = time.time()
         rollout_results = self._rollout_phase(fresh_scenes, iteration)
         logger.warning("Phase 1 complete: %d completions in %.1fs", len(rollout_results), time.time() - t0)
+        self._get_data_cache().log_stats("Phase 1")
 
         # Save rollout clip IDs for debugging
         train_cfg = self.cfg.get("training", {})
@@ -886,6 +886,7 @@ class SelfPlayLoop:
         t0 = time.time()
         adv_labels, advantages = self._evaluate_phase(rollout_results)
         logger.warning("Phase 2 complete in %.1fs", time.time() - t0)
+        self._get_data_cache().log_stats("Phase 2")
 
         # ----- Phase 2.5: GT AUGMENTATION (optional) -----
         adv_cfg = self.cfg.get("advantage_conditioning", {})

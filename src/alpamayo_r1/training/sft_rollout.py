@@ -18,6 +18,7 @@ from typing import Any
 
 import einops
 import torch
+from tqdm import tqdm
 import torch.nn.functional as F
 from alpamayo_r1.inference import decode_vlm_trajectories, generate_coc, prepare_vlm_inputs
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
@@ -305,7 +306,7 @@ class RolloutEngine:
             return results
 
         # Dispatch generation method based on mode
-        from tqdm import tqdm
+
 
         use_expert = self.mode == "expert"
         batch_fn = self._generate_batch_expert if use_expert else self._generate_batch_vlm_only
@@ -321,9 +322,8 @@ class RolloutEngine:
         if use_expert:
             self._move_expert_to_device(device)
 
-        # Pre-fetch first chunk so it's ready when the loop starts
-        for cid in local_clip_ids[:S]:
-            self.data_cache.prefetch(cid, t0_us)
+        # Pre-fetch first 2 chunks so they're ready when the loop starts
+        self.data_cache.prefetch(local_clip_ids[:S * 2], t0_us)
 
         rollout_start = time.time()
         pbar = tqdm(
@@ -337,9 +337,8 @@ class RolloutEngine:
                 chunk_ids = local_clip_ids[chunk_start : chunk_start + S]
                 chunk_end = chunk_start + len(chunk_ids)
 
-                # Prefetch next chunk
-                for cid in local_clip_ids[chunk_end : chunk_end + S]:
-                    self.data_cache.prefetch(cid, t0_us)
+                # Prefetch next 2 chunks
+                self.data_cache.prefetch(local_clip_ids[chunk_end : chunk_end + S * 2], t0_us)
 
                 try:
                     chunk_results = batch_fn(
@@ -1063,13 +1062,31 @@ class RolloutEngine:
             mem_before = torch.cuda.memory_allocated(device) / (1024 ** 3)
         peak_per_scene: list[float] = []
 
+
+
+        rank = int(os.environ.get("RANK", 0))
+        scene_list = list(scene_groups.items())
+        pbar = tqdm(
+            scene_list, desc="extract_segment_hidden", unit="scene",
+            disable=rank != 0,
+        )
         with torch.no_grad():
-            for clip_id, indices in scene_groups.items():
+            for scene_idx, (clip_id, indices) in enumerate(pbar):
                 t0_us = rollout_results[indices[0]]["t0_us"]
 
                 t_ = time.time()
                 model_inputs, _ = self.data_cache.get(clip_id, t0_us, device)
                 t_data_load_total += time.time() - t_
+
+                # Prefetch next 2 scenes while GPU processes current one
+                prefetch_ids = []
+                for offset in range(1, 3):
+                    ni = scene_idx + offset
+                    if ni < len(scene_list):
+                        next_clip_id, next_indices = scene_list[ni]
+                        prefetch_ids.append(next_clip_id)
+                if prefetch_ids:
+                    self.data_cache.prefetch(prefetch_ids, t0_us)
 
                 # Prepare prompt input_ids with fused history
                 t_ = time.time()
@@ -1115,7 +1132,9 @@ class RolloutEngine:
                     completion_segment_map.append(seg_map)
                     n_completions += 1
                 t_extract_hidden_total += time.time() - t_
+                pbar.set_postfix(completions=n_completions)
 
+        pbar.close()
         t_total = time.time() - t_total_start
 
         # Memory summary
@@ -1185,10 +1204,21 @@ class RolloutEngine:
         S = self.scene_batch_size or len(unique_clip_ids)
         h_obs_per_scene: dict[str, torch.Tensor] = {}
 
+
+
+        rank = int(os.environ.get("RANK", 0))
         t_prepare_batch_total = 0.0
         t_vlm_fwd_total = 0.0
         t_extract_obs_total = 0.0
         n_batches = 0
+        total_batches = math.ceil(len(unique_clip_ids) / S)
+
+        pbar = tqdm(
+            total=total_batches, desc="extract_prompt_hidden", unit="batch",
+            disable=rank != 0,
+        )
+        # Prefetch first 2 batches so they're ready when the loop starts
+        self.data_cache.prefetch(unique_clip_ids[:S * 2], t0_us)
 
         with torch.no_grad():
             for batch_start in range(0, len(unique_clip_ids), S):
@@ -1199,7 +1229,14 @@ class RolloutEngine:
                 batched_inputs, per_scene_meta = self._prepare_scene_batch(
                     batch_clip_ids, t0_us, device,
                 )
-                t_prepare_batch_total += time.time() - t_
+                t_prep = time.time() - t_
+                t_prepare_batch_total += t_prep
+
+                # Prefetch next 2 batches while GPU processes current one
+                next_batch_start = batch_start + S
+                self.data_cache.prefetch(
+                    unique_clip_ids[next_batch_start : next_batch_start + S * 2], t0_us
+                )
 
                 # Batched VLM forward (prompt only, no generation)
                 fwd_kwargs = {
@@ -1216,7 +1253,14 @@ class RolloutEngine:
                     )
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
-                t_vlm_fwd_total += time.time() - t_
+                t_fwd = time.time() - t_
+                t_vlm_fwd_total += t_fwd
+                logger.info(
+                    "[profile] extract_prompt_hidden batch %d/%d: "
+                    "prepare=%.2fs, vlm_fwd=%.2fs, clips=%s",
+                    n_batches, total_batches, t_prep, t_fwd,
+                    batch_clip_ids,
+                )
 
                 # Extract last real token per scene (inputs are left-padded)
                 t_ = time.time()
@@ -1229,7 +1273,10 @@ class RolloutEngine:
                 t_extract_obs_total += time.time() - t_
 
                 del out, hidden
+                pbar.update(1)
+                pbar.set_postfix(scenes=len(h_obs_per_scene))
 
+        pbar.close()
         # Build per-completion stash and segment maps
         t_build_maps_start = time.time()
         for clip_id, indices in scene_groups.items():

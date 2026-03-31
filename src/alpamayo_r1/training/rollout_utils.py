@@ -104,22 +104,33 @@ class ClipDataCache:
             self._evictions,
         )
 
-    def prefetch(self, clip_id: str, t0_us: int) -> None:
-        """Submit a background load for (clip_id, t0_us) if not already cached.
+    def prefetch(self, clip_ids: str | list[str], t0_us: int) -> None:
+        """Submit a background load for one or more (clip_id, t0_us) pairs.
 
-        The load runs in a single-thread executor so it overlaps with GPU work.
-        Call this for the *next* scene before starting generation on the current one.
+        Accepts a single clip_id string or a list of clip_ids (all sharing the
+        same t0_us). Clips already in the cache are skipped. The remaining
+        clips are loaded sequentially in a single background thread so the
+        entire batch overlaps with GPU work.
         """
-        key = (clip_id, t0_us)
+        if isinstance(clip_ids, str):
+            clip_ids = [clip_ids]
+        # Filter out clips already cached
+        to_load = [cid for cid in clip_ids if (cid, t0_us) not in self._cache]
+        if not to_load:
+            return
         with self._prefetch_lock:
-            if key in self._cache:
-                return
             # Wait for any in-flight prefetch before starting a new one
             if self._prefetch_future is not None and not self._prefetch_future.done():
                 self._prefetch_future.result()
             self._prefetch_future = self._prefetch_executor.submit(
-                self._load_and_cache, clip_id, t0_us
+                self._load_and_cache_many, to_load, t0_us
             )
+
+    def _load_and_cache_many(self, clip_ids: list[str], t0_us: int) -> None:
+        """Load multiple clips sequentially (runs in background thread)."""
+        for clip_id in clip_ids:
+            if (clip_id, t0_us) not in self._cache:
+                self._load_and_cache(clip_id, t0_us)
 
     def _wait_for_prefetch(self) -> None:
         """Block until any in-flight prefetch completes."""
@@ -170,6 +181,22 @@ class ClipDataCache:
         else:
             self._cache.move_to_end(key)  # mark as recently used
         return self._cache[key]["pil_images"]
+
+    def log_stats(self, prefix: str = "") -> None:
+        """Log cache hit/miss/eviction stats at INFO level."""
+        total = self._hits + self._misses
+        hit_rate = self._hits / total * 100 if total else 0.0
+        logger.info(
+            "%sClipDataCache stats: %d hits, %d misses, %d evictions, "
+            "%.1f%% hit rate, %d/%d entries",
+            f"[{prefix}] " if prefix else "",
+            self._hits,
+            self._misses,
+            self._evictions,
+            hit_rate,
+            len(self._cache),
+            self._max_size,
+        )
 
 
 # ---------------------------------------------------------------------------

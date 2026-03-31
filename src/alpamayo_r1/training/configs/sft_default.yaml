@@ -78,7 +78,7 @@ value_head:
   lr: 1e-4
   load_path: null               # pre-trained value head checkpoint (skips pre-training if provided)
   segment_level: true
-  extract_mode: segment            # "segment" = full TF forward per completion, "prompt" = prompt-only forward (faster, h_obs only)
+  extract_mode: prompt            # "segment" = full TF forward per completion, "prompt" = prompt-only forward (faster, h_obs only)
   train_epochs: 1              # epochs to train value head per iteration (before advantage computation)
   batch_size: 16                 # mini-batch size for value head training
   pretrain_scenes: 0           # scenes for Stage 0 pre-training (0 = skip, use load_path instead)
@@ -129,7 +129,7 @@ rollout:
   top_p: 0.98
   max_generation_length: 256
   logprob_mini_batch_size: 2
-  data_cache_max_size: 200      # LRU cache entries (~130 MB each with PIL images)
+  data_cache_max_size: 16      # LRU cache entries (~130 MB each with PIL images)
   vllm_server_url: null         # optional: URL for vLLM server mode (null = use HF generate)
   expert_diffusion_steps: 10    # Euler steps for flow matching (expert mode only)
   expert_non_causal: true       # non-causal attention for expert transformer
