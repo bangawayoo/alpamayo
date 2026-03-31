@@ -24,7 +24,7 @@ import math
 import random
 import time
 from pathlib import Path
-import psutil
+
 from typing import Any
 
 import numpy as np
@@ -43,6 +43,7 @@ from alpamayo_r1.training.advantage_conditioning import (
     precompute_conditioned_sequences,
     train_segment_value_head,
 )
+from alpamayo_r1.training.profiler import StageProfiler
 
 logger = logging.getLogger(__name__)
 
@@ -573,6 +574,25 @@ class SelfPlayLoop:
         self._tb_writer = None
         self._vh_global_step = 0
 
+        # Profiling state (wall-clock + CPU RAM + VRAM)
+        train_cfg = self.cfg.get("training", {})
+        self._profiling_enabled = bool(train_cfg.get("enable_profiling", True))
+        profile_dir = Path(train_cfg.get("output_dir", "outputs/sft_advcond")) / "profiles"
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        self._profile_log_path = profile_dir / f"selfplay_profile_rank{rank}.jsonl"
+        self._profiler = StageProfiler(
+            enabled=self._profiling_enabled,
+            log_path=self._profile_log_path,
+            logger=logger,
+            capture_memory=True,
+            emit_human_logs=False,
+        )
+        if self._profiling_enabled:
+            logger.info("Profiling enabled: %s", self._profile_log_path)
+        else:
+            logger.info("Profiling disabled (training.enable_profiling=false)")
+        self._active_iteration: int | None = None
+
     def _get_tb_writer(self):
         """Lazily create a TensorBoard SummaryWriter for value head metrics.
 
@@ -596,6 +616,37 @@ class SelfPlayLoop:
             logger.debug("tensorboard not installed — value head TB logging disabled")
         return self._tb_writer
 
+    def _memory_snapshot(self) -> dict[str, float]:
+        """Collect a single memory snapshot for profiling."""
+        return self._profiler.memory_snapshot()
+
+    def _append_profile_record(self, record: dict[str, Any]) -> None:
+        """Append one structured profile record to a separate JSONL log file."""
+        self._profiler.append_event(record)
+
+    def _profile_section(
+        self,
+        *,
+        iteration: int | None,
+        phase: str,
+        stage: str,
+        gpu_active: bool,
+        extra: dict[str, Any] | None = None,
+    ):
+        """Profile one section and emit JSONL + human-readable summary logs."""
+        baseline_key = None
+        if iteration is not None and iteration >= 0:
+            baseline_key = f"iter_{iteration}"
+
+        return self._profiler.section(
+            iteration=iteration,
+            phase=phase,
+            stage=stage,
+            gpu_active=gpu_active,
+            extra=extra,
+            baseline_key=baseline_key,
+        )
+
     def run(self) -> None:
         """Run all iterations of the self-play loop.
 
@@ -603,6 +654,14 @@ class SelfPlayLoop:
         bootstrap the value head with sensible predictions before the first
         iteration computes advantages.
         """
+        self._append_profile_record(
+            {
+                "event": "run_start",
+                "num_iterations": self.num_iterations,
+                "profile_log_path": str(self._profile_log_path),
+            }
+        )
+
         vh_cfg = self.cfg.get("value_head", {})
         pretrain_scenes = int(vh_cfg.get("pretrain_scenes", 0))
         if pretrain_scenes > 0 and vh_cfg.get("enabled", False):
@@ -614,6 +673,7 @@ class SelfPlayLoop:
             logger.warning("=" * 60)
             self.run_iteration(i)
 
+        self._append_profile_record({"event": "run_end"})
         if self._tb_writer is not None:
             self._tb_writer.close()
 
@@ -732,57 +792,72 @@ class SelfPlayLoop:
         all_hidden_stash: list[dict] = []
         all_reward_stash: list[dict] = []
 
-        pbar = tqdm(
-            total=num_iters, initial=start_iter,
-            desc="VH pretrain (rollout)", unit="iter", disable=pretrain_rank != 0,
-        )
-        for i in range(start_iter, num_iters):
-            chunk_start = i * pretrain_batch_scenes
-            chunk_end = chunk_start + pretrain_batch_scenes
-            chunk_scenes = pretrain_scenes[chunk_start:chunk_end]
-            if not chunk_scenes:
-                break
-
-            # Prefetch next iteration's scenes so data loads overlap with GPU work
-            next_start = chunk_end
-            next_end = next_start + pretrain_batch_scenes
-            data_cache.prefetch(pretrain_scenes[next_start:next_end], t0_us)
-
-            # 1. Generate rollouts
-            rollout_results = engine.generate_completions(chunk_scenes, t0_us, G)
-            if not rollout_results:
-                logger.warning("No rollouts from iter %d — skipping", i + 1)
-                pbar.update(1)
-                continue
-
-            # 2. Compute rewards (CPU)
-            reward_stash = engine.compute_rewards(rollout_results)
-
-            # 3. Extract h_obs via prompt-only forward (1 per scene, not per completion)
-            segment_hidden_stash, _ = engine.extract_prompt_hidden(rollout_results)
-
-            all_hidden_stash.extend(segment_hidden_stash)
-            all_reward_stash.extend(reward_stash)
-
-            logger.debug(
-                "Pretrain rollout %d/%d: %d completions (total accumulated: %d)",
-                i + 1, num_iters, len(rollout_results), len(all_hidden_stash),
+        with self._profile_section(
+            iteration=-1,
+            phase="PRETRAIN",
+            stage="rollout_accumulate",
+            gpu_active=True,
+            extra={"num_iters": num_iters, "batch_scenes": pretrain_batch_scenes},
+        ):
+            pbar = tqdm(
+                total=num_iters,
+                initial=start_iter,
+                desc="VH pretrain (rollout)",
+                unit="iter",
+                disable=pretrain_rank != 0,
             )
-            pbar.update(1)
-            pbar.set_postfix(completions=len(all_hidden_stash))
+            for i in range(start_iter, num_iters):
+                chunk_start = i * pretrain_batch_scenes
+                chunk_end = chunk_start + pretrain_batch_scenes
+                chunk_scenes = pretrain_scenes[chunk_start:chunk_end]
+                if not chunk_scenes:
+                    break
 
-            del rollout_results, reward_stash, segment_hidden_stash
+                # Prefetch next iteration's scenes so data loads overlap with GPU work
+                next_start = chunk_end
+                next_end = next_start + pretrain_batch_scenes
+                data_cache.prefetch(pretrain_scenes[next_start:next_end], t0_us)
 
-            # Keep ranks synchronized — without this, faster ranks drift ahead
-            # and eventually trigger NCCL collective timeouts.
-            if dist.is_initialized():
-                dist.barrier(device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None)
+                # 1. Generate rollouts
+                rollout_results = engine.generate_completions(chunk_scenes, t0_us, G)
+                if not rollout_results:
+                    logger.warning("No rollouts from iter %d — skipping", i + 1)
+                    pbar.update(1)
+                    continue
 
-            # Periodic GC to free rollout intermediates
-            if (i + 1) % checkpoint_interval == 0:
-                gc.collect()
+                # 2. Compute rewards (CPU)
+                reward_stash = engine.compute_rewards(rollout_results)
 
-        pbar.close()
+                # 3. Extract h_obs via prompt-only forward (1 per scene, not per completion)
+                segment_hidden_stash, _ = engine.extract_prompt_hidden(rollout_results)
+
+                all_hidden_stash.extend(segment_hidden_stash)
+                all_reward_stash.extend(reward_stash)
+
+                logger.debug(
+                    "Pretrain rollout %d/%d: %d completions (total accumulated: %d)",
+                    i + 1,
+                    num_iters,
+                    len(rollout_results),
+                    len(all_hidden_stash),
+                )
+                pbar.update(1)
+                pbar.set_postfix(completions=len(all_hidden_stash))
+
+                del rollout_results, reward_stash, segment_hidden_stash
+
+                # Keep ranks synchronized — without this, faster ranks drift ahead
+                # and eventually trigger NCCL collective timeouts.
+                if dist.is_initialized():
+                    dist.barrier(
+                        device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None
+                    )
+
+                # Periodic GC to free rollout intermediates
+                if (i + 1) % checkpoint_interval == 0:
+                    gc.collect()
+
+            pbar.close()
 
         # ---------------------------------------------------------------
         # Phase 2: Train value head on all accumulated data at once
@@ -800,17 +875,24 @@ class SelfPlayLoop:
                 "Training value head on %d completions for %d epochs",
                 len(all_hidden_stash), num_epochs,
             )
-            metrics = train_segment_value_head(
-                value_head=vh_for_training,
-                optimizer=self._value_head_optimizer,
-                segment_hidden_stash=all_hidden_stash,
-                g_obs_list=g_obs,
-                num_epochs=num_epochs,
-                batch_size=vh_batch_size,
-                log_interval=vh_log_interval,
-                tb_writer=self._get_tb_writer(),
-                global_step_offset=self._vh_global_step,
-            )
+            with self._profile_section(
+                iteration=-1,
+                phase="PRETRAIN",
+                stage="train_value_head",
+                gpu_active=True,
+                extra={"num_epochs": num_epochs, "batch_size": vh_batch_size},
+            ):
+                metrics = train_segment_value_head(
+                    value_head=vh_for_training,
+                    optimizer=self._value_head_optimizer,
+                    segment_hidden_stash=all_hidden_stash,
+                    g_obs_list=g_obs,
+                    num_epochs=num_epochs,
+                    batch_size=vh_batch_size,
+                    log_interval=vh_log_interval,
+                    tb_writer=self._get_tb_writer(),
+                    global_step_offset=self._vh_global_step,
+                )
             self._vh_global_step += metrics.get("total_steps", 0)
             last_loss = metrics.get("loss", float("nan"))
             del all_hidden_stash, all_reward_stash, g_obs
@@ -864,12 +946,19 @@ class SelfPlayLoop:
         )
 
         iter_start = time.time()
+        self._active_iteration = iteration
+        self._profiler.set_baseline(f"iter_{iteration}")
 
         # ----- Phase 1: ROLLOUT -----
         logger.warning("Phase 1: ROLLOUT — generating completions")
-        t0 = time.time()
-        rollout_results = self._rollout_phase(fresh_scenes, iteration)
-        logger.warning("Phase 1 complete: %d completions in %.1fs", len(rollout_results), time.time() - t0)
+        with self._profile_section(
+            iteration=iteration,
+            phase="ROLLOUT",
+            stage="phase_total",
+            gpu_active=True,
+            extra={"num_fresh_scenes": len(fresh_scenes)},
+        ):
+            rollout_results = self._rollout_phase(fresh_scenes, iteration)
         self._get_data_cache().log_stats("Phase 1")
 
         # Save rollout clip IDs for debugging
@@ -883,55 +972,103 @@ class SelfPlayLoop:
 
         # ----- Phase 2: EVALUATE -----
         logger.warning("Phase 2: EVALUATE — scoring and binarizing advantages")
-        t0 = time.time()
-        adv_labels, advantages = self._evaluate_phase(rollout_results)
-        logger.warning("Phase 2 complete in %.1fs", time.time() - t0)
+        with self._profile_section(
+            iteration=iteration,
+            phase="EVALUATE",
+            stage="phase_total",
+            gpu_active=True,
+            extra={"num_rollouts": len(rollout_results)},
+        ):
+            adv_labels, advantages = self._evaluate_phase(rollout_results, iteration)
         self._get_data_cache().log_stats("Phase 2")
 
         # ----- Phase 2.5: GT AUGMENTATION (optional) -----
         adv_cfg = self.cfg.get("advantage_conditioning", {})
         if adv_cfg.get("augment_with_gt", False):
             logger.info("Phase 2.5: GT AUGMENTATION — selecting bottom-k%% + GT positives")
-            t0 = time.time()
-            rollout_results, adv_labels = self._augment_negative_traj_with_gt(
-                rollout_results, adv_labels, advantages
-            )
-            logger.info("Phase 2.5 complete in %.1fs", time.time() - t0)
+            with self._profile_section(
+                iteration=iteration,
+                phase="GT_AUGMENT",
+                stage="phase_total",
+                gpu_active=False,
+            ):
+                rollout_results, adv_labels = self._augment_negative_traj_with_gt(
+                    rollout_results, adv_labels, advantages
+                )
 
         # ----- Cleanup before Phase 3 -----
-        del advantages
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        proc = psutil.Process()
-        logger.warning(
-            "Pre-Phase 3 cleanup: RSS=%.1f GB, VRAM=%.1f/%.1f GB alloc/reserved",
-            proc.memory_info().rss / 1e9,
-            torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
-            torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0,
-        )
+        with self._profile_section(
+            iteration=iteration,
+            phase="CLEANUP",
+            stage="pre_train_cleanup",
+            gpu_active=False,
+        ):
+            del advantages
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if self._profiling_enabled:
+            snap = self._memory_snapshot()
+            logger.warning(
+                "PROFILE-CLEANUP it=%d RSS=%.2fGB VRAM alloc/reserved/used=%.2f/%.2f/%.2fGB",
+                iteration,
+                snap["rss_gb"],
+                snap["cuda_alloc_gb"],
+                snap["cuda_reserved_gb"],
+                snap["cuda_used_gb"],
+            )
 
         # ----- Phase 3: TRAIN -----
         logger.warning("Phase 3: TRAIN — advantage-conditioned SFT + expert CFM")
-        t0 = time.time()
-        self._train_phase(rollout_results, adv_labels, iteration)
-        logger.warning("Phase 3 complete in %.1fs", time.time() - t0)
+        with self._profile_section(
+            iteration=iteration,
+            phase="TRAIN",
+            stage="phase_total",
+            gpu_active=True,
+            extra={"num_train_samples": len(rollout_results)},
+        ):
+            self._train_phase(rollout_results, adv_labels, iteration)
 
         # ----- Phase 4: BOOKKEEPING -----
         logger.info("Phase 4: BOOKKEEPING — updating replay buffer and checkpoints")
-        self.replay_buffer.add(rollout_results, adv_labels, iteration)
-        advcond_cfg = self.cfg.get("advantage_conditioning", {})
-        if advcond_cfg.get("skip_checkpoint", False):
-            logger.info("Skipping checkpoint save (skip_checkpoint=true)")
-        else:
-            self._save_checkpoint(iteration)
+        with self._profile_section(
+            iteration=iteration,
+            phase="BOOKKEEPING",
+            stage="phase_total",
+            gpu_active=False,
+        ):
+            self.replay_buffer.add(rollout_results, adv_labels, iteration)
+            advcond_cfg = self.cfg.get("advantage_conditioning", {})
+            if advcond_cfg.get("skip_checkpoint", False):
+                logger.info("Skipping checkpoint save (skip_checkpoint=true)")
+            else:
+                self._save_checkpoint(iteration)
 
-        logger.info(
-            "Iteration %d complete: total %.1fs",
-            iteration,
-            time.time() - iter_start,
+        iter_total_s = time.time() - iter_start
+        iter_end_mem = self._memory_snapshot()
+        iter_growth = self._profiler.diff_from_baseline(f"iter_{iteration}", iter_end_mem)
+        self._append_profile_record(
+            {
+                "event": "iteration_complete",
+                "iteration": iteration,
+                "duration_s": round(iter_total_s, 4),
+                "mem_growth_vs_iter_start": {
+                    "rss_gb": round(iter_growth.get("rss_gb", 0.0), 4),
+                    "cuda_reserved_gb": round(iter_growth.get("cuda_reserved_gb", 0.0), 4),
+                },
+                "end_mem": iter_end_mem,
+            }
         )
+        if self._profiling_enabled:
+            logger.warning(
+                "PROFILE-ITER it=%d total=%.2fs | RSS growth=%.2fGB | VRAM reserved growth=%.2fGB",
+                iteration,
+                iter_total_s,
+                iter_growth.get("rss_gb", 0.0),
+                iter_growth.get("cuda_reserved_gb", 0.0),
+            )
+        self._active_iteration = None
 
     def _rollout_phase(self, fresh_scenes: list[str], iteration: int) -> list[dict]:
         """Generate G completions per fresh scene from current policy.
@@ -986,7 +1123,7 @@ class SelfPlayLoop:
         return results
 
     def _evaluate_phase(
-        self, rollout_results: list[dict]
+        self, rollout_results: list[dict], iteration: int | None = None
     ) -> tuple[list[dict], list[dict]]:
         """Score completions and binarize advantages.
 
@@ -1013,9 +1150,14 @@ class SelfPlayLoop:
         )
 
         # 1. Compute rewards
-        t_ = time.time()
-        reward_stash = engine.compute_rewards(rollout_results)
-        logger.info("  Stage 1 (compute_rewards): %.1fs for %d completions", time.time() - t_, len(reward_stash))
+        with self._profile_section(
+            iteration=iteration,
+            phase="EVALUATE",
+            stage="compute_rewards",
+            gpu_active=False,
+            extra={"num_completions": len(rollout_results)},
+        ):
+            reward_stash = engine.compute_rewards(rollout_results)
         if reward_stash:
             r_traj_vals = [r["r_traj"] for r in reward_stash]
             r_reason_vals = [r["r_reason"] for r in reward_stash]
@@ -1037,34 +1179,48 @@ class SelfPlayLoop:
         vh_cfg = self.cfg.get("value_head", {})
         if vh_cfg.get("enabled", False) and vh_cfg.get("segment_level", False):
             extract_mode = vh_cfg.get("extract_mode", "segment")
-            t_ = time.time()
             if extract_mode == "prompt":
-                segment_hidden_stash, completion_segment_map = engine.extract_prompt_hidden(
-                    rollout_results
-                )
-                logger.info("  Stage 2 (extract_prompt_hidden): %.1fs for %d completions", time.time() - t_, len(rollout_results))
+                with self._profile_section(
+                    iteration=iteration,
+                    phase="EVALUATE",
+                    stage="extract_prompt_hidden",
+                    gpu_active=True,
+                    extra={"num_completions": len(rollout_results)},
+                ):
+                    segment_hidden_stash, completion_segment_map = engine.extract_prompt_hidden(
+                        rollout_results
+                    )
             else:
-                segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
-                    rollout_results
-                )
-                logger.info("  Stage 2 (extract_segment_hidden): %.1fs for %d completions", time.time() - t_, len(rollout_results))
+                with self._profile_section(
+                    iteration=iteration,
+                    phase="EVALUATE",
+                    stage="extract_segment_hidden",
+                    gpu_active=True,
+                    extra={"num_completions": len(rollout_results)},
+                ):
+                    segment_hidden_stash, completion_segment_map = engine.extract_segment_hidden(
+                        rollout_results
+                    )
 
             reward_weights = self._get_reward_weights()
             value_head = self._get_or_create_value_head()
 
             # 3. Compute advantages using CURRENT value head (before update)
-            t_ = time.time()
-            advantages = compute_segment_advantages_from_rollouts(
-                segment_hidden_stash=segment_hidden_stash,
-                segment_reward_stash=reward_stash,
-                completion_segment_map=completion_segment_map,
-                value_head=value_head,
-                reward_weights=reward_weights,
-            )
-            logger.info("  Stage 3 (compute_advantages): %.1fs for %d completions", time.time() - t_, len(advantages))
+            with self._profile_section(
+                iteration=iteration,
+                phase="EVALUATE",
+                stage="compute_advantages",
+                gpu_active=False,
+            ):
+                advantages = compute_segment_advantages_from_rollouts(
+                    segment_hidden_stash=segment_hidden_stash,
+                    segment_reward_stash=reward_stash,
+                    completion_segment_map=completion_segment_map,
+                    value_head=value_head,
+                    reward_weights=reward_weights,
+                )
 
             # 4. THEN update value head on current data (for next iteration)
-            t_ = time.time()
             g_obs = compute_value_targets(
                 segment_reward_stash=reward_stash,
                 reward_weights=reward_weights,
@@ -1080,25 +1236,31 @@ class SelfPlayLoop:
                 vh_for_train = torch.nn.parallel.DistributedDataParallel(
                     value_head, device_ids=[vh_device]
                 )
-            vh_metrics = train_segment_value_head(
-                value_head=vh_for_train,
-                optimizer=self._value_head_optimizer,
-                segment_hidden_stash=segment_hidden_stash,
-                g_obs_list=g_obs,
-                num_epochs=vh_train_epochs,
-                batch_size=vh_batch_size,
-                log_interval=vh_log_interval,
-                tb_writer=self._get_tb_writer(),
-                global_step_offset=self._vh_global_step,
-            )
+            with self._profile_section(
+                iteration=iteration,
+                phase="EVALUATE",
+                stage="train_value_head",
+                gpu_active=True,
+                extra={"epochs": vh_train_epochs, "batch_size": vh_batch_size},
+            ):
+                vh_metrics = train_segment_value_head(
+                    value_head=vh_for_train,
+                    optimizer=self._value_head_optimizer,
+                    segment_hidden_stash=segment_hidden_stash,
+                    g_obs_list=g_obs,
+                    num_epochs=vh_train_epochs,
+                    batch_size=vh_batch_size,
+                    log_interval=vh_log_interval,
+                    tb_writer=self._get_tb_writer(),
+                    global_step_offset=self._vh_global_step,
+                )
             if isinstance(vh_for_train, torch.nn.parallel.DistributedDataParallel):
                 del vh_for_train  # release DDP wrapper
             del segment_hidden_stash, completion_segment_map, reward_stash
             del g_obs
             self._vh_global_step += vh_metrics.get("total_steps", 0)
             logger.info(
-                "  Stage 4 (train_value_head): %.1fs (%d epochs, loss=%.4f)",
-                time.time() - t_,
+                "Evaluate Stage train_value_head metrics: epochs=%d loss=%.4f",
                 vh_train_epochs,
                 vh_metrics.get("loss", float("nan")),
             )
@@ -1356,11 +1518,14 @@ class SelfPlayLoop:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             torch.cuda.empty_cache()
-            if torch.cuda.is_available():
+            if self._profiling_enabled and torch.cuda.is_available():
+                snap = self._memory_snapshot()
                 logger.info(
-                    "GPU cleanup after evaluate: %.1f/%.1f GB allocated/reserved",
-                    torch.cuda.memory_allocated() / 1e9,
-                    torch.cuda.memory_reserved() / 1e9,
+                    "PROFILE-TRAIN-PREP it=%d cleanup_after_evaluate alloc/reserved/used=%.2f/%.2f/%.2fGB",
+                    iteration,
+                    snap["cuda_alloc_gb"],
+                    snap["cuda_reserved_gb"],
+                    snap["cuda_used_gb"],
                 )
 
         if reset_to_base:
@@ -1437,6 +1602,12 @@ class SelfPlayLoop:
         if world_size == 1:
             fsdp_kwargs["fsdp"] = ""
 
+        dataloader_num_workers = int(train_cfg.get("dataloader_num_workers", 0))
+        dataloader_pin_memory = bool(train_cfg.get("dataloader_pin_memory", True))
+        dataloader_persistent_workers = bool(
+            train_cfg.get("dataloader_persistent_workers", False)
+        )
+
         training_args = TrainingArguments(
             output_dir=str(output_dir),
             num_train_epochs=int(train_cfg.get("num_train_epochs", 1)),
@@ -1454,6 +1625,11 @@ class SelfPlayLoop:
             max_grad_norm=float(train_cfg.get("max_grad_norm", 1.0)),
             report_to=train_cfg.get("report_to", "tensorboard"),
             remove_unused_columns=False,
+            dataloader_num_workers=dataloader_num_workers,
+            dataloader_pin_memory=dataloader_pin_memory,
+            dataloader_persistent_workers=(
+                dataloader_persistent_workers and dataloader_num_workers > 0
+            ),
             **fsdp_kwargs,
         )
 
@@ -1472,17 +1648,39 @@ class SelfPlayLoop:
             expert_cfg=expert_cfg,
             data_cache=data_cache,
             value_head=value_head,
+            profiling_cfg={
+                "enabled": bool(train_cfg.get("profile_inner_steps", False)),
+                "every_n_steps": int(train_cfg.get("profile_inner_every_n_steps", train_cfg.get("logging_steps", 1))),
+                "capture_memory": bool(train_cfg.get("profile_inner_capture_memory", True)),
+            },
         )
 
         # 6. Train
-        if torch.cuda.is_available():
+        if self._profiling_enabled and torch.cuda.is_available():
+            snap = self._memory_snapshot()
             logger.info(
-                "GPU mem before trainer.train(): %.1f/%.1f GB allocated/reserved",
-                torch.cuda.memory_allocated() / 1e9,
-                torch.cuda.memory_reserved() / 1e9,
+                "PROFILE-TRAIN-PREP it=%d before_trainer_train alloc/reserved/used=%.2f/%.2f/%.2fGB",
+                iteration,
+                snap["cuda_alloc_gb"],
+                snap["cuda_reserved_gb"],
+                snap["cuda_used_gb"],
             )
-        logger.info("Starting SFT iteration %d: %d samples", iteration, len(train_dataset))
-        trainer.train()
+        logger.info(
+            "Starting SFT iteration %d: %d samples (dl_workers=%d pin_memory=%s persistent_workers=%s)",
+            iteration,
+            len(train_dataset),
+            dataloader_num_workers,
+            dataloader_pin_memory,
+            dataloader_persistent_workers and dataloader_num_workers > 0,
+        )
+        with self._profile_section(
+            iteration=iteration,
+            phase="TRAIN",
+            stage="trainer_train",
+            gpu_active=True,
+            extra={"num_train_samples": len(train_dataset)},
+        ):
+            trainer.train()
 
         # 7. Save
         advcond_cfg = self.cfg.get("advantage_conditioning", {})
@@ -1557,11 +1755,15 @@ class SelfPlayLoop:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            logger.info(
-                "GPU cleanup after training: %.1f/%.1f GB allocated/reserved",
-                torch.cuda.memory_allocated() / 1e9,
-                torch.cuda.memory_reserved() / 1e9,
-            )
+            if self._profiling_enabled:
+                snap = self._memory_snapshot()
+                logger.info(
+                    "PROFILE-TRAIN-CLEANUP it=%d after_training alloc/reserved/used=%.2f/%.2f/%.2fGB",
+                    iteration,
+                    snap["cuda_alloc_gb"],
+                    snap["cuda_reserved_gb"],
+                    snap["cuda_used_gb"],
+                )
 
         # Update the full_model reference for next iteration's rollouts
         self.full_model = full_model

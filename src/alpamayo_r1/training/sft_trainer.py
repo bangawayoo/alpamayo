@@ -26,10 +26,12 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from transformers import Trainer
 
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1.models.base_model import IGNORE_INDEX
+from alpamayo_r1.training.profiler import StageProfiler
 from alpamayo_r1.training.rollout_utils import ClipDataCache
 
 logger = logging.getLogger(__name__)
@@ -151,6 +153,7 @@ class AdvCondSFTTrainer(Trainer):
         expert_cfg: dict | None = None,
         data_cache: ClipDataCache | None = None,
         value_head: torch.nn.Module | None = None,
+        profiling_cfg: dict | None = None,
         **kwargs,
     ):
         # Determine pad_token_id for the collator
@@ -181,6 +184,32 @@ class AdvCondSFTTrainer(Trainer):
         self._sft_step_count = 0
         self._uncond_total = 0
         self._uncond_count = 0
+
+        # Optional inner-step profiling (for training_step bubble diagnosis)
+        self._profiling_cfg = profiling_cfg or {}
+        self._profile_enabled = bool(self._profiling_cfg.get("enabled", False))
+        self._profile_every_n_steps = int(
+            self._profiling_cfg.get("every_n_steps", max(1, int(self.args.logging_steps)))
+        )
+        profile_capture_memory = bool(self._profiling_cfg.get("capture_memory", True))
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        self._profile_log_path = (
+            Path(self.args.output_dir) / "profiles" / f"sft_trainer_profile_rank{rank}.jsonl"
+        )
+        self._profiler = StageProfiler(
+            enabled=self._profile_enabled,
+            log_path=self._profile_log_path,
+            logger=logger,
+            capture_memory=profile_capture_memory,
+            emit_human_logs=True,
+            human_log_level=logging.INFO,
+        )
+        if self._profile_enabled:
+            logger.info(
+                "SFT inner-step profiling enabled: %s (every_n_steps=%d)",
+                self._profile_log_path,
+                self._profile_every_n_steps,
+            )
 
         # Expert finetuning setup
         self._expert_enabled = False
@@ -274,6 +303,42 @@ class AdvCondSFTTrainer(Trainer):
             self._expert_every_n_steps,
         )
 
+    def _should_profile_step(self, step: int) -> bool:
+        return self._profile_enabled and (step % self._profile_every_n_steps == 0)
+
+    def _profile_section(
+        self,
+        *,
+        step: int,
+        stage: str,
+        gpu_active: bool,
+        extra: dict[str, Any] | None = None,
+    ):
+        """Profile a sub-section inside training_step."""
+        return self._profiler.section(
+            phase="TRAIN_STEP",
+            stage=stage,
+            gpu_active=gpu_active,
+            active=self._should_profile_step(step),
+            sync_cuda=True,
+            event="training_step_section",
+            extra=extra,
+            step=step,
+            global_step=int(self.state.global_step) if self.state is not None else -1,
+        )
+
+    def _append_profile_record(self, step: int, record: dict[str, Any]) -> None:
+        self._profiler.append_event(
+            {
+                "event": "training_step_summary",
+                "phase": "TRAIN_STEP",
+                "step": step,
+                "global_step": int(self.state.global_step) if self.state is not None else -1,
+                **record,
+            },
+            active=self._should_profile_step(step),
+        )
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """Standard cross-entropy with dual-loss weighting.
 
@@ -316,8 +381,11 @@ class AdvCondSFTTrainer(Trainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Override to add deferred expert CFM step after VLM backward."""
+        step = self._sft_step_count + 1
+
         # 1. Normal SFT forward + backward
-        loss = super().training_step(model, inputs, num_items_in_batch)
+        with self._profile_section(step=step, stage="sft_forward_backward", gpu_active=True):
+            loss = super().training_step(model, inputs, num_items_in_batch)
 
         # Track unconditional fraction
         is_unconditional = inputs.get("is_unconditional")
@@ -325,8 +393,14 @@ class AdvCondSFTTrainer(Trainer):
             self._uncond_total += is_unconditional.numel()
             self._uncond_count += is_unconditional.sum().item()
 
+        # 2. Deferred expert CFM step
+        expert_metrics = {}
+        if self._expert_enabled and self.state.global_step % self._expert_every_n_steps == 0:
+            with self._profile_section(step=step, stage="expert_cfm_total", gpu_active=True):
+                expert_metrics = self._expert_cfm_step(inputs, step=step)
+
         # Log SFT loss periodically
-        self._sft_step_count += 1
+        self._sft_step_count = step
         if self._sft_step_count % max(1, self.args.logging_steps) == 0:
             uncond_frac = self._uncond_count / max(self._uncond_total, 1)
             logger.debug(
@@ -339,13 +413,18 @@ class AdvCondSFTTrainer(Trainer):
                 self._uncond_total,
             )
 
-        # 2. Deferred expert CFM step
-        if self._expert_enabled and self.state.global_step % self._expert_every_n_steps == 0:
-            self._expert_cfm_step(inputs)
+        self._append_profile_record(
+            step,
+            {
+                "sft_loss": float(loss.item() if hasattr(loss, "item") else loss),
+                "uncond_frac": float(self._uncond_count / max(self._uncond_total, 1)),
+                "expert_metrics": expert_metrics,
+            },
+        )
 
         return loss
 
-    def _expert_cfm_step(self, inputs: dict) -> None:
+    def _expert_cfm_step(self, inputs: dict, step: int) -> dict[str, Any]:
         """Run one expert CFM training step using deferred GPU scheduling.
 
         Two-phase approach to avoid VLM + expert co-residency on GPU:
@@ -355,7 +434,7 @@ class AdvCondSFTTrainer(Trainer):
                  restore VLM to GPU.
         """
         if self.full_model is None or self._data_cache is None:
-            return
+            return {"status": "skipped_no_model_or_cache"}
 
         from alpamayo_r1.training.train_expert import compute_cfm_loss
 
@@ -375,53 +454,59 @@ class AdvCondSFTTrainer(Trainer):
         hist_rot_list = inputs.get("hist_rot_list", [])
 
         if not clip_ids:
-            return
+            return {"status": "skipped_no_clip_ids"}
 
         # ---- Phase A: Extract KV caches (VLM on GPU) ----
         cached_samples = []
-        for i in range(len(clip_ids)):
-            try:
-                clip_id = clip_ids[i]
-                t0_us = t0_us_list[i]
-                completion_prefix = completion_prefixes[i]
+        with self._profile_section(
+            step=step,
+            stage="expert_phaseA_extract_kv",
+            gpu_active=True,
+            extra={"num_clip_ids": len(clip_ids)},
+        ):
+            for i in range(len(clip_ids)):
+                try:
+                    clip_id = clip_ids[i]
+                    t0_us = t0_us_list[i]
+                    completion_prefix = completion_prefixes[i]
 
-                # Load scene data (needed for VLM KV cache extraction)
-                model_inputs, ego_future_xyz = self._data_cache.get(clip_id, t0_us, device)
+                    # Load scene data (needed for VLM KV cache extraction)
+                    model_inputs, ego_future_xyz = self._data_cache.get(clip_id, t0_us, device)
 
-                # Teacher-forced VLM forward → KV cache
-                kv_result = self._get_vlm_kv_cache_teacher_forced(
-                    model_inputs, completion_prefix, device
-                )
+                    # Teacher-forced VLM forward → KV cache
+                    kv_result = self._get_vlm_kv_cache_teacher_forced(
+                        model_inputs, completion_prefix, device
+                    )
 
-                # Use expert GT from rollout if available (handles artificial data correctly),
-                # otherwise fall back to dataset GT.
-                if expert_fut_xyz_list and i < len(expert_fut_xyz_list):
-                    hist_xyz = hist_xyz_list[i].unsqueeze(0).to(device)  # (1, T, 3)
-                    hist_rot = hist_rot_list[i].unsqueeze(0).to(device)  # (1, T, 3, 3)
-                    fut_xyz = expert_fut_xyz_list[i].unsqueeze(0).to(device)  # (1, T_fut, 3)
-                    fut_rot = expert_fut_rot_list[i].unsqueeze(0).to(device)  # (1, T_fut, 3, 3)
-                else:
-                    ego_future_rot = self._data_cache.get_ego_future_rot(clip_id, t0_us).to(device)
-                    hist_xyz = model_inputs["ego_history_xyz"][:, -1].to(device)
-                    hist_rot = model_inputs["ego_history_rot"][:, -1].to(device)
-                    fut_xyz = ego_future_xyz.to(device)[:, -1]
-                    fut_rot = ego_future_rot[:, -1]
+                    # Use expert GT from rollout if available (handles artificial data correctly),
+                    # otherwise fall back to dataset GT.
+                    if expert_fut_xyz_list and i < len(expert_fut_xyz_list):
+                        hist_xyz = hist_xyz_list[i].unsqueeze(0).to(device)  # (1, T, 3)
+                        hist_rot = hist_rot_list[i].unsqueeze(0).to(device)  # (1, T, 3, 3)
+                        fut_xyz = expert_fut_xyz_list[i].unsqueeze(0).to(device)  # (1, T_fut, 3)
+                        fut_rot = expert_fut_rot_list[i].unsqueeze(0).to(device)  # (1, T_fut, 3, 3)
+                    else:
+                        ego_future_rot = self._data_cache.get_ego_future_rot(clip_id, t0_us).to(device)
+                        hist_xyz = model_inputs["ego_history_xyz"][:, -1].to(device)
+                        hist_rot = model_inputs["ego_history_rot"][:, -1].to(device)
+                        fut_xyz = ego_future_xyz.to(device)[:, -1]
+                        fut_rot = ego_future_rot[:, -1]
 
-                cached_samples.append(
-                    {
-                        "kv_result": kv_result,
-                        "hist_xyz": hist_xyz,
-                        "hist_rot": hist_rot,
-                        "fut_xyz": fut_xyz,
-                        "fut_rot": fut_rot,
-                    }
-                )
-            except Exception as e:
-                logger.warning("KV cache extraction failed for sample %d: %s", i, e)
-                continue
+                    cached_samples.append(
+                        {
+                            "kv_result": kv_result,
+                            "hist_xyz": hist_xyz,
+                            "hist_rot": hist_rot,
+                            "fut_xyz": fut_xyz,
+                            "fut_rot": fut_rot,
+                        }
+                    )
+                except Exception as e:
+                    logger.warning("KV cache extraction failed for sample %d: %s", i, e)
+                    continue
 
         if not cached_samples:
-            return
+            return {"status": "skipped_no_cached_samples"}
 
         # ---- Phase B: Expert CFM step ----
         expert_device = next(self.full_model.expert.parameters()).device
@@ -435,40 +520,46 @@ class AdvCondSFTTrainer(Trainer):
         n_valid = 0
         self._expert_optimizer.zero_grad()
 
-        for i, sample in enumerate(cached_samples):
-            try:
-                prompt_cache, rope_deltas, prefill_seq_len, b_star, offset = sample["kv_result"]
+        with self._profile_section(
+            step=step,
+            stage="expert_phaseB_forward_backward",
+            gpu_active=True,
+            extra={"num_cached_samples": len(cached_samples)},
+        ):
+            for i, sample in enumerate(cached_samples):
+                try:
+                    prompt_cache, rope_deltas, prefill_seq_len, b_star, offset = sample["kv_result"]
 
-                with torch.no_grad():
-                    gt_action = self.full_model.action_space.traj_to_action(
-                        sample["hist_xyz"],
-                        sample["hist_rot"],
-                        sample["fut_xyz"],
-                        sample["fut_rot"],
-                    )
+                    with torch.no_grad():
+                        gt_action = self.full_model.action_space.traj_to_action(
+                            sample["hist_xyz"],
+                            sample["hist_rot"],
+                            sample["fut_xyz"],
+                            sample["fut_rot"],
+                        )
 
-                # Compute CFM loss
-                with torch.autocast(str(device), dtype=torch.bfloat16):
-                    loss = compute_cfm_loss(
-                        model=self.full_model,
-                        gt_action=gt_action,
-                        prompt_cache=prompt_cache,
-                        rope_deltas=rope_deltas,
-                        prefill_seq_len=prefill_seq_len,
-                        b_star=b_star,
-                        offset=offset,
-                        num_noisy_samples=num_noisy_samples,
-                        device=device,
-                    )
-                    loss = loss / max(len(cached_samples), 1)
+                    # Compute CFM loss
+                    with torch.autocast(str(device), dtype=torch.bfloat16):
+                        loss = compute_cfm_loss(
+                            model=self.full_model,
+                            gt_action=gt_action,
+                            prompt_cache=prompt_cache,
+                            rope_deltas=rope_deltas,
+                            prefill_seq_len=prefill_seq_len,
+                            b_star=b_star,
+                            offset=offset,
+                            num_noisy_samples=num_noisy_samples,
+                            device=device,
+                        )
+                        loss = loss / max(len(cached_samples), 1)
 
-                loss.backward()
-                total_loss += loss.item()
-                n_valid += 1
+                    loss.backward()
+                    total_loss += loss.item()
+                    n_valid += 1
 
-            except Exception as e:
-                logger.warning("Expert CFM step failed for sample %d: %s", i, e)
-                continue
+                except Exception as e:
+                    logger.warning("Expert CFM step failed for sample %d: %s", i, e)
+                    continue
 
         if n_valid > 0:
             expert_params = [
@@ -479,8 +570,14 @@ class AdvCondSFTTrainer(Trainer):
                 )
                 and p.requires_grad
             ]
-            torch.nn.utils.clip_grad_norm_(expert_params, max_grad_norm)
-            self._expert_optimizer.step()
+            with self._profile_section(
+                step=step,
+                stage="expert_phaseB_optimizer_step",
+                gpu_active=True,
+                extra={"n_valid": n_valid},
+            ):
+                torch.nn.utils.clip_grad_norm_(expert_params, max_grad_norm)
+                self._expert_optimizer.step()
 
             self._expert_metrics["expert_cfm/loss"].append(total_loss)
             self._expert_metrics["expert_cfm/valid_samples"].append(float(n_valid))
@@ -497,6 +594,13 @@ class AdvCondSFTTrainer(Trainer):
                 self.log(
                     {"expert_cfm/loss": total_loss, "expert_cfm/valid_samples": float(n_valid)}
                 )
+
+        return {
+            "status": "ok",
+            "n_cached": len(cached_samples),
+            "n_valid": n_valid,
+            "loss": float(total_loss),
+        }
 
     def _get_vlm_kv_cache_teacher_forced(
         self,

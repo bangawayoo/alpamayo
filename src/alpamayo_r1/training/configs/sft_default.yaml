@@ -51,6 +51,13 @@ training:
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   report_to: tensorboard
+  dataloader_num_workers: 0         # increase to overlap CPU batch prep with GPU work
+  dataloader_pin_memory: true
+  dataloader_persistent_workers: true
+  enable_profiling: false           # self-play phase/stage profiling JSONL
+  profile_inner_steps: false        # profile AdvCondSFTTrainer.training_step internals
+  profile_inner_every_n_steps: 10   # sampling interval for inner-step profiler
+  profile_inner_capture_memory: true
 
 # Advantage conditioning parameters (outer self-play loop)
 advantage_conditioning:
