@@ -7,6 +7,25 @@ This document summarizes profiling metrics collected from:
 
 The run was still in progress when this snapshot was generated, so numbers reflect currently available records.
 
+## Before vs After optimization (succinct)
+
+Optimizations compared:
+1. Increase DataLoader parallelism (`dataloader_num_workers=4`, `pin_memory=true`, `persistent_workers=true`) → `outputs/profile_workers4`
+2. Add max sequence-length control (same profiling setup) → `outputs/profile` *(current snapshot has 1 completed iteration)*
+
+| Metric | Before (`outputs/sft_advcond`) | +Workers4 (`outputs/profile_workers4`) | +Workers4 + Max-Seq (`outputs/profile`) |
+|---|---:|---:|---:|
+| Completed iterations in snapshot | 4 | 3 | 1 |
+| **Total wall-clock** (rank0 sum of `iteration_complete`) | **1483.12s** | **772.14s** | **347.87s** |
+| Wall-clock / iteration (avg) | 370.78s | 257.38s | 347.87s |
+| `sft_forward_backward` bubble P50 (step>1) | **0.254s** | **0.033s** | **0.039s** |
+| `sft_forward_backward` fraction bubble > 1s | **40.7%** | **23.2%** | **27.3%** |
+| Peak GPU `cuda_max_reserved_gb` | 80.79 GB | 80.79 GB | **64.89 GB** |
+| Peak GPU `cuda_reserved_gb` | 76.85 GB | 76.86 GB | **64.89 GB** |
+| Peak GPU `cuda_used_gb` | 78.09 GB | 78.09 GB | **66.13 GB** |
+
+Takeaway: workers reduce median bubble strongly. In this `outputs/profile` snapshot, max-seq control shows a large VRAM drop (peak reserved/max_reserved ~64.9 GB vs ~80.8 GB), while bubble metrics remain in the same range as workers-only. Since only one iteration completed, wall-clock is not directly comparable yet.
+
 ## How to run with profiling enabled
 
 ```bash
