@@ -920,7 +920,11 @@ class SelfPlayLoop:
         # ----- Phase 4: BOOKKEEPING -----
         logger.info("Phase 4: BOOKKEEPING — updating replay buffer and checkpoints")
         self.replay_buffer.add(rollout_results, adv_labels, iteration)
-        self._save_checkpoint(iteration)
+        advcond_cfg = self.cfg.get("advantage_conditioning", {})
+        if advcond_cfg.get("skip_checkpoint", False):
+            logger.info("Skipping checkpoint save (skip_checkpoint=true)")
+        else:
+            self._save_checkpoint(iteration)
 
         logger.info(
             "Iteration %d complete: total %.1fs",
@@ -1473,32 +1477,38 @@ class SelfPlayLoop:
         trainer.train()
 
         # 7. Save
-        # Save the adapter first (standard PEFT behavior)
-        final_save_dir = output_dir / "final"
-        trainer.save_model(str(final_save_dir))
+        advcond_cfg = self.cfg.get("advantage_conditioning", {})
+        skip_checkpoint = advcond_cfg.get("skip_checkpoint", False)
 
-        # ALSO: Save the ENTIRE model to confirm if loading/resizing is the issue.
-        logger.info(
-            "Merging LoRA weights and saving full AlpamayoR1 model to %s",
-            final_save_dir / "full_model",
-        )
+        if skip_checkpoint:
+            logger.info("Skipping Phase 3 checkpoint save (skip_checkpoint=true)")
+        else:
+            # Save the adapter first (standard PEFT behavior)
+            final_save_dir = output_dir / "final"
+            trainer.save_model(str(final_save_dir))
 
-        # 1. Merge LoRA weights in-place temporarily for saving
-        if hasattr(self.full_model.vlm, "merge_and_unload"):
-            self.full_model.vlm = self.full_model.vlm.merge_and_unload()
-        if hasattr(self.full_model.expert, "merge_and_unload"):
-            self.full_model.expert = self.full_model.expert.merge_and_unload()
+            # ALSO: Save the ENTIRE model to confirm if loading/resizing is the issue.
+            logger.info(
+                "Merging LoRA weights and saving full AlpamayoR1 model to %s",
+                final_save_dir / "full_model",
+            )
 
-        # 2. Save the full AlpamayoR1 instance
-        # This saves config.json (model_type: alpamayo_r1) and all submodule weights
-        self.full_model.save_pretrained(str(final_save_dir / "full_model"))
-        self.processor.save_pretrained(str(final_save_dir / "full_model"))
+            # 1. Merge LoRA weights in-place temporarily for saving
+            if hasattr(self.full_model.vlm, "merge_and_unload"):
+                self.full_model.vlm = self.full_model.vlm.merge_and_unload()
+            if hasattr(self.full_model.expert, "merge_and_unload"):
+                self.full_model.expert = self.full_model.expert.merge_and_unload()
 
-        # 3. Reload LoRA for the next iteration (since SelfPlayLoop continues using this model)
-        # Note: In RECAP mode (reset_to_base=True), this doesn't matter as it reloads anyway.
-        # If not resetting, we would need to re-apply the adapter here.
-        self.current_policy_path = str(output_dir / "final")
-        logger.info("Saved pi_%d to %s", iteration + 1, self.current_policy_path)
+            # 2. Save the full AlpamayoR1 instance
+            # This saves config.json (model_type: alpamayo_r1) and all submodule weights
+            self.full_model.save_pretrained(str(final_save_dir / "full_model"))
+            self.processor.save_pretrained(str(final_save_dir / "full_model"))
+
+            # 3. Reload LoRA for the next iteration (since SelfPlayLoop continues using this model)
+            # Note: In RECAP mode (reset_to_base=True), this doesn't matter as it reloads anyway.
+            # If not resetting, we would need to re-apply the adapter here.
+            self.current_policy_path = str(output_dir / "final")
+            logger.info("Saved pi_%d to %s", iteration + 1, self.current_policy_path)
 
         # 8. Synchronize NCCL state across ranks before the next iteration.
         if dist.is_initialized():

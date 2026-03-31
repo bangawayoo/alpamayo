@@ -69,6 +69,7 @@ advantage_conditioning:
   replay_ratio: 0.3             # fraction of training data from historical replay buffer
   replay_buffer_max_size: 50000
   reset_to_base: false          # true = reload pi_0 each iteration (RECAP), false = continue from previous iteration's weights
+  skip_checkpoint: false         # skip saving checkpoints at each iteration (useful for profiling/debugging)
 
 # Value head (required for segment-level advantage computation)
 value_head:
