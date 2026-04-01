@@ -37,9 +37,11 @@ from alpamayo_r1.training.advantage_conditioning import (
     AdvantageBuffer,
     AdvantageEmbedding,
     AdvCondDataset,
+    OnDiskAdvCondDataset,
     compute_advantage_token_ids,
     compute_segment_advantages_from_rollouts,
     compute_value_targets,
+    materialize_advcond_dataset,
     precompute_conditioned_sequences,
     train_segment_value_head,
 )
@@ -1668,6 +1670,7 @@ class SelfPlayLoop:
         dataloader_persistent_workers = bool(
             train_cfg.get("dataloader_persistent_workers", False)
         )
+        dataloader_prefetch_factor = int(train_cfg.get("dataloader_prefetch_factor", 2))
 
         training_args = TrainingArguments(
             output_dir=str(output_dir),
@@ -1690,6 +1693,9 @@ class SelfPlayLoop:
             dataloader_pin_memory=dataloader_pin_memory,
             dataloader_persistent_workers=(
                 dataloader_persistent_workers and dataloader_num_workers > 0
+            ),
+            dataloader_prefetch_factor=(
+                dataloader_prefetch_factor if dataloader_num_workers > 0 else None
             ),
             **fsdp_kwargs,
         )
@@ -1727,12 +1733,13 @@ class SelfPlayLoop:
                 snap["cuda_used_gb"],
             )
         logger.info(
-            "Starting SFT iteration %d: %d samples (dl_workers=%d pin_memory=%s persistent_workers=%s)",
+            "Starting SFT iteration %d: %d samples (dl_workers=%d pin_memory=%s persistent_workers=%s prefetch_factor=%s)",
             iteration,
             len(train_dataset),
             dataloader_num_workers,
             dataloader_pin_memory,
             dataloader_persistent_workers and dataloader_num_workers > 0,
+            dataloader_prefetch_factor if dataloader_num_workers > 0 else "n/a",
         )
         with self._profile_section(
             iteration=iteration,
@@ -1833,7 +1840,7 @@ class SelfPlayLoop:
         self,
         fresh_rollouts: list[dict],
         fresh_labels: list[dict],
-    ) -> AdvCondDataset:
+    ) -> AdvCondDataset | OnDiskAdvCondDataset:
         """Build the advantage-conditioned dataset for SFT training.
 
         Combines fresh rollouts (current iteration) with historical rollouts
@@ -1841,6 +1848,10 @@ class SelfPlayLoop:
 
         The fresh rollouts are the primary training data. Historical data
         is mixed in to improve stability and prevent catastrophic forgetting.
+
+        By default, this materializes compact training-ready shards to disk and
+        returns a lazy dataset so Phase 3 can keep dataloader workers/prefetching
+        without holding the entire Python object graph in RAM.
         """
         # Calculate how many historical samples to add
         n_fresh = len(fresh_rollouts)
@@ -1875,11 +1886,43 @@ class SelfPlayLoop:
             traj_future_start_id=traj_future_start_id,
         )
 
-        return AdvCondDataset(
+        p_drop = float(adv_cfg.get("p_drop", 0.3))
+        train_cfg = self.cfg.get("training", {})
+        serialize_dataset = bool(train_cfg.get("serialize_train_dataset", True))
+
+        if not serialize_dataset:
+            return AdvCondDataset(
+                rollout_results=all_rollouts,
+                precomputed=precomputed,
+                p_drop=p_drop,
+                data_cache=self._get_data_cache(),
+            )
+
+        output_dir = Path(train_cfg.get("output_dir", "outputs/sft_advcond"))
+        iteration = self._active_iteration if self._active_iteration is not None else -1
+        dataset_dir = output_dir / f"iter_{iteration}" / "train_dataset"
+        manifest_path = materialize_advcond_dataset(
             rollout_results=all_rollouts,
             precomputed=precomputed,
-            p_drop=float(adv_cfg.get("p_drop", 0.3)),
+            output_dir=dataset_dir,
+            shard_size=int(train_cfg.get("train_dataset_shard_size", 1024)),
+        )
+        logger.info(
+            "Serialized train dataset to %s (%d samples)",
+            manifest_path,
+            len(all_rollouts),
+        )
+
+        del precomputed
+        del all_rollouts
+        del all_labels
+        gc.collect()
+
+        return OnDiskAdvCondDataset(
+            manifest_path=manifest_path,
+            p_drop=p_drop,
             data_cache=self._get_data_cache(),
+            shard_cache_size=int(train_cfg.get("train_dataset_shard_cache_size", 2)),
         )
 
     def _get_data_cache(self):

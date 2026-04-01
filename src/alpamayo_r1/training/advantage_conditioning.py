@@ -12,10 +12,13 @@ See docs/advantage-conditioning.md for the design specification.
 
 from __future__ import annotations
 
+import bisect
+import json
 import logging
 import math
 import random
-from collections import deque
+from collections import OrderedDict, deque
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -729,21 +732,54 @@ def precompute_conditioned_sequences(
     return precomputed
 
 
+def _build_advcond_item(
+    rollout: dict[str, Any],
+    pc: dict[str, Any],
+    *,
+    p_drop: float,
+    data_cache: Any | None,
+) -> dict[str, Any]:
+    """Build one training item from rollout metadata + precomputed sequences."""
+    is_unconditional = pc["is_all_positive"] and random.random() < p_drop
+    seq = pc["uncond"] if is_unconditional else pc["cond"]
+    item = {
+        "input_ids": seq["input_ids"],
+        "labels": seq["labels"],
+        "attention_mask": seq["attention_mask"],
+        "is_unconditional": is_unconditional,
+        "completion_prefix": seq["completion_prefix"],
+    }
+
+    # Propagate metadata for expert CFM step.
+    if "clip_id" in rollout:
+        item["clip_id"] = rollout["clip_id"]
+    if "t0_us" in rollout:
+        item["t0_us"] = rollout["t0_us"]
+    if "expert_fut_xyz" in rollout:
+        item["expert_fut_xyz"] = rollout["expert_fut_xyz"]
+    if "expert_fut_rot" in rollout:
+        item["expert_fut_rot"] = rollout["expert_fut_rot"]
+    if "hist_xyz" in rollout:
+        item["hist_xyz"] = rollout["hist_xyz"]
+    if "hist_rot" in rollout:
+        item["hist_rot"] = rollout["hist_rot"]
+
+    # Fetch vision data from cached model_inputs (already processor-encoded)
+    if data_cache is not None and "clip_id" in rollout:
+        clip_id = rollout["clip_id"]
+        t0_us = rollout.get("t0_us", 5_100_000)
+        model_inputs, _ = data_cache.get(clip_id, t0_us, device="cpu")
+        tokenized = model_inputs["tokenized_data"]
+        if "pixel_values" in tokenized:
+            item["pixel_values"] = tokenized["pixel_values"].squeeze(0)
+        if "image_grid_thw" in tokenized:
+            item["image_grid_thw"] = tokenized["image_grid_thw"].squeeze(0)
+
+    return item
+
+
 class AdvCondDataset(Dataset):
-    """Dataset wrapping rollout results with pre-computed advantage conditioning.
-
-    Sequences (input_ids, labels, attention_mask, completion_prefix) are
-    pre-built by precompute_conditioned_sequences() before training starts.
-    At __getitem__ time the only CPU work is a single random check for
-    conditioning dropout, plus vision data retrieval from the cache.
-
-    Args:
-        rollout_results: List of dicts per completion (metadata for vision
-            data lookup and expert CFM: clip_id, t0_us, etc.).
-        precomputed: Pre-computed sequences from precompute_conditioned_sequences().
-        p_drop: Conditioning dropout probability.
-        data_cache: ClipDataCache for loading vision data.
-    """
+    """In-memory dataset wrapping rollout results with pre-computed sequences."""
 
     def __init__(
         self,
@@ -766,41 +802,134 @@ class AdvCondDataset(Dataset):
         return len(self._rollouts)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        rollout = self._rollouts[idx]
-        pc = self._precomputed[idx]
-        is_unconditional = pc["is_all_positive"] and random.random() < self._p_drop
-        seq = pc["uncond"] if is_unconditional else pc["cond"]
-        item = {
-            "input_ids": seq["input_ids"],
-            "labels": seq["labels"],
-            "attention_mask": seq["attention_mask"],
-            "is_unconditional": is_unconditional,
-            "completion_prefix": seq["completion_prefix"],
-        }
+        return _build_advcond_item(
+            self._rollouts[idx],
+            self._precomputed[idx],
+            p_drop=self._p_drop,
+            data_cache=self._data_cache,
+        )
 
-        # Propagate metadata for expert CFM step.
-        if "clip_id" in rollout:
-            item["clip_id"] = rollout["clip_id"]
-        if "t0_us" in rollout:
-            item["t0_us"] = rollout["t0_us"]
-        if "expert_fut_xyz" in rollout:
-            item["expert_fut_xyz"] = rollout["expert_fut_xyz"]
-        if "expert_fut_rot" in rollout:
-            item["expert_fut_rot"] = rollout["expert_fut_rot"]
-        if "hist_xyz" in rollout:
-            item["hist_xyz"] = rollout["hist_xyz"]
-        if "hist_rot" in rollout:
-            item["hist_rot"] = rollout["hist_rot"]
 
-        # Fetch vision data from cached model_inputs (already processor-encoded)
-        if self._data_cache is not None and "clip_id" in rollout:
-            clip_id = rollout["clip_id"]
-            t0_us = rollout.get("t0_us", 5_100_000)
-            model_inputs, _ = self._data_cache.get(clip_id, t0_us, device="cpu")
-            tokenized = model_inputs["tokenized_data"]
-            if "pixel_values" in tokenized:
-                item["pixel_values"] = tokenized["pixel_values"].squeeze(0)
-            if "image_grid_thw" in tokenized:
-                item["image_grid_thw"] = tokenized["image_grid_thw"].squeeze(0)
+def compact_rollout_for_sft(rollout: dict[str, Any]) -> dict[str, Any]:
+    """Keep only fields needed by SFT + expert CFM after rollout/eval phases."""
+    keep = {
+        "prompt_ids",
+        "completion_ids",
+        "clip_id",
+        "t0_us",
+        "expert_fut_xyz",
+        "expert_fut_rot",
+        "hist_xyz",
+        "hist_rot",
+    }
+    return {k: rollout[k] for k in keep if k in rollout}
 
-        return item
+
+def materialize_advcond_dataset(
+    *,
+    rollout_results: list[dict],
+    precomputed: list[dict],
+    output_dir: str | Path,
+    shard_size: int = 1024,
+) -> Path:
+    """Serialize compact SFT samples into sharded .pt files.
+
+    Each shard stores compact rollout metadata plus the corresponding precomputed
+    conditioned/unconditioned sequences. This keeps Phase 3 dataloader workers
+    fast while avoiding one large in-memory Python object graph.
+    """
+    if len(rollout_results) != len(precomputed):
+        raise ValueError(
+            f"Mismatched lengths: {len(rollout_results)} rollouts vs {len(precomputed)} precomputed"
+        )
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shard_size = max(1, int(shard_size))
+
+    manifest: dict[str, Any] = {
+        "num_samples": len(rollout_results),
+        "shard_size": shard_size,
+        "shards": [],
+    }
+
+    for shard_idx, start in enumerate(range(0, len(rollout_results), shard_size)):
+        end = min(start + shard_size, len(rollout_results))
+        shard_records = []
+        for rollout, pc in zip(rollout_results[start:end], precomputed[start:end], strict=False):
+            shard_records.append(
+                {
+                    "rollout": compact_rollout_for_sft(rollout),
+                    "precomputed": pc,
+                }
+            )
+        shard_path = out_dir / f"shard_{shard_idx:05d}.pt"
+        torch.save(shard_records, shard_path)
+        manifest["shards"].append(
+            {
+                "path": shard_path.name,
+                "length": len(shard_records),
+            }
+        )
+
+    manifest_path = out_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest_path
+
+
+class OnDiskAdvCondDataset(Dataset):
+    """Shard-backed SFT dataset with a small per-worker shard cache."""
+
+    def __init__(
+        self,
+        manifest_path: str | Path,
+        p_drop: float = 0.3,
+        data_cache: Any | None = None,
+        shard_cache_size: int = 2,
+    ) -> None:
+        self._manifest_path = Path(manifest_path)
+        manifest = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+        self._base_dir = self._manifest_path.parent
+        self._shards = manifest["shards"]
+        self._length = int(manifest["num_samples"])
+        self._p_drop = p_drop
+        self._data_cache = data_cache
+        self._cumulative_sizes: list[int] = []
+        running = 0
+        for shard in self._shards:
+            running += int(shard["length"])
+            self._cumulative_sizes.append(running)
+        self._shard_cache_size = max(1, int(shard_cache_size))
+        self._shard_cache: OrderedDict[int, list[dict[str, Any]]] = OrderedDict()
+
+    def __len__(self) -> int:
+        return self._length
+
+    def _load_shard(self, shard_idx: int) -> list[dict[str, Any]]:
+        cached = self._shard_cache.get(shard_idx)
+        if cached is not None:
+            self._shard_cache.move_to_end(shard_idx)
+            return cached
+
+        shard_rel_path = self._shards[shard_idx]["path"]
+        shard_path = self._base_dir / shard_rel_path
+        records = torch.load(shard_path, map_location="cpu", weights_only=False)
+        self._shard_cache[shard_idx] = records
+        self._shard_cache.move_to_end(shard_idx)
+        while len(self._shard_cache) > self._shard_cache_size:
+            self._shard_cache.popitem(last=False)
+        return records
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        if idx < 0 or idx >= self._length:
+            raise IndexError(idx)
+        shard_idx = bisect.bisect_right(self._cumulative_sizes, idx)
+        start = 0 if shard_idx == 0 else self._cumulative_sizes[shard_idx - 1]
+        local_idx = idx - start
+        record = self._load_shard(shard_idx)[local_idx]
+        return _build_advcond_item(
+            record["rollout"],
+            record["precomputed"],
+            p_drop=self._p_drop,
+            data_cache=self._data_cache,
+        )
