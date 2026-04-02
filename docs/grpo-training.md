@@ -1,253 +1,606 @@
-# GRPO Post-Training for Alpamayo-R1
+# GRPO Training in Alpamayo-R1
 
 ## Overview
 
-The GRPO (Group Relative Policy Optimization) module implements Stage 3 RL post-training for Alpamayo-R1, as described in Section 3.3 of the [paper](https://arxiv.org/abs/2511.00088). The VLM autoregressively generates both Chain-of-Causation (CoC) reasoning text and discrete trajectory tokens during rollouts. No Expert or Diffusion modules are used — trajectory tokens are decoded to continuous xyz waypoints via the trajectory tokenizer.
+GRPO training is the RL post-training stage for Alpamayo-R1. The goal is to improve the **VLM backbone** so that, given a driving scene, it generates:
 
-Training uses [TRL](https://huggingface.co/docs/trl/index)'s `GRPOTrainer` with a custom subclass (`AlpamayoGRPOTrainer`) that handles the multi-modal rollout pipeline.
+1. **Chain-of-Causation (CoC) reasoning text**, and then
+2. **Discrete future trajectory tokens**
 
----
+in a single autoregressive sequence.
 
-## Architecture
+In this repository, GRPO is implemented as **VLM-only rollout training**:
 
-### VLM-Only Rollout Pipeline
+- the **VLM** is the policy being optimized,
+- the **expert** and **diffusion** modules are kept out of the rollout path,
+- the model directly emits trajectory tokens,
+- those tokens are decoded into continuous waypoints only for reward computation.
 
-```
-Dataset (PhysicalAI-AV clips)
-    │
-    │ Each sample: {prompt with [clip_id=...] [t0_us=...]}
-    │
-    ▼
-AlpamayoGRPOTrainer._generate_single_turn
-    │
-    ├─ 1. Parse clip_id/t0_us from prompt metadata
-    │
-    ├─ 2. Load driving data (16 camera images, ego history/future)
-    │      └─ ClipDataCache: lazy-loads and caches in CPU RAM
-    │
-    ├─ 3. Fuse history trajectory tokens into input_ids
-    │      └─ full_model.fuse_traj_tokens(input_ids, traj_data)
-    │
-    ├─ 4. VLM generates CoC text + 64 trajectory tokens
-    │      └─ vlm.generate() with temperature/top_p sampling
-    │      └─ Stops at <|traj_future_end|> token
-    │
-    ├─ 5. Decode trajectory tokens → continuous xyz
-    │      └─ extract_traj_tokens() → traj_tokenizer.decode()
-    │      └─ Output: pred_xyz (num_samples, 64, 3)
-    │
-    ├─ 6. Compute per-token log-probs (teacher-forced VLM forward)
-    │      └─ _compute_batch_logprobs() in mini-batches
-    │
-    └─> Return: (prompt_ids, completion_ids, logprobs, {pred_xyz, gt_xyz})
-                    │
-                    ▼
-            TRL GRPOTrainer
-                    │
-                    ├─ Compute rewards (3 functions, weighted sum)
-                    ├─ Group-relative advantage estimation
-                    ├─ GRPO clipped loss → backprop through VLM (LoRA only)
-                    └─ Optimizer step
-```
-
-**Key design choice**: The VLM directly produces discrete trajectory tokens (`<i0>`..\`<i767>`), which are decoded via `traj_tokenizer.decode()` to continuous (x, y, z) waypoints. Expert and Diffusion modules stay on CPU and are not used during GRPO training following the paper's implementation.
+The training entry point is `src/alpamayo_r1/training/train_grpo.py`, and the custom trainer is `src/alpamayo_r1/training/rollout.py`.
 
 ---
 
-## Modules
+## High-level training loop
 
-| File | Purpose |
-|------|---------|
-| `train_grpo.py` | Hydra entry point. Loads model, applies LoRA, builds datasets, creates trainer. |
-| `rollout.py` | `AlpamayoGRPOTrainer` — overrides `_generate_single_turn` for VLM-only rollouts, `log()` for eval metric plumbing, `_save()` for PEFT compatibility. Also contains `ClipDataCache`, `RolloutLoggingCallback`, `GpuUtilizationCallback`. |
-| `rewards.py` | Three reward functions: trajectory quality, reasoning quality, consistency. |
-| `dataset.py` | Builds lightweight HF Dataset with conversational prompts embedding clip metadata. |
-| `configs/grpo_default.yaml` | Default Hydra config with all hyperparameters. |
+At a high level, one GRPO step looks like this:
 
-### AlpamayoGRPOTrainer
+1. Sample a batch of driving scenes.
+2. For each scene, generate **G** completions (`training.num_generations`, default 8).
+3. Score each completion with reward functions.
+4. Compute **group-relative advantages** within each scene’s set of G samples.
+5. Update the VLM so higher-reward reasoning/trajectory sequences become more likely.
 
-Subclasses TRL's `GRPOTrainer`. The `model` passed to the parent is `full_model.vlm` (the VLM component only), which is what TRL wraps with LoRA and trains. The full `AlpamayoR1` model is stored separately for trajectory tokenizer access.
-
-Key overrides:
-- **`_generate_single_turn`**: VLM-only rollout with trajectory token decoding (see diagram above). Also supports vLLM delegation via `rollout_func` when `vllm.enabled=true`.
-- **`log`**: Mutates the eval metrics dict in-place so that `_determine_best_metric` and `EarlyStoppingCallback` can find reward metrics (works around a TRL bug where `GRPOTrainer.log()` creates a new dict instead of updating the original).
-- **`_save`**: Passes `save_embedding_layers=True` to PEFT because Qwen3VLConfig doesn't expose `vocab_size`, causing PEFT's auto-detection to crash.
+That means Alpamayo is not trained against a supervised target sequence here. Instead, it explores multiple sampled completions per scene and learns from their **relative reward ranking**.
 
 ---
 
-## Reward Functions
+## End-to-end pipeline
 
-All reward functions follow TRL's interface: `f(completions, **kwargs) -> list[float]`, returning values in [0, 1].
-
-### 1. Trajectory Quality (`trajectory_quality_reward`)
-
-Measures prediction accuracy using minADE (minimum Average Displacement Error).
-
+```text
+PhysicalAI-AV clips
+    ↓
+build_alpamayo_dataset()
+    ↓
+Prompt contains metadata: [clip_id=...] [t0_us=...]
+    ↓
+AlpamayoGRPOTrainer rollout
+    ↓
+Load scene data for that clip/timestamp
+    - camera images
+    - ego history trajectory
+    - ground-truth future trajectory
+    ↓
+Fuse history trajectory tokens into the prompt
+    ↓
+VLM generates:
+    CoC text + future trajectory tokens
+    ↓
+Decode trajectory tokens → continuous xyz waypoints
+    ↓
+Compute rewards
+    - trajectory quality
+    - reasoning quality
+    - consistency
+    ↓
+TRL GRPOTrainer computes grouped advantages and GRPO loss
+    ↓
+Backprop through the VLM (typically LoRA adapters only)
 ```
-reward = max(0, 1 - minADE / 5.0)
+
+---
+
+## 1. Dataset construction
+
+File: `src/alpamayo_r1/training/dataset.py`
+
+`build_alpamayo_dataset()` creates a lightweight Hugging Face dataset. Each example stores:
+
+- `prompt`: a chat-style prompt,
+- `clip_id`: the driving clip identifier,
+- `t0_us`: the timestamp used as the prediction origin.
+
+The prompt does **not** inline all image and trajectory tensors. Instead, the prompt embeds metadata like:
+
+```text
+[clip_id=...] [t0_us=...]
 ```
 
-- Uses only xy coordinates (ignores z/altitude)
-- `min` over trajectory samples encourages diversity (best-of-N)
-- Threshold of 5.0m: perfect prediction → 1.0, 5m+ error → 0.0
+During rollout, the trainer parses those fields and loads the real scene data through `PhysicalAIAVDatasetInterface`.
 
-### 2. Reasoning Quality (`reasoning_quality_reward`)
+This keeps the dataset compact and lets rollouts lazily fetch the multimodal inputs they need.
 
-Rule-based heuristic scoring CoC text on 4 criteria (each worth 0.25):
+---
 
-| Criterion | Full score | Partial | Zero |
-|-----------|-----------|---------|------|
-| Causal connectors ("because", "therefore", ...) | 2+ matches | 1 match | 0 |
-| Driving vocabulary ("vehicle", "lane", "brake", ...) | 4+ terms | 2-3 terms | 0-1 |
-| Appropriate length (40-2000 chars) | In range | Non-empty | Empty |
-| No degenerate repetition (20+ char repeated 3x) | No repeat | — | Repeat found |
+## 2. Model setup before training
 
-**Note**: The paper uses a reasoning critic for this reward. The rule-based heuristic is a simplified stand-in.
+File: `src/alpamayo_r1/training/train_grpo.py`
 
-### 3. Consistency (`consistency_reward`)
+`train_grpo.py` loads the full `AlpamayoR1` model, but only the **VLM portion** is optimized during GRPO.
 
-Checks whether CoC text mentions behaviors that match the predicted trajectory (turning, braking, etc.). Currently **disabled by default** (weight=0.0) because the coarse behavior extraction is too noisy.
+### What gets frozen
 
-### Default Weights
+All parameters outside `vlm.*` are frozen by `_freeze_non_vlm_params()`.
+
+So GRPO does **not** update:
+
+- expert module,
+- diffusion module,
+- action projection layers,
+- other non-VLM components.
+
+### What usually gets trained
+
+By default, LoRA is applied to the VLM attention projections:
+
+- `q_proj`
+- `k_proj`
+- `v_proj`
+- `o_proj`
+
+Default config in `src/alpamayo_r1/training/configs/grpo_default.yaml`:
 
 ```yaml
-trajectory_weight: 0.50   # minADE-based, grounded
-reasoning_weight:  0.50   # rule-based heuristic
-consistency_weight: 0.00  # disabled
-```
-
----
-
-## Configuration
-
-All config is in `src/alpamayo_r1/training/configs/grpo_default.yaml`. Override any value via CLI Hydra overrides.
-
-### Key Parameters
-
-```yaml
-# LoRA (applied to VLM attention layers only)
 lora:
+  enabled: true
   r: 16
   alpha: 32
   dropout: 0.05
-  target_modules: [q_proj, k_proj, v_proj, o_proj]
+```
 
-# Training
-training:
-  num_train_epochs: 1
-  per_device_train_batch_size: 4
-  gradient_accumulation_steps: 1
-  learning_rate: 1e-5
-  num_generations: 8              # G in GRPO (group size)
-  max_completion_length: 384      # CoC (≤256) + 64 traj tokens + overhead
-  gradient_checkpointing: true
-  beta: 0.0                       # no KL penalty → no reference model
+So the common GRPO setup is: **freeze the full model except the VLM, then train small LoRA adapters on the VLM**.
 
-# Rollout
+---
+
+## 3. What a rollout actually does
+
+File: `src/alpamayo_r1/training/rollout.py`
+
+The core logic lives in `AlpamayoGRPOTrainer`, which subclasses TRL’s `GRPOTrainer`.
+
+### Prompt expansion into groups
+
+GRPO needs multiple sampled completions per prompt. If `num_generations=8`, then each scene is sampled 8 times with stochastic decoding.
+
+Those 8 completions form one **group** for relative comparison.
+
+### Scene loading
+
+Inside `_generate_single_turn()`, the trainer:
+
+1. parses `clip_id` and `t0_us` from the prompt,
+2. loads the scene using `ClipDataCache`,
+3. obtains:
+   - camera images,
+   - ego history xyz/rotation,
+   - ground-truth future xyz.
+
+`ClipDataCache` avoids repeatedly reloading the same clip from disk/network.
+
+### History fusion
+
+Before generation, the trainer injects the ego history into the token stream using:
+
+- `full_model.fuse_traj_tokens(...)`
+
+This replaces trajectory placeholder tokens with the actual tokenized history trajectory so the VLM conditions on recent motion.
+
+### Generation
+
+The VLM then generates a single sequence containing:
+
+- CoC reasoning text first,
+- future trajectory tokens after that,
+- termination at `<|traj_future_end|>`.
+
+By default, generation uses:
+
+```yaml
 rollout:
   temperature: 0.6
   top_p: 0.98
-  max_generation_length: 256      # max CoC text tokens
-  logprob_mini_batch_size: 2      # completions per forward pass
+  max_generation_length: 256
+```
 
-# Dataset
-data:
-  split: train
-  t0_us: 5100000                  # 5.1s into each clip
-  max_samples: 3000
-  exclude_clip_ids_file: notebooks/clip_ids.parquet  # exclude eval clips
+The trainer uses `StopAfterEOS` so generation ends once the future trajectory terminator is reached.
 
-# Early stopping
+---
+
+## 4. From generated tokens to trajectories
+
+After generation, the trainer extracts future trajectory tokens from the completion and decodes them.
+
+Important pieces:
+
+- token extraction: `extract_traj_tokens()`
+- decoding: `traj_tokenizer.decode()`
+
+This converts the generated discrete trajectory token IDs into continuous future waypoints in xyz space.
+
+So the policy itself predicts **tokens**, but rewards are computed on decoded **continuous trajectories**.
+
+---
+
+## 5. Why log-probabilities are computed afterward
+
+GRPO needs token-level log-probabilities for the sampled completions. After generation, the trainer runs a separate teacher-forced forward pass over the generated completion to compute those log-probs.
+
+That happens in `_generate_single_turn()` via `_compute_batch_logprobs(...)`.
+
+Conceptually:
+
+- generation produces sampled completions,
+- a second forward pass scores how probable those tokens were under the current policy,
+- TRL uses those log-probs when building the GRPO objective.
+
+This is separate from decoding trajectories for reward computation.
+
+---
+
+## 6. Reward functions
+
+File: `src/alpamayo_r1/training/rewards.py`
+
+Each sampled completion gets multiple rewards.
+
+### Trajectory quality reward
+
+`trajectory_quality_reward()` compares predicted and ground-truth future trajectories using ADE on the xy plane.
+
+Approximate form:
+
+```text
+reward = max(0, 1 - ADE / threshold)
+```
+
+Default threshold is 5 meters.
+
+This is the most grounded reward because it directly measures trajectory accuracy.
+
+### Reasoning quality reward
+
+`reasoning_quality_reward()` is a rule-based text reward. It scores the CoC text based on things like:
+
+- presence of causal connectors,
+- driving-domain vocabulary,
+- non-empty and reasonable length,
+- lack of degenerate repetition.
+
+This is a heuristic stand-in for a more sophisticated reasoning critic.
+
+### Consistency reward
+
+`consistency_reward()` checks whether the generated reasoning text agrees with the generated trajectory at a coarse behavior level, such as:
+
+- turning,
+- going straight,
+- accelerating,
+- decelerating.
+
+It maps the predicted trajectory to meta-actions and checks whether the text mentions matching behaviors.
+
+### Default reward weights
+
+Current defaults are:
+
+```yaml
+rewards:
+  trajectory_weight: 0.50
+  reasoning_weight: 0.50
+  consistency_weight: 0.0
+```
+
+So consistency is currently disabled by default, while trajectory and reasoning each contribute half of the total reward.
+
+---
+
+## 7. How GRPO uses the rewards
+
+For each scene, the trainer samples a group of completions:
+
+```text
+scene i → completion 1, completion 2, ..., completion G
+```
+
+Each completion gets a scalar total reward from the weighted reward functions.
+
+GRPO then compares samples **within the same group**. A completion is considered good if it scores better than the other sampled completions from the same scene.
+
+This gives a **group-relative advantage** instead of an absolute target. The policy update then increases the probability of better-ranked completions and decreases the probability of worse-ranked ones.
+
+In practical terms:
+
+- if one reasoning/trajectory sample is better than the others for the same scene, it gets positive advantage,
+- if it is worse, it gets negative advantage,
+- this helps stabilize RL by comparing like with like.
+
+The underlying loss and optimization are handled by TRL’s `GRPOTrainer`, while `AlpamayoGRPOTrainer` customizes how multimodal rollouts and rewards are produced.
+
+---
+
+## 8. Comparison with the SFT pipeline
+
+The repository also has an **advantage-conditioned iterative SFT** pipeline, implemented in:
+
+- `src/alpamayo_r1/training/train_sft.py`
+- `src/alpamayo_r1/training/selfplay_loop.py`
+- `src/alpamayo_r1/training/sft_rollout.py`
+- `src/alpamayo_r1/training/sft_trainer.py`
+- `src/alpamayo_r1/training/advantage_conditioning.py`
+
+Both pipelines generate rollouts and score them with rewards, but they use those scores very differently.
+
+### GRPO vs SFT at a glance
+
+| Aspect | GRPO | Advantage-conditioned SFT |
+|---|---|---|
+| Outer algorithm | RL / policy optimization | Iterative self-play + supervised learning |
+| Trainer | TRL `GRPOTrainer` subclass | HF `Trainer` subclass |
+| Rollout usage | Used immediately to form policy-gradient-style updates | Converted into labeled SFT examples |
+| Main training loss | GRPO objective on sampled completions | Teacher-forced cross-entropy |
+| What reward affects | Sample weights/advantages in the loss | Binary conditioning labels attached to sequences |
+| Default rollout mode | `vlm_only` | often `expert` in current config |
+| Expert/diffusion in rollout | not used by default | can be used during rollout and expert finetuning |
+
+### The most important difference: how the advantage is computed and used
+
+#### In GRPO
+
+GRPO samples **G completions for the same scene** and compares them **against each other**.
+
+Conceptually:
+
+```text
+A_i,j ≈ reward_i,j - baseline_from_other_samples_in_same_group
+```
+
+where:
+
+- `i` = scene,
+- `j` = one sampled completion among the `G` completions for that scene.
+
+So the advantage is **group-relative**. A completion gets positive advantage if it is better than the other sampled completions for that same prompt/scene, and negative advantage if it is worse.
+
+This is the standard GRPO idea:
+
+- rewards are computed per completion,
+- advantages are formed within each prompt group,
+- those advantages directly scale the policy update.
+
+In other words, GRPO uses the advantage as an **optimization weight**.
+
+#### In advantage-conditioned SFT
+
+The SFT pipeline does **not** use grouped relative ranking inside the training loss.
+
+Instead, it computes a **return-minus-value baseline** advantage for each completion:
+
+```text
+a = G(s_obs) - V(s_obs)
+```
+
+In the current implementation in `advantage_conditioning.py`:
+
+- reward components are first normalized,
+- a scalar return target `G(s_obs)` is formed from the weighted rewards,
+- a value head predicts `V(s_obs)`,
+- the advantage is computed as `a_obs = G(s_obs) - V(s_obs)`,
+- and `a_traj` is currently set equal to that same value in the default computation.
+
+So unlike GRPO, the SFT pipeline's advantage is **not “how much better than the other G samples was this completion?”**
+It is closer to **“how much better or worse than the value-head expectation was this completion?”**
+
+Then that continuous advantage is **binarized** using percentile thresholds:
+
+```text
+i_obs  = 1[a_obs  > eps_obs]
+i_traj = 1[a_traj > eps_traj]
+```
+
+Those binary labels are turned into conditioning tokens such as:
+
+- positive observation label,
+- negative observation label,
+- positive trajectory label,
+- negative trajectory label.
+
+Then the model is trained by plain SFT to predict the same completion sequence under those labels.
+
+So in SFT, the advantage is used as a **data label**, not as a direct policy-gradient weight.
+
+### Why this matters
+
+This difference changes the role of rollout sampling:
+
+- **GRPO** needs multiple samples per scene mainly to estimate a stable **relative advantage** and improve the policy online.
+- **SFT** needs rollouts mainly to create a better supervised dataset: generate completions, score them, label them as positive/negative, and train on them with cross-entropy.
+
+Said another way:
+
+- GRPO asks: **which sampled completion should get pushed up or down right now?**
+- SFT asks: **what kind of completion should the model learn to imitate when conditioned on good/bad labels?**
+
+### Training objective difference
+
+#### GRPO objective
+
+The GRPO path uses sampled completions, token log-probs, and advantages inside the RL loss.
+
+Very roughly:
+
+```text
+loss ~ - advantage × logprob(sampled completion)
+```
+
+with GRPO-specific clipping / normalization handled by TRL.
+
+#### SFT objective
+
+The SFT path uses the same rollout completions as fixed targets and optimizes:
+
+```text
+loss = cross_entropy(predicted_tokens, completion_tokens)
+```
+
+The only role of the advantage is to decide which conditioning tokens get inserted before CoC and trajectory generation.
+
+### Rollout path difference
+
+Another important practical difference:
+
+- **GRPO** in this repo is intentionally **VLM-only** during rollout.
+- **SFT** can run in either:
+  - `vlm_only` mode, or
+  - `expert` mode, where the VLM generates CoC and the expert+diffusion path generates the trajectory.
+
+In the current `sft_default.yaml`, rollout mode is:
+
+```yaml
+rollout:
+  mode: expert
+```
+
+So by default the SFT pipeline is closer to the full system than GRPO is.
+
+### Value head role
+
+- In **GRPO**, the default pipeline does not rely on a learned value head for the main advantage computation; the core signal is the group-relative GRPO advantage from sampled rewards.
+- In **SFT**, the value head is central because the advantage labels are computed from **return minus value prediction**.
+
+That is why the SFT pipeline has explicit stages for:
+
+- pretraining the value head,
+- updating it on rollout data,
+- then computing advantage labels with the current value head.
+
+### Practical takeaway
+
+If you want the shortest comparison:
+
+- **GRPO**: reward → group-relative advantage → RL loss.
+- **SFT**: reward → return-minus-value advantage → positive/negative labels → supervised loss.
+
+So the biggest conceptual difference is that **GRPO uses advantage as an online optimization signal**, while **the SFT pipeline uses advantage as a label-generation mechanism for later supervised training**.
+
+## 9. Why this is “VLM-only GRPO”
+
+Alpamayo-R1 as a full system includes more than the VLM, but GRPO here intentionally trains only the VLM rollout path.
+
+That means:
+
+- the VLM directly emits trajectory tokens,
+- expert and diffusion are not used to refine trajectories during rollout,
+- reward is computed directly from the decoded VLM output.
+
+This has two main advantages:
+
+1. **Lower memory / simpler training loop**
+2. **Directly aligns the VLM outputs with the RL reward**
+
+It also means the RL signal is attached to exactly what the model generated: the reasoning text and the future trajectory token sequence.
+
+---
+
+## 9. Trainer customizations in this repo
+
+`AlpamayoGRPOTrainer` adds several Alpamayo-specific behaviors on top of TRL:
+
+- custom `_generate_single_turn()` for multimodal VLM rollouts,
+- custom `_calculate_rewards()` to decode trajectory tokens before reward scoring,
+- `log()` workaround so evaluation reward metrics are visible to early stopping,
+- custom `_save()` for PEFT/Qwen3-VL compatibility,
+- optional vLLM generation backend,
+- optional value head and expert fine-tuning hooks.
+
+For the default GRPO path, the most important customizations are the rollout override and the reward decoding logic.
+
+---
+
+## 10. vLLM support
+
+The trainer supports two generation backends:
+
+1. **Hugging Face generation** via `model.generate()`
+2. **vLLM** for faster rollout generation
+
+vLLM can run in:
+
+- `colocate` mode: in-process,
+- `server` mode: separate vLLM process.
+
+When vLLM is enabled, generation is delegated through a custom `rollout_func`, but the overall logic is the same:
+
+- load scene,
+- fuse history,
+- generate CoC + trajectory tokens,
+- decode trajectory tokens,
+- compute rewards,
+- run GRPO updates.
+
+---
+
+## 11. Configuration knobs that matter most
+
+File: `src/alpamayo_r1/training/configs/grpo_default.yaml`
+
+The most important GRPO controls are:
+
+### Group size
+
+```yaml
+training.num_generations: 8
+```
+
+This is the number of sampled completions per scene.
+
+### Policy optimization
+
+```yaml
+training.learning_rate: 1e-5
+training.num_train_epochs: 1
+training.gradient_checkpointing: true
+training.beta: 0.0
+```
+
+`beta: 0.0` means no KL penalty/reference-model term is used by default.
+
+### Rollout sampling
+
+```yaml
+rollout.temperature: 0.6
+rollout.top_p: 0.98
+```
+
+These control exploration. Higher temperature increases diversity but also noise.
+
+### Reward mix
+
+```yaml
+rewards:
+  trajectory_weight: 0.50
+  reasoning_weight: 0.50
+  consistency_weight: 0.0
+```
+
+### Early stopping
+
+```yaml
 early_stopping:
   enabled: true
-  patience: 5
-  eval_steps: 100
-  eval_max_samples: 30
-  metric: rewards/trajectory_quality_reward/mean
+  metric: reward
 ```
 
+By default, early stopping tracks the overall weighted reward on a held-out eval set.
 
 ---
 
-## Quick Start
+## 12. What is optimized in one sentence
 
-```bash
-# Smoke test (3 samples, 1 epoch)
-./scripts/run_grpo.sh --smoke
-
-# Full training run (DDP, auto-detected GPUs)
-./scripts/run_grpo.sh --no-fsdp
-
-# Single-GPU mode
-./scripts/run_grpo.sh --no-fsdp --num-gpus 1
-
-# Custom overrides
-./scripts/run_grpo.sh --no-fsdp training.learning_rate=5e-6 rewards.trajectory_weight=0.7
-
-# Dry run (print resolved config)
-./scripts/run_grpo.sh --dry-run
-
-# Monitor training
-tensorboard --logdir outputs/grpo
-```
-
-> **Note**: FSDP is currently broken (conflicts with LoRA + Qwen3-VL tied embeddings during checkpoint saving). Use `--no-fsdp` for DDP mode.
+GRPO in Alpamayo-R1 trains the VLM so that, for each driving scene, sampled CoC-plus-trajectory completions with **better reward than their peers** become more likely under the model.
 
 ---
 
-## Preliminary Results
+## 13. Practical summary
 
-Evaluated on 253 curated test clips (5 trajectory samples per clip, 5 seeds per model). All checkpoints use the same LoRA config (r=16, α=32) and reward weights (trajectory 50%, reasoning 50%).
+If you want the shortest mental model:
 
-| Model | minADE mean ± std | minFDE mean ± std |
-|-------|-------------------|-------------------|
-| Base (no GRPO) | 0.918 ± 0.030 | 2.446 ± 0.071 |
-| temp=0.6, step 300 | 0.910 ± 0.040 | 2.431 ± 0.152 |
-| **temp=0.6, step 400** | **0.898 ± 0.030** | **2.334 ± 0.099** |
-| temp=0.6, step 600 | 0.918 ± 0.035 | 2.441 ± 0.088 |
-| temp=1.0, step 400 | 0.930 ± 0.023 | 2.544 ± 0.084 |
-| temp=1.0, step 600 | 0.959 ± 0.021 | 2.591 ± 0.092 |
+- build prompts that point to a driving clip,
+- load the real multimodal scene at rollout time,
+- fuse trajectory history into the prompt,
+- sample multiple CoC + trajectory completions from the VLM,
+- decode trajectories,
+- score each sample with trajectory and reasoning rewards,
+- use GRPO to push probability mass toward the better samples,
+- update mainly LoRA adapters on the VLM.
 
-The temp=0.6, step 400 checkpoint shows the best trend on both metrics. The improvement does not reach statistical significance at p<0.05 (paired t-test: minADE p≈0.53, minFDE p≈0.21), so results should be read as suggestive rather than conclusive. Notable patterns:
-
-- **Lower sampling temperature** (0.6 vs 1.0) consistently produces better trajectories. Higher temperature increases diversity but introduces more stochasticity into the trajectory token distribution.
-- **Step 400 is a sweet spot**: step 300 is undertrained, while step 600 begins to regress, suggesting overfitting to the reward signal.
+That is how GRPO training works in this repository.
 
 ---
 
-## Design Decisions
+## Key files
 
-### Why VLM-Only Rollouts?
-
-The paper's full pipeline runs VLM → Expert → Diffusion → Action Space, but during GRPO the VLM is trained to generate trajectory tokens directly.
-
-### Why Override `_generate_single_turn`?
-
-TRL's `rollout_func` hook is only invoked in vLLM code paths. For HuggingFace generation, we override `_generate_single_turn` directly to:
-- Parse clip metadata from prompts and load driving data
-- Run the VLM with fused history trajectory tokens
-- Extract and decode trajectory tokens for reward computation
-- Compute per-token log-probs via a separate teacher-forced forward pass
-
-### Why Clone `input_ids`?
-
-The Alpamayo model **pops** `input_ids` from the input dict during forward pass (`tokenized_data.pop("input_ids")`). We clone it before generation so it's available for the log-prob computation afterward.
-
----
-
-## Troubleshooting
-
-**OOM errors**: Reduce `num_generations` (e.g., 4), `logprob_mini_batch_size` (e.g., 1), or `max_generation_length`.
-
-**Slow rollouts**: Download the PhysicalAI-AV dataset locally (streaming is slow) through [download_eval_clips.py](../scripts/data/download_eval_clips.py). `ClipDataCache` caches loaded clips in CPU RAM to avoid redundant I/O.
-
-**FSDP crashes**: Use `--no-fsdp` for DDP mode. FSDP conflicts with LoRA + Qwen3-VL during checkpoint saving.
-
----
-
-## References
-
-- [Alpamayo-R1 Paper (arXiv:2511.00088)](https://arxiv.org/abs/2511.00088)
-- [TRL GRPOTrainer Documentation](https://huggingface.co/docs/trl/index)
-- [GRPO Paper (arXiv:2402.03300)](https://arxiv.org/abs/2402.03300)
-- [PhysicalAI-AV Dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles)
+- `docs/grpo-training.md`
+- `src/alpamayo_r1/training/train_grpo.py`
+- `src/alpamayo_r1/training/rollout.py`
+- `src/alpamayo_r1/training/rewards.py`
+- `src/alpamayo_r1/training/dataset.py`
+- `src/alpamayo_r1/training/configs/grpo_default.yaml`
