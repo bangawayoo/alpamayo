@@ -387,6 +387,15 @@ class AdvCondSFTTrainer(Trainer):
         with self._profile_section(step=step, stage="sft_forward_backward", gpu_active=True):
             loss = super().training_step(model, inputs, num_items_in_batch)
 
+        # Memory snapshot after SFT forward+backward
+        if logger.isEnabledFor(logging.DEBUG):
+            mem_alloc = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.warning(
+                "training_step after_sft_fwd_bwd: step=%d allocated=%.2fGB reserved=%.2fGB",
+                step, mem_alloc, mem_reserved,
+            )
+
         # Track unconditional fraction
         is_unconditional = inputs.get("is_unconditional")
         if is_unconditional is not None:
@@ -509,12 +518,28 @@ class AdvCondSFTTrainer(Trainer):
             return {"status": "skipped_no_cached_samples"}
 
         # ---- Phase B: Expert CFM step ----
+        if logger.isEnabledFor(logging.DEBUG):
+            mem_alloc = torch.cuda.memory_allocated(device) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+            mem_max = torch.cuda.max_memory_allocated(device) / 1024**3
+            logger.warning(
+                "expert_cfm PhaseB_entry: allocated=%.2fGB reserved=%.2fGB peak=%.2fGB "
+                "cached_samples=%d",
+                mem_alloc, mem_reserved, mem_max, len(cached_samples),
+            )
         expert_device = next(self.full_model.expert.parameters()).device
         if expert_device != device:
             self.full_model.expert.to(device)
             self.full_model.action_in_proj.to(device)
             self.full_model.action_out_proj.to(device)
             self.full_model.action_space.to(device)
+            if logger.isEnabledFor(logging.DEBUG):
+                mem_alloc = torch.cuda.memory_allocated(device) / 1024**3
+                mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+                logger.warning(
+                    "expert_cfm PhaseB_after_expert_to_gpu: allocated=%.2fGB reserved=%.2fGB",
+                    mem_alloc, mem_reserved,
+                )
 
         total_loss = 0.0
         n_valid = 0
