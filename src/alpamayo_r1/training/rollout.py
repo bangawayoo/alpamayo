@@ -2117,6 +2117,7 @@ class RolloutLoggingCallback(TrainerCallback):
                         pred_list=[data["pred_xyz"][base + j] for j in range(num_gen)],
                         gt_flat=data["gt_xyz"][base],
                         title=f"Step {step} | {clip_id}",
+                        coc_text=data["coc_texts"][base] if data.get("coc_texts") else None,
                     )
                     writer.add_figure(f"rollout/trajectory_bev_{i}", fig, step)
                     import matplotlib.pyplot as plt
@@ -2132,6 +2133,7 @@ def _plot_trajectories_bev(
     pred_list: list[list[float]],
     gt_flat: list[float],
     title: str = "",
+    coc_text: str | None = None,
 ):
     """Render a bird's-eye-view XY trajectory plot.
 
@@ -2139,6 +2141,7 @@ def _plot_trajectories_bev(
         pred_list: List of flattened predicted trajectories (one per sample).
         gt_flat: Flattened ground-truth trajectory.
         title: Plot title.
+        coc_text: Optional CoC reasoning text to display below the plot.
 
     Returns:
         matplotlib Figure (caller must close it).
@@ -2147,18 +2150,34 @@ def _plot_trajectories_bev(
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(5, 5))
+    import textwrap
 
     gt = np.array(gt_flat, dtype=np.float32).reshape(-1, 3)
-    ax.plot(gt[:, 0], gt[:, 1], "k-", linewidth=2.5, label="GT", zorder=10)
+    preds = [np.array(p, dtype=np.float32).reshape(-1, 3) for p in pred_list]
+
+    # Rotate 90 CCW for BEV: (-y, x) so ego "forward" (X+) points up
+    def bev_xy(arr):
+        return -arr[:, 1], arr[:, 0]
+
+    # Use gridspec to give the text panel a fixed height ratio
+    has_text = bool(coc_text)
+    if has_text:
+        fig, (ax, ax_text) = plt.subplots(
+            2, 1, figsize=(6, 8),
+            gridspec_kw={"height_ratios": [5, 1.5]},
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(6, 6))
+
+    bev_gt = bev_xy(gt)
+    ax.plot(*bev_gt, "k-", linewidth=2.5, label="GT", zorder=10)
+    ax.plot(0, 0, "k*", markersize=12, label="Ego (t=0)", zorder=11)
 
     cmap = plt.cm.tab10
-    for j, pred_flat in enumerate(pred_list):
-        pred = np.array(pred_flat, dtype=np.float32).reshape(-1, 3)
+    for j, pred in enumerate(preds):
+        bev_pred = bev_xy(pred)
         ax.plot(
-            pred[:, 0],
-            pred[:, 1],
+            *bev_pred,
             "--",
             color=cmap(j % 10),
             alpha=0.6,
@@ -2166,11 +2185,41 @@ def _plot_trajectories_bev(
             label=f"Pred {j}" if j < 6 else None,
         )
 
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
+    ax.set_xlabel("Lateral (m)")
+    ax.set_ylabel("Longitudinal (m)")
     ax.set_title(title, fontsize=9)
     ax.legend(loc="best", fontsize=7)
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.3)
+
+    # Pad shorter axis to at least 30% of the longer to avoid squished plots
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    x_span = xlim[1] - xlim[0]
+    y_span = ylim[1] - ylim[0]
+    min_span = max(x_span, y_span) * 0.3
+    if x_span < min_span:
+        mid = (xlim[0] + xlim[1]) / 2
+        ax.set_xlim(mid - min_span / 2, mid + min_span / 2)
+    if y_span < min_span:
+        mid = (ylim[0] + ylim[1]) / 2
+        ax.set_ylim(mid - min_span / 2, mid + min_span / 2)
+
+    if has_text:
+        # Manually wrap text (fig.text wrap=True is unreliable with Agg backend)
+        display_text = coc_text[:500] + ("..." if len(coc_text) > 500 else "")
+        wrapped = textwrap.fill(display_text, width=90)
+        ax_text.axis("off")
+        ax_text.text(
+            0.5,
+            1.0,
+            wrapped,
+            ha="center",
+            va="top",
+            fontsize=6,
+            family="monospace",
+            transform=ax_text.transAxes,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8),
+        )
+
     fig.tight_layout()
     return fig
