@@ -1,8 +1,8 @@
 export CUDA_VISIBLE_DEVICES=0
 
 
-MODEL_DIR="sft-text/iter_1/final/full_model"
-OUTPUT_DIR="sft-text/iter_1"
+MODEL_DIR="grpo_smoke/checkpoint-1/"
+OUTPUT_DIR="grpo-debug"
 
 bash scripts/evaluate/evaluate_quick_test.sh \
     --output-dir eval_results/$OUTPUT_DIR \
@@ -10,9 +10,10 @@ bash scripts/evaluate/evaluate_quick_test.sh \
     --num-traj-samples 5 \
     --temperature 0.6 \
     --adv-mode text \
-    --model-name outputs/$MODEL_DIR \
-    --adv-obs \
-    --adv-traj 
+    --model-name outputs/$MODEL_DIR 
+
+    # --adv-obs \
+    # --adv-traj 
 
 
 

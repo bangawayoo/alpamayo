@@ -32,20 +32,20 @@ lora:
 
 # GRPOConfig training parameters
 training:
-  output_dir: outputs/grpo
-  num_train_epochs: 1
-  per_device_train_batch_size: 4
-  gradient_accumulation_steps: 1
-  learning_rate: 1e-5
+  output_dir: outputs/grpo-lr1e6-temp06-beta04-ga32
+  num_train_epochs: 3
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 32
+  learning_rate: 1e-6
   num_generations: 8        # G in GRPO (group size for advantage estimation)
   max_completion_length: 384  # CoC tokens (≤256) + 64 trajectory tokens + special tokens overhead
   gradient_checkpointing: true  # trade compute for memory
-  beta: 0.0                  # no KL penalty -> no reference model needed
+  beta: 0.04                  # no KL penalty -> no reference model needed
   loss_type: grpo
   logging_steps: 1
-  save_steps: 100
+  save_steps: 500
   save_total_limit: 3
-  warmup_ratio: 0.05
+  warmup_ratio: 0.1
   max_grad_norm: 1.0
   report_to: tensorboard
   resume_from_checkpoint: null  # path to checkpoint dir to resume training, or null
@@ -54,7 +54,7 @@ training:
 data:
   split: train
   t0_us: 5100000  # 5.1 seconds into each clip
-  max_samples: 3000  # null = use all samples; set to int for debugging
+  max_samples: 10000  # null = use all samples; set to int for debugging
   clip_ids_file: null  # optional path to parquet with clip_id column
   exclude_clip_ids_file: notebooks/clip_ids.parquet  # exclude evaluation clips from training
   dataset_revision: 05e158af89ba  # HF dataset revision (pin to avoid breaking changes)
@@ -64,9 +64,9 @@ rollout:
   temperature: 0.6
   top_p: 0.98
   max_generation_length: 256
-  logprob_mini_batch_size: 2  # completions per VLM forward pass — reduced for 40GB GPU
-  log_interval: 10       # steps between rollout text logging (CoC text + generated tokens)
-  plot_interval: 100      # steps between BEV trajectory plots (null = same as log_interval)
+  logprob_mini_batch_size: 4  # completions per VLM forward pass — reduced for 40GB GPU
+  log_interval: 50       # steps between rollout text logging (CoC text + generated tokens)
+  plot_interval: 50      # steps between BEV trajectory plots (null = same as log_interval)
   log_max_samples: 2     # max prompts to log per interval
 
 # vLLM configuration for faster rollout generation
@@ -93,12 +93,12 @@ vllm:
 # Early stopping on held-out validation set (uses eval clips from exclude_clip_ids_file)
 early_stopping:
   enabled: true
-  patience: 3              # stop after N evals with no improvement
+  patience: 4              # stop after N evals with no improvement
   threshold: 0.01          # minimum improvement to count
-  eval_steps: 100          # evaluate every N training steps
+  eval_steps: 50          # evaluate every N training steps
   eval_split: val          # dataset split filter (train 153k, val 91k, test 62k)
   eval_clip_ids_file: null # parquet with clip_id column; defaults to data.exclude_clip_ids_file
-  eval_max_samples: 30     # clips in the validation set
+  eval_max_samples: 200     # clips in the validation set
   metric: reward  # overall weighted-sum reward across all reward functions
 
 # Reward function weights (must sum to 1.0)

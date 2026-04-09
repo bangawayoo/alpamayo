@@ -100,11 +100,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 
-if [[ ! -x "$VENV_PYTHON" ]]; then
-    echo "Error: venv python not found at $VENV_PYTHON"
-    echo "Run 'uv sync' first to create the virtual environment."
-    exit 1
-fi
 
 # ---------------------------------------------------------------
 # Build Hydra overrides
@@ -124,7 +119,6 @@ if [[ "$SMOKE" -eq 1 ]]; then
         "training.output_dir=outputs/grpo_smoke"
         "training.report_to=none"
         "early_stopping.enabled=false"
-        "rollout.num_traj_samples=2"
         "rollout.max_generation_length=128"
     )
 fi

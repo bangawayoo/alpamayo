@@ -1067,7 +1067,7 @@ def main():
     parser.add_argument(
         "--adv-mode",
         choices=["embedding", "text"],
-        default="embedding",
+        default="text",
         help="Advantage conditioning mode: 'embedding' uses learned AdvantageEmbedding "
         "hooks, 'text' uses plain-text tokens the VLM already understands.",
     )
